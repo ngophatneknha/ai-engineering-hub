@@ -1,0 +1,53 @@
+import ModelClient from "@azure-rest/ai-inference";
+import { AzureKeyCredential } from "@azure/core-auth";
+
+// SECURITY: Validate required environment variables
+// Get these from your Microsoft Foundry project's "Overview" page
+// (GitHub Models is retiring end of July 2026 - see https://ai.azure.com/catalog/models)
+const token = process.env["AZURE_INFERENCE_CREDENTIAL"];
+if (!token) {
+    throw new Error("AZURE_INFERENCE_CREDENTIAL environment variable is required. Please set it before running this application.");
+}
+
+const endpoint = process.env["AZURE_INFERENCE_ENDPOINT"];
+if (!endpoint) {
+    throw new Error("AZURE_INFERENCE_ENDPOINT environment variable is required. Please set it before running this application.");
+}
+
+/* By using the Azure AI Inference SDK, you can easily experiment with different models
+   by modifying the value of `modelName` in the code below. The following models are
+   available in the Microsoft Foundry Models catalog:
+
+   Meta: Llama-3.3-70B-Instruct, Llama-4-Scout-17B-16E-Instruct
+   Mistral AI: mistral-medium-3-5, mistral-small-4-119b-2603, Codestral-2501, ministral-ministral-4b-instruct
+   OpenAI: gpt-5-mini, gpt-4o-mini, gpt-4o, gpt-4.1, gpt-4.1-mini
+   Microsoft: Phi-4, Phi-4-mini-instruct, Phi-4-multimodal-instruct, Phi-4-reasoning */
+const modelName = "gpt-5-mini";
+
+export async function main() {
+
+    const client = new ModelClient(endpoint, new AzureKeyCredential(token));
+
+    const response = await client.path("/chat/completions").post({
+        body: {
+            messages: [
+                { role: "system", content: "You're the president of France"},
+                { role: "system", content: "You have just resigned" },
+                { role: "user", content: "What tasks needs doing?"  },
+            ],
+            model: modelName,
+        }
+    });
+
+    if (response.status !== "200") {
+        throw response.body.error;
+    }
+
+    for (const choice of response.body.choices) {
+        console.log(choice.message.content);
+    }
+}
+
+main().catch((err) => {
+    console.error("The sample encountered an error:", err);
+});
