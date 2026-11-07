@@ -1,0 +1,1366 @@
+/**
+ * Codebase knowledge extraction and graph building.
+ *
+ * Knowledge graph architecture and wiki protocol based on Team Wiki
+ * by @lurkacai. Core concepts: structured code facts, graph-index,
+ * evidence pages, router/hot/index navigation, and gaps detection.
+ */
+
+import { createHash } from 'node:crypto';
+import { statSync } from 'node:fs';
+import { mkdir, writeFile, readFile, realpath, lstat } from 'node:fs/promises';
+import path from 'node:path';
+
+import chalk from 'chalk';
+
+import {
+  collectCode,
+  extractCodeFacts,
+  buildCodeGraph,
+  detectCodeIncrementalChanges,
+  scanInterfaces,
+  traceCallChains,
+  buildIndexHubOverlay,
+  mergeGraphs,
+  saveGraphIndex,
+  extractStructuralGraphAsFacts,
+  astAvailable,
+  mergeCodeFacts,
+  formatAstStatsSummary,
+} from './wiki-engine/adapters/index.js';
+import type { CodeFact, InterfaceInventory, CallChain } from './wiki-engine/adapters/index.js';
+import type { CodeCollectedFile, SourceManifest } from './wiki-engine/code-knowledge/code-collector.js';
+import { CODE_COLLECTION_VERSION, SourceManifestSchema } from './wiki-engine/code-knowledge/code-collector.js';
+import type { ExtractorContext } from './wiki-engine/code-knowledge/extractors/index.js';
+import { SCALA_DECL_PREFIX, SCALA_WILDCARD_PREFIX } from './wiki-engine/code-knowledge/extractors/index.js';
+import { isMetadataRelation } from './wiki-engine/code-knowledge/code-extractors.js';
+import {
+  loadFactsCache,
+  saveFactsCache,
+  loadInterfacesCache,
+  saveInterfacesCache,
+  pruneFactsByFiles,
+  mergeInterfaceInventories,
+} from './wiki-engine/code-knowledge/code-incremental.js';
+import { writeIfChanged } from './utils/fs.js';
+import { createGit, redactGitCredentials, repoIdentity, resolveAnchors, type ProjectAnchors } from './utils/git.js';
+import { assertSafePath } from './utils/path-safety.js';
+import { repoName } from './utils/repo-attribution.js';
+import type { GraphIndex } from './wiki-engine/core/graph-index.schema.js';
+import { routerTemplate, indexTemplate, HOT_TEMPLATE } from './wiki-engine/adapters/templates.js';
+import type { IndexStats } from './wiki-engine/adapters/templates.js';
+
+export interface ExtractCodebaseOptions {
+  path?: string;
+  incremental?: boolean;
+  json?: boolean;
+  project?: string;
+  maxFiles?: number;
+  skipEnrich?: boolean;
+  /** 产出根目录（teamwiki/ 写到此目录下）。默认与 path 相同。 */
+  outputRoot?: string;
+  /** Remote repository URL, persisted into source-manifest.json baseline. */
+  repoUrl?: string;
+  /** Branch name, persisted into source-manifest.json baseline. */
+  branch?: string;
+  /** Source MR/PR URL to record as ingested into source-manifest.json (P5). */
+  sourceMrUrl?: string | readonly string[];
+}
+
+interface ExtractResult {
+  project: string;
+  filesScanned: number;
+  facts: { total: number; byKind: Record<string, number> };
+  graph: { nodes: number; edges: number };
+  incremental: boolean;
+  outputDir: string;
+  manifest: {
+    written: boolean;
+    source: 'ai' | 'fallback' | 'none';
+    components: number;
+    note?: string;
+  };
+}
+
+interface KnowledgeGap {
+  id: string;
+  kind: string;
+  description: string;
+  source: string;
+}
+
+/** 用户可见的 facts：元数据 relation（通配包名、顶层声明标记）不进任何统计。 */
+function visibleFactsOf(facts: CodeFact[]): CodeFact[] {
+  return facts.filter((f) => f.kind !== 'relation' || !isMetadataRelation(f.name));
+}
+
+function detectKnowledgeGaps(
+  facts: CodeFact[],
+  graph: GraphIndex,
+  files: Array<{ relativePath: string }>,
+): KnowledgeGap[] {
+  const gaps: KnowledgeGap[] = [];
+  const scannedFiles = new Set(files.map((f) => f.relativePath));
+  const connectedNodes = new Set<string>();
+
+  for (const edge of graph.edges) {
+    connectedNodes.add(edge.from);
+    connectedNodes.add(edge.to);
+  }
+
+  // 1. 未解析的外部依赖：import target 不在扫描范围内
+  const relationFacts = facts.filter((f) => f.kind === 'relation' && !isMetadataRelation(f.name));
+  const unresolvedImports = new Set<string>();
+
+  for (const rel of relationFacts) {
+    const target = rel.name;
+
+    if (target.startsWith('.')) continue; // 相对路径跳过
+
+    if (target.startsWith('node:')) continue; // Node 内置模块跳过
+    const matchesAnyFile = [...scannedFiles].some((f) => f.includes(target.replace(/\//g, path.sep)));
+
+    if (!matchesAnyFile) {
+      unresolvedImports.add(target);
+    }
+  }
+
+  if (unresolvedImports.size > 5) {
+    gaps.push({
+      id: 'unresolved-external-deps',
+      kind: 'EXTERNAL_DEP_UNDOCUMENTED',
+      description: `${unresolvedImports.size} external dependencies not documented (e.g. ${[...unresolvedImports].slice(0, 3).join(', ')})`,
+      source: 'relation facts',
+    });
+  }
+
+  // 2. 接口无实现：有 interface 声明但图谱中无 IMPLEMENTS 边指向它
+  const interfaces = facts.filter((f) => f.kind === 'interface');
+  const components = facts.filter((f) => f.kind === 'component');
+  const componentNames = new Set(components.map((c) => c.name.toLowerCase()));
+  const unimplemented: string[] = [];
+
+  for (const iface of interfaces) {
+    const name = iface.name.toLowerCase();
+
+    const hasImpl = componentNames.has(name) ||
+      componentNames.has(name.replace(/^i/, '').toLowerCase()) ||
+      componentNames.has((name + 'impl').toLowerCase());
+
+    if (!hasImpl) {
+      unimplemented.push(iface.name);
+    }
+  }
+
+  if (unimplemented.length > 3) {
+    gaps.push({
+      id: 'interface-no-impl',
+      kind: 'IMPL_MISSING',
+      description: `${unimplemented.length} interfaces with no matching implementation (e.g. ${unimplemented.slice(0, 3).join(', ')})`,
+      source: 'interface facts',
+    });
+  }
+
+  // 3. 孤立组件：有节点但与图谱中其他节点无任何连接
+  const orphanNodes = graph.nodes.filter(
+    (n) => !connectedNodes.has(n.slug),
+  );
+
+  if (orphanNodes.length > 5 && orphanNodes.length > graph.nodes.length * 0.3) {
+    gaps.push({
+      id: 'high-orphan-ratio',
+      kind: 'LOW_CONNECTIVITY',
+      description: `${orphanNodes.length}/${graph.nodes.length} nodes have no graph connections, dependencies may not be fully extracted`,
+      source: 'graph-index.json',
+    });
+  }
+
+  // 4. 无错误处理模式：有组件但无 error 类型定义
+  const errorFacts = facts.filter((f) => f.kind === 'error');
+
+  if (components.length > 10 && errorFacts.length === 0) {
+    gaps.push({
+      id: 'no-error-patterns',
+      kind: 'ERROR_HANDLING_UNDOCUMENTED',
+      description: `Project has ${components.length} components but no error types detected, error handling may be undocumented`,
+      source: 'code scan',
+    });
+  }
+
+  // 5. 无配置项目：有组件但无 config/env 提取
+  const configFacts = facts.filter((f) => f.kind === 'config');
+
+  if (components.length > 10 && configFacts.length === 0) {
+    gaps.push({
+      id: 'no-config-detected',
+      kind: 'CONFIG_UNDOCUMENTED',
+      description: `Project has ${components.length} components but no config/env vars detected, configuration may be undocumented`,
+      source: 'code scan',
+    });
+  }
+
+  return gaps;
+}
+
+function buildEvidencePages(
+  facts: CodeFact[],
+  project: string,
+  interfaceInventory?: InterfaceInventory,
+  callChains?: CallChain[],
+): Map<string, string> {
+  const pages = new Map<string, string>();
+  const byKind = new Map<string, CodeFact[]>();
+
+  for (const fact of facts) {
+    if (fact.kind === 'relation') continue;
+    const existing = byKind.get(fact.kind) ?? [];
+    existing.push(fact);
+    byKind.set(fact.kind, existing);
+  }
+
+  for (const [kind, kindFacts] of byKind) {
+    const lines = [
+      '---',
+      `title: ${project} ${kind}`,
+      'domain: code-knowledge',
+      `source:`,
+      ...Array.from(new Set(kindFacts.map((f) => f.file))).map((f) => `  - ${f}`),
+      '---',
+      '',
+      `# ${kind.charAt(0).toUpperCase() + kind.slice(1)}`,
+      '',
+    ];
+
+    for (const fact of kindFacts) {
+      lines.push(`- \`${fact.name}\` ← ${fact.file}:${fact.lineStart} [${fact.confidence}]`);
+
+      if (fact.detail) {
+        lines.push(`  \`\`\`\n  ${fact.detail.trim()}\n  \`\`\``);
+      }
+    }
+
+    pages.set(`${kind}.md`, lines.join('\n'));
+  }
+
+  const relationFacts = facts.filter((f) => f.kind === 'relation' && !isMetadataRelation(f.name));
+
+  if (relationFacts.length > 0) {
+    const byDir = new Map<string, CodeFact[]>();
+
+    for (const fact of relationFacts) {
+      const seg = fact.file.split('/')[0] || '_root';
+      const existing = byDir.get(seg) ?? [];
+      existing.push(fact);
+      byDir.set(seg, existing);
+    }
+
+    for (const [seg, segFacts] of byDir) {
+      const lines = [
+        '---',
+        `title: ${project} relations (${seg})`,
+        'domain: code-knowledge',
+        '---',
+        '',
+        `# Relations (${seg})`,
+        '',
+      ];
+
+      for (const fact of segFacts) {
+        lines.push(`- \`${fact.name}\` ← ${fact.file}:${fact.lineStart}`);
+      }
+
+      pages.set(`relation-${seg}.md`, lines.join('\n'));
+    }
+  }
+
+  // Interface Inventory page
+  if (interfaceInventory && interfaceInventory.entries.length > 0) {
+    const ifLines = [
+      '---',
+      `title: ${project} interface inventory`,
+      'domain: code-knowledge',
+      '---',
+      '',
+      '# Interface Inventory',
+      '',
+      '| Component | Type | Count | Confidence | Patterns |',
+      '|-----------|------|-------|------------|----------|',
+    ];
+
+    for (const entry of interfaceInventory.entries) {
+      const patterns = entry.patterns.slice(0, 2).map(p => `\`${p.trim()}\``).join(', ');
+      ifLines.push(`| ${entry.component} | ${entry.type} | ${entry.count} | ${entry.confidence} | ${patterns} |`);
+    }
+
+    ifLines.push('');
+    pages.set('interfaces.md', ifLines.join('\n'));
+  }
+
+  // Dependency Paths page
+  if (callChains && callChains.length > 0) {
+    const ccLines = [
+      '---',
+      `title: ${project} dependency paths`,
+      'domain: code-knowledge',
+      '---',
+      '',
+      '# Dependency Paths',
+      '',
+      'Static import dependency paths (not runtime call traces).',
+      '',
+      `${callChains.length} dependency path(s) traced from entry points (max depth 4).`,
+      '',
+    ];
+
+    for (const chain of callChains.slice(0, 20)) {
+      ccLines.push(`## ${chain.entryPoint}`);
+      ccLines.push('');
+
+      for (const step of chain.steps) {
+        const indent = step.layer === 'entry' ? '' : step.layer === 'orchestration' ? '  ' : step.layer === 'service' ? '    ' : '      ';
+        ccLines.push(`${indent}- [${step.layer}] \`${step.symbol}\` ← ${step.file}:${step.lineStart}`);
+      }
+
+      ccLines.push('');
+    }
+
+    pages.set('dependency-paths.md', ccLines.join('\n'));
+  }
+
+  const indexLines = [
+    '---',
+    `title: ${project} code knowledge index`,
+    'domain: code-knowledge',
+    '---',
+    '',
+    `# ${project}`,
+    '',
+    `Facts: ${visibleFactsOf(facts).length} | Pages: ${pages.size}`,
+    '',
+  ];
+
+  // Interface summary in index
+  if (interfaceInventory && interfaceInventory.entries.length > 0) {
+    const byType: Record<string, number> = {};
+
+    for (const e of interfaceInventory.entries) {
+      byType[e.type] = (byType[e.type] ?? 0) + e.count;
+    }
+
+    indexLines.push('## Interface Inventory');
+    indexLines.push('');
+    indexLines.push(`| Type | Count |`);
+    indexLines.push(`|------|-------|`);
+
+    for (const [type, count] of Object.entries(byType)) {
+      indexLines.push(`| ${type} | ${count} |`);
+    }
+
+    indexLines.push('');
+  }
+
+  indexLines.push('## Pages');
+  indexLines.push('');
+
+  for (const pageName of pages.keys()) {
+    indexLines.push(`- [${pageName}](./${pageName})`);
+  }
+
+  pages.set('index.md', indexLines.join('\n'));
+
+  return pages;
+}
+
+function buildModuleSummaries(
+  facts: CodeFact[],
+  graph: GraphIndex,
+  project: string,
+): Map<string, string> {
+  const modules = new Map<string, CodeFact[]>();
+
+  // 按顶层目录分组（排除 relation facts）
+  for (const fact of facts) {
+    if (fact.kind === 'relation') continue;
+    const parts = fact.file.split('/');
+    const module = parts.length > 1 ? parts[0] : '_root';
+    const existing = modules.get(module) ?? [];
+    existing.push(fact);
+    modules.set(module, existing);
+  }
+
+  const summaries = new Map<string, string>();
+
+  // 只为有 5+ 个 facts 的模块生成摘要
+  for (const [module, moduleFacts] of modules) {
+    if (moduleFacts.length < 5) continue;
+
+    // 统计该模块的引用次数（作为 edge target 的次数）
+    const fileRefs = new Map<string, number>();
+
+    for (const edge of graph.edges) {
+      if (edge.to.startsWith(module + '/') || edge.to === module) {
+        fileRefs.set(edge.to, (fileRefs.get(edge.to) ?? 0) + 1);
+      }
+    }
+
+    // 按 kind 统计
+    const kindCounts: Record<string, number> = {};
+
+    for (const f of moduleFacts) {
+      kindCounts[f.kind] = (kindCounts[f.kind] ?? 0) + 1;
+    }
+
+    // 按引用次数排序，取 top 20 核心组件
+    const ranked = moduleFacts
+      .filter(f => f.kind === 'component' || f.kind === 'interface')
+      .map(f => ({ ...f, refs: fileRefs.get(f.file) ?? 0 }))
+      .sort((a, b) => b.refs - a.refs)
+      .slice(0, 20);
+
+    // 该模块依赖的其他模块
+    const depsTo = new Set<string>();
+    const depsFrom = new Set<string>();
+
+    for (const edge of graph.edges) {
+      if (edge.from.startsWith(module + '/')) {
+        const targetMod = edge.to.split('/')[0];
+
+        if (targetMod !== module) depsTo.add(targetMod);
+      }
+
+      if (edge.to.startsWith(module + '/')) {
+        const sourceMod = edge.from.split('/')[0];
+
+        if (sourceMod !== module) depsFrom.add(sourceMod);
+      }
+    }
+
+    const lines = [
+      '---',
+      `title: ${project} — ${module} module`,
+      'domain: code-knowledge',
+      `source: [${module}/]`,
+      '---',
+      '',
+      `# ${module}`,
+      '',
+      `**${moduleFacts.length} facts** (${Object.entries(kindCounts).map(([k, v]) => `${k}: ${v}`).join(', ')})`,
+      '',
+    ];
+
+    if (depsTo.size > 0) {
+      lines.push(`**Depends on**: ${[...depsTo].join(', ')}`);
+    }
+
+    if (depsFrom.size > 0) {
+      lines.push(`**Depended by**: ${[...depsFrom].join(', ')}`);
+    }
+
+    if (depsTo.size > 0 || depsFrom.size > 0) lines.push('');
+
+    lines.push('## Core components');
+    lines.push('');
+
+    for (const item of ranked) {
+      const refStr = item.refs > 0 ? ` (${item.refs} refs)` : '';
+      lines.push(`- \`${item.name}\` ← ${item.file}:${item.lineStart}${refStr}`);
+    }
+
+    if (moduleFacts.some(f => f.kind === 'config')) {
+      lines.push('');
+      lines.push('## Config');
+      lines.push('');
+
+      for (const f of moduleFacts.filter(fact => fact.kind === 'config').slice(0, 10)) {
+        lines.push(`- \`${f.name}\` ← ${f.file}`);
+      }
+    }
+
+    if (moduleFacts.some(f => f.kind === 'error')) {
+      lines.push('');
+      lines.push('## Errors');
+      lines.push('');
+
+      for (const f of moduleFacts.filter(fact => fact.kind === 'error').slice(0, 10)) {
+        lines.push(`- \`${f.name}\` ← ${f.file}`);
+      }
+    }
+
+    lines.push('');
+    summaries.set(`${module}.md`, lines.join('\n'));
+  }
+
+  return summaries;
+}
+
+/**
+ * Generate a deterministic overview.md from facts + graph (B16).
+ * Provides basic architecture context without AI calls.
+ */
+function buildOverview(
+  facts: CodeFact[],
+  graph: GraphIndex,
+  project: string,
+  interfaceInventory: InterfaceInventory,
+  callChains: CallChain[],
+): string {
+  const modules = new Map<string, CodeFact[]>();
+
+  for (const fact of facts) {
+    if (fact.kind === 'relation') continue;
+    const mod = fact.file.split('/')[0] || '_root';
+    const existing = modules.get(mod) ?? [];
+    existing.push(fact);
+    modules.set(mod, existing);
+  }
+
+  const lines = [
+    '---',
+    `title: ${project} overview`,
+    'domain: code-knowledge',
+    '---',
+    '',
+    `# ${project}`,
+    '',
+    `**${visibleFactsOf(facts).length} facts** extracted from ${new Set(facts.map(f => f.file)).size} files.`,
+    `Graph: ${graph.nodes.length} nodes, ${graph.edges.length} edges.`,
+    '',
+    '## Module Structure',
+    '',
+    '| Module | Facts | Components | Interfaces |',
+    '|--------|-------|------------|------------|',
+  ];
+
+  const sortedModules = [...modules.entries()]
+    .filter(([, mf]) => mf.length >= 3)
+    .sort((a, b) => b[1].length - a[1].length);
+
+  for (const [mod, mf] of sortedModules) {
+    const comps = mf.filter(f => f.kind === 'component').length;
+    const ifaces = mf.filter(f => f.kind === 'interface').length;
+    lines.push(`| ${mod} | ${mf.length} | ${comps} | ${ifaces} |`);
+  }
+
+  // Module dependency direction
+  lines.push('');
+  lines.push('## Dependencies');
+  lines.push('');
+  const depMap = new Map<string, Set<string>>();
+
+  for (const edge of graph.edges) {
+    const fromMod = edge.from.split('/')[0] || '_root';
+    const toMod = edge.to.split('/')[0] || '_root';
+
+    if (fromMod !== toMod) {
+      const existing = depMap.get(fromMod) ?? new Set();
+      existing.add(toMod);
+      depMap.set(fromMod, existing);
+    }
+  }
+
+  if (depMap.size > 0) {
+    for (const [mod, deps] of depMap) {
+      lines.push(`- **${mod}** → ${[...deps].join(', ')}`);
+    }
+  } else {
+    lines.push('(No cross-module dependencies detected)');
+  }
+
+  // Interface summary
+  if (interfaceInventory.entries.length > 0) {
+    lines.push('');
+    lines.push('## Interfaces');
+    lines.push('');
+    const byType: Record<string, number> = {};
+
+    for (const e of interfaceInventory.entries) {
+      byType[e.type] = (byType[e.type] ?? 0) + e.count;
+    }
+
+    lines.push(`Types: ${Object.entries(byType).map(([t, c]) => `${t}(${c})`).join(', ')}`);
+  }
+
+  // Dependency paths summary
+  if (callChains.length > 0) {
+    lines.push('');
+    lines.push('## Key Dependency Paths');
+    lines.push('');
+
+    for (const chain of callChains.slice(0, 5)) {
+      const chainPath = chain.steps.map(s => s.symbol).join(' → ');
+      lines.push(`- ${chain.entryPoint}: ${chainPath}`);
+    }
+  }
+
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+/**
+ * The wiki slug of `dir` when no `--project` is given (#809): a checkout's
+ * root, the main one or a linked worktree, takes its repo's name (repoName:
+ * the main checkout's real name, or a bare repo's), so every checkout of a repo
+ * writes the repo's evidence, whatever path it was opened by (#823); any other
+ * directory keeps its own name. A root whose `origin` names a repo takes the
+ * slug `--from-repo` gives that repo, so two checkouts named `svc` of different
+ * repos do not share one evidence directory, and `--dir` updates the evidence
+ * CI publishes for the repo.
+ */
+export async function defaultProjectSlug(dir: string): Promise<string> {
+  const anchors = await checkoutRootAnchors(dir);
+
+  if (!anchors) return path.basename(dir);
+
+  const origin = (await createGit(dir).getRemotes(true).catch(() => []))
+    .find((remote) => remote.name === 'origin')?.refs.fetch;
+
+  if (origin) {
+    const { repoSlugForUrl } = await import('./import-repo.js');
+
+    try {
+      return repoSlugForUrl(origin);
+    } catch {
+      // An origin no provider can parse names no remote slug; use the repo's name.
+    }
+  }
+
+  return repoName(anchors.projectAnchor);
+}
+
+/**
+ * The slug `--dir` gave `dir` before a checkout with an origin was named after
+ * its remote: the repo's name for a checkout root, else the directory's own.
+ */
+export async function checkoutName(dir: string): Promise<string> {
+  const anchors = await checkoutRootAnchors(dir);
+
+  return anchors ? repoName(anchors.projectAnchor) : path.basename(dir);
+}
+
+/** The anchors of `dir` when it is a checkout's root, the main one or a linked worktree. */
+async function checkoutRootAnchors(dir: string): Promise<ProjectAnchors | null> {
+  if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) return null;
+  const anchors = await resolveAnchors(dir);
+
+  return anchors && await realpath(dir) === anchors.workspaceRoot ? anchors : null;
+}
+
+interface SourceRepositoryMetadata {
+  repoUrl?: string;
+  repoIdentity?: string;
+  sourceSubdir?: string;
+  /**
+   * Hex `sha256` of the verified `realpath` of the git root, or of the
+   * directory itself when it is in no repository. Written to
+   * source-manifest.json only for a checkout with no remote identity (#1422),
+   * because such a checkout has nothing else stable to recognise itself by; a
+   * checkout with a remote is identified by `repoIdentity`, and an import
+   * compares its hash only with evidence it published before it had a remote.
+   * Hashed rather than stored raw because `source-manifest.json` is committed to the
+   * teamwiki, so a raw path would publish the member's home directory. This is
+   * not a repository identity, so it is never stored in `repoIdentity`, which
+   * freshness compares against remote URLs.
+   */
+  localRootHash?: string;
+}
+
+/** source-manifest.json as an import writes it. */
+interface WrittenSourceManifest {
+  version: number;
+  lastScan: string;
+  project: string;
+  files: Array<{ relativePath: string; sha256: string; language?: string }>;
+  sourceSubdir?: string;
+  localRootHash?: string;
+  headSha?: string;
+  repoUrl?: string;
+  repoIdentity?: string;
+  branch?: string;
+  ingestedMrs?: Array<{ url: string; headSha?: string; at: string }>;
+}
+
+function sanitizeRepoUrl(url: string): string {
+  const redacted = redactGitCredentials(url);
+
+  try {
+    const parsed = new URL(redacted);
+    parsed.username = '';
+    parsed.password = '';
+
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    // scp-form URLs have no URL authority separator; retain their conventional
+    // `git@host:path` user while stripping userinfo from other malformed URLs.
+    return redacted.replace(/^(.+:\/\/)[^/@]*@/, '$1');
+  }
+}
+
+async function readStoredSourceManifest(filePath: string): Promise<SourceManifest | null> {
+  try {
+    return SourceManifestSchema.safeParse(JSON.parse(await readFile(filePath, 'utf8'))).data ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function manifestMatchesSource(
+  manifest: SourceManifest | null,
+  project: string,
+  source: SourceRepositoryMetadata,
+): manifest is SourceManifest {
+  if (!manifest || source.sourceSubdir === undefined) return false;
+
+  if (manifest.project !== project || manifest.sourceSubdir !== source.sourceSubdir) return false;
+
+  if (source.repoIdentity) {
+    if (manifest.repoIdentity?.trim()) {
+      return manifest.repoIdentity.trim() === source.repoIdentity;
+    }
+
+    if (!manifest.repoUrl?.trim()) return false;
+
+    try {
+      return repoIdentity(manifest.repoUrl) === source.repoIdentity;
+    } catch {
+      return false;
+    }
+  }
+
+  // A checkout with no origin remote has no canonical identity (#1422), so the
+  // git root it was read from is the only stable statement of "this source". A
+  // manifest that names a remote was written by a checkout that had one and
+  // says nothing about this directory, so it cannot serve as its baseline.
+  if (manifest.repoIdentity?.trim()) return false;
+
+  if (manifest.repoUrl?.trim()) return false;
+
+  return source.localRootHash !== undefined
+    && source.localRootHash !== ''
+    && manifest.localRootHash === source.localRootHash;
+}
+
+/**
+ * Read the repository provenance for a source root without contacting its
+ * remote. Hashes in source-manifest.json are relative to the extraction root,
+ * so retain only the relative path from the verified Git root.
+ */
+export async function sourceRepositoryMetadata(
+  root: string,
+  explicitRepoUrl?: string,
+): Promise<SourceRepositoryMetadata & { localRootHash: string }> {
+  let sourceSubdir: string | undefined;
+  let localRootHash: string | undefined;
+  let remoteUrl = explicitRepoUrl;
+
+  try {
+    const git = createGit(root);
+    const gitRoot = (await git.revparse(['--show-toplevel'])).trim();
+    const [realGitRoot, realSourceRoot] = await Promise.all([realpath(gitRoot), realpath(root)]);
+    localRootHash = createHash('sha256').update(realGitRoot).digest('hex');
+    const relative = path.relative(realGitRoot, realSourceRoot);
+
+    if (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`)) {
+      sourceSubdir = relative.split(path.sep).filter(Boolean).join('/');
+    }
+
+    if (!remoteUrl) {
+      const remotes = await git.getRemotes(true);
+      remoteUrl = remotes.find((remote) => remote.name === 'origin')?.refs.fetch;
+    }
+  } catch {
+    // A repository identity/root that cannot be verified leaves freshness
+    // unknown. Extraction itself still works for non-Git directories.
+  }
+
+  // A directory outside any repository answers by its own real path, hashed
+  // like a git root, so its next import recognises it (#1422).
+  localRootHash ??= createHash('sha256').update(await realpath(root)).digest('hex');
+
+  if (!remoteUrl) {
+    const local: SourceRepositoryMetadata = {};
+
+    if (sourceSubdir !== undefined) local.sourceSubdir = sourceSubdir;
+
+    return { ...local, localRootHash };
+  }
+
+  const safeUrl = sanitizeRepoUrl(remoteUrl);
+  const identity = repoIdentity(safeUrl);
+
+  // Keep the historical repoUrl field for status output, after removing
+  // credentials, and store strict identity separately for freshness checks.
+  const remote: SourceRepositoryMetadata = { repoUrl: safeUrl, repoIdentity: identity };
+
+  if (sourceSubdir !== undefined) remote.sourceSubdir = sourceSubdir;
+
+  return { ...remote, localRootHash };
+}
+
+/**
+ * Extract code knowledge from `opts.path` into `<outputRoot>/teamwiki`.
+ *
+ * @returns false when nothing was written: an incremental run found no
+ *          changes, or the source has no extractable files
+ */
+export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<boolean> {
+  const root = path.resolve(opts.path || '.');
+  const project = opts.project || await defaultProjectSlug(root);
+  const sourceRepo = await sourceRepositoryMetadata(root, opts.repoUrl);
+  const maxFiles = opts.maxFiles || 200;
+  const outputBase = opts.outputRoot ? path.resolve(opts.outputRoot) : root;
+
+  const wikiRoot = path.join(outputBase, 'teamwiki');
+  const evidenceDir = path.join(wikiRoot, 'evidence', 'code', project);
+  const manifestPath = path.join(wikiRoot, 'source-manifest.json');
+  const projectManifestPath = path.join(evidenceDir, 'source-manifest.json');
+  assertSafePath(projectManifestPath, [wikiRoot]);
+
+  const sidecarStat = await lstat(projectManifestPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error;
+
+    return null;
+  });
+
+  // A dangling link cannot be resolved by assertSafePath, but writeFile would
+  // follow it and create its target. Reject sidecar links before reading them.
+  if (sidecarStat?.isSymbolicLink()) {
+    throw new Error('Refusing to write source manifest through a symbolic link');
+  }
+
+  const rootManifest = await readStoredSourceManifest(manifestPath);
+  const projectManifest = await readStoredSourceManifest(projectManifestPath);
+  const rootMatchesSource = manifestMatchesSource(rootManifest, project, sourceRepo);
+  const projectMatchesSource = manifestMatchesSource(projectManifest, project, sourceRepo);
+
+  // The .indices facts cache is shared at teamwiki/.indices. Reuse it only
+  // while the root manifest proves that cache belongs to this exact source.
+  // If provenance is absent or another repo was extracted last, run a full
+  // hash scan rather than combining another repo's file/fact baseline.
+  // The manifests name the imported directory (`sourceSubdir`), so a root
+  // and a subdirectory extraction never share a baseline, and the git diff
+  // helper scopes repository-root-relative paths into the subdirectory (#1502).
+  const incrementalBaselineMatches = rootMatchesSource
+    && (!projectManifest || projectMatchesSource);
+
+  const incrementalManifestPath = projectMatchesSource ? projectManifestPath : manifestPath;
+  const provenanceManifest = projectMatchesSource ? projectManifest : rootMatchesSource ? rootManifest : null;
+
+  let changedFiles: string[] | undefined;
+  let deletedFiles: string[] = [];
+
+  if (opts.incremental && incrementalBaselineMatches) {
+    try {
+      const changes = await detectCodeIncrementalChanges(
+        root,
+        incrementalManifestPath,
+        project,
+        maxFiles,
+        sourceRepo.sourceSubdir,
+      );
+
+      if (changes.added.length === 0 && changes.changed.length === 0 && changes.deleted.length === 0) {
+        if (opts.json) {
+          console.log(JSON.stringify({ status: 'up-to-date', project }));
+        } else {
+          console.log(chalk.green(`[extract] ${project}: no changes, skipped.`));
+        }
+
+        return false;
+      }
+
+      changedFiles = [...changes.added, ...changes.changed];
+      deletedFiles = changes.deleted;
+
+      if (!opts.json) {
+        console.log(chalk.dim(`[extract] incremental: ${changedFiles.length} files changed, ${deletedFiles.length} deleted`));
+      }
+    } catch {
+      if (!opts.json) {
+        console.log(chalk.dim('[extract] no manifest history, running full extraction'));
+      }
+    }
+  } else if (opts.incremental && !opts.json) {
+    console.log(chalk.dim('[extract] no matching source baseline, running full extraction'));
+  }
+
+  // 增量模式下，import 在提取时物化为具体文件（通配 → 各成员、具名 → 声明
+  // 文件）；若本次只变更了被指向的文件而 importer 未变，物化结果已过期。
+  // 缓存的 scala-wildcard: 标记记录通配 importer 及其包；其余以 .scala/.java
+  // 结尾的 relation 名就是物化目标文件本身——两者任一受影响都重提取 importer
+  const indicesDir = path.join(wikiRoot, '.indices');
+  let cachedFacts: CodeFact[] | undefined;
+
+  if (changedFiles !== undefined) {
+    cachedFacts = await loadFactsCache(indicesDir);
+    const changedSet = new Set([...changedFiles, ...deletedFiles]);
+    const originalChangedFiles = changedFiles;
+    const staleImporters = new Set<string>();
+
+    for (const fact of cachedFacts) {
+      if (fact.kind !== 'relation' || fact.name.startsWith(SCALA_DECL_PREFIX)) continue;
+
+      const touchedPackage = (pkg: string): boolean =>
+        originalChangedFiles.some((f) => f.includes(`/${pkg}/`) || f.startsWith(`${pkg}/`)) ||
+        deletedFiles.some((f) => f.includes(`/${pkg}/`) || f.startsWith(`${pkg}/`));
+
+      if (fact.name.startsWith(SCALA_WILDCARD_PREFIX)) {
+        if (touchedPackage(fact.name.slice(SCALA_WILDCARD_PREFIX.length))) staleImporters.add(fact.file);
+      } else if (/\.(?:scala|java)$/.test(fact.name)) {
+        // 物化目标本身变了——importer 必须重新解析
+        if (changedSet.has(fact.name)) staleImporters.add(fact.file);
+      } else {
+        // 未物化的常规路径（com/demo/core/Invoice）：包目录里有文件增删时，
+        // 原本解析不到的目标可能已经可解析
+        const pkg = fact.name.split('/').slice(0, -1).join('/');
+
+        if (pkg && touchedPackage(pkg)) staleImporters.add(fact.file);
+      }
+    }
+
+    if (staleImporters.size > 0) {
+      changedFiles = [...new Set([...changedFiles, ...staleImporters])];
+    }
+  }
+
+  const { files, manifest: collectionManifest, totalCandidates } = await collectCode({ root, maxFiles, changedFiles });
+
+  if (!opts.json && totalCandidates > files.length) {
+    console.log(chalk.yellow(
+      `[extract] ${project}: ${totalCandidates} source files matched, but only the first ${files.length} were collected. Raise the limit with --max-files <n>.`,
+    ));
+  }
+
+  if (files.length === 0 && !changedFiles) {
+    // 全量模式下无文件
+    if (opts.json) {
+      console.log(JSON.stringify({ status: 'no-files', project }));
+    } else {
+      console.log(chalk.yellow(`[extract] ${project}: no extractable source files found.`));
+    }
+
+    return false;
+  }
+
+  // 增量模式下，跨文件解析（通配展开、符号定位到声明文件）需要未变更文件的
+  // 路径与声明；两者都能从上一轮 facts 缓存得到，未变更文件无需重新读取。
+  // 声明只从 scala-decl: 标记重建——component facts 分不出嵌套成员，
+  // 标记在提取时就只记包级名字
+  let extractionContext: ExtractorContext | undefined;
+
+  if (changedFiles !== undefined) {
+    const priorDeclarations = new Map<string, Set<string>>();
+    const stubs = new Map<string, CodeCollectedFile>();
+    const removed = new Set([...changedFiles, ...deletedFiles]);
+
+    for (const fact of cachedFacts ?? []) {
+      if (!removed.has(fact.file)) {
+        stubs.set(fact.file, { path: fact.file, relativePath: fact.file, language: 'text', sha256: '', content: '' });
+      }
+
+      if (fact.kind === 'relation' && fact.name.startsWith(SCALA_DECL_PREFIX)) {
+        const names = new Set(fact.name.slice(SCALA_DECL_PREFIX.length).split(','));
+        priorDeclarations.set(fact.file, names);
+      }
+    }
+
+    for (const file of files) {
+      stubs.delete(file.relativePath); // 变更文件以本批为准
+    }
+
+    extractionContext = { allFiles: [...files, ...stubs.values()], priorDeclarations };
+  }
+
+  const newFacts = files.length > 0 ? extractCodeFacts(files, extractionContext) : [];
+
+  // 增量模式：加载缓存 → 剪除 → 合并
+  let facts: CodeFact[];
+  let interfaceInventory: InterfaceInventory;
+
+  if (changedFiles !== undefined) {
+    // 增量模式（含 changedFiles=[] 即仅删除场景）
+    const oldFacts = cachedFacts ?? (await loadFactsCache(indicesDir));
+    const oldInterfaces = await loadInterfacesCache(indicesDir);
+
+    // 剪除已变更/删除的旧数据
+    const filesToRemove = new Set([...changedFiles, ...deletedFiles]);
+    const remainingFacts = pruneFactsByFiles(oldFacts, filesToRemove);
+
+    // 合并：旧的保留 facts + 新提取的 facts
+    const merged = [...remainingFacts, ...newFacts];
+    // 去重（kind:name:file，同一文件中同名同类型只保留一份）
+    const seen = new Set<string>();
+    facts = [];
+
+    for (const f of merged) {
+      if (f.kind === 'relation') {
+        facts.push(f);
+      } else {
+        const key = `${f.kind}:${f.name}:${f.file}`;
+
+        if (!seen.has(key)) {
+          seen.add(key);
+          facts.push(f);
+        }
+      }
+    }
+
+    // 合并 interfaces（按 component+type 去重，新覆盖旧）
+    const newInterfaces = files.length > 0 ? await scanInterfaces(files) : { entries: [], scannedAt: '' };
+    interfaceInventory = mergeInterfaceInventories(oldInterfaces, newInterfaces);
+  } else {
+    // 全量模式
+    facts = newFacts;
+    interfaceInventory = await scanInterfaces(files);
+  }
+
+
+  // AST track (web-tree-sitter WASM): resolve precise import/call edges for
+  // TS/JS/Python/Go/Swift. Runs alongside the regex heuristic track; AST facts win
+  // on merge. Falls back to heuristic-only when the WASM runtime is unavailable
+  // (e.g. TEAMAI_SKIP_AST=1) or throws, recording an AST_UNAVAILABLE gap.
+  const astGaps: KnowledgeGap[] = [];
+
+  if (files.length > 0 && astAvailable()) {
+    try {
+      const { facts: astFacts, result: astResult } = await extractStructuralGraphAsFacts({
+        repoRoot: root,
+        files,
+      });
+
+      facts = mergeCodeFacts(astFacts, facts);
+      let gapSeq = 0;
+
+      for (const gap of astResult.gaps) {
+        astGaps.push({
+          id: `AST-${gap.kind}-${gapSeq++}`,
+          kind: gap.kind,
+          description: gap.message,
+          source: gap.sources.join(', '),
+        });
+      }
+
+      if (!opts.json) {
+        console.log(chalk.dim(`  [AST: ${formatAstStatsSummary(astResult.stats)}]`));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      astGaps.push({
+        id: 'AST-UNAVAILABLE-0',
+        kind: 'AST_UNAVAILABLE',
+        description: `code-ast failed: ${message}; used code-heuristic only.`,
+        source: 'code-ast',
+      });
+    }
+  } else if (files.length > 0) {
+    astGaps.push({
+      id: 'AST-UNAVAILABLE-0',
+      kind: 'AST_UNAVAILABLE',
+      description: 'web-tree-sitter WASM runtime unavailable or TEAMAI_SKIP_AST=1; used code-heuristic only.',
+      source: 'code-ast',
+    });
+  }
+
+  const graph: GraphIndex = buildCodeGraph(facts);
+
+  // Call chain tracing (entry → orchestration → service → data)
+  let callChains: CallChain[];
+  const depPathsFile = path.join(evidenceDir, 'dependency-paths.md');
+
+  if (changedFiles) {
+    // 增量模式：优先复用已有 dependency-paths.md（只有变更文件的 content，无法完整追踪）
+    let reused = false;
+
+    try {
+      const existing = await readFile(depPathsFile, 'utf-8');
+
+      if (existing.trim()) {
+        reused = true;
+      }
+    } catch { /* 文件不存在 */ }
+
+    if (reused) {
+      callChains = [];
+    } else {
+      callChains = traceCallChains(facts, files);
+    }
+  } else {
+    callChains = traceCallChains(facts, files);
+  }
+
+  const pages = buildEvidencePages(facts, project, interfaceInventory, callChains);
+
+  await mkdir(evidenceDir, { recursive: true });
+  // A project evidence directory may have been replaced by a symlink after
+  // extraction started. Do not let generated pages or the baseline escape the
+  // teamwiki root.
+  assertSafePath(evidenceDir, [wikiRoot]);
+
+  // 增量模式下复用已有 dependency-paths.md
+  if (changedFiles && !pages.has('dependency-paths.md')) {
+    try {
+      const existing = await readFile(depPathsFile, 'utf-8');
+      pages.set('dependency-paths.md', existing);
+    } catch { /* 无历史文件，跳过 */ }
+  }
+
+  for (const [filename, content] of pages) {
+    await writeIfChanged(path.join(evidenceDir, filename), content);
+  }
+
+  // Build architecture overlay (directory-level contains edges)
+  const pageSlugs = [...pages.keys()].map(p => `evidence/code/${project}/${p.replace('.md', '')}`);
+  const overlay = buildIndexHubOverlay(project, 'evidence/code', pageSlugs);
+
+  // Merge overlay into the per-repo graph
+  const repoGraph = mergeGraphs(graph, overlay);
+
+  // Stamp ownership before writing, same as buildAggregatedGraph does for an
+  // orchestrated `teamai import` (#974 review round 19 P1): when this write
+  // target IS the real teamwiki root (a direct extractCodebase call, not
+  // routed through import's staging directory), it lands straight in
+  // `teamwiki/.indices/graph-index.json` with no later aggregation step ever
+  // tagging it. Leaving it untagged would let a withheld codebase's fresh
+  // re-extraction bypass origin-based removal entirely, and the stale
+  // evidence/code/<slug>/ per-repo file the fallback would otherwise read
+  // can no longer be trusted to describe it either.
+  for (const node of repoGraph.nodes) node.origin = project;
+
+  for (const edge of repoGraph.edges) edge.origin = project;
+
+  // Write per-repo graph only; global aggregation is done by aggregateGlobalGraph()
+  // in import-repo.ts after all per-repo graphs are in place (avoids write races).
+  await saveGraphIndex(wikiRoot, repoGraph);
+
+  // A deterministic _manifest.json, so deep-enrich has components to work with (#508). The teamai-codebase-enrich
+  // workflow that an import runs next replaces it with the AI tool's analysis; with --skip-enrich it stays.
+  let manifestSource: 'fallback' | 'none' = 'none';
+  let manifestComponentCount = 0;
+
+  const {
+    writeManifest,
+    buildFallbackManifest,
+    groupFactsByModule,
+    describeEvidenceManifest,
+  } = await import('./enrich-with-ai.js');
+
+  const modules = groupFactsByModule(facts);
+
+  if (opts.skipEnrich && !opts.json) console.log(chalk.dim('  [AI enrich: skipped (--skip-enrich)]'));
+  const fallback = buildFallbackManifest({ project, facts, modules });
+
+  if (fallback && fallback.components.length > 0) {
+    await writeManifest(fallback, evidenceDir);
+    manifestSource = 'fallback';
+    manifestComponentCount = fallback.components.length;
+  }
+
+  // Without --skip-enrich the enrich workflow says what it wrote.
+  const manifestNote = opts.skipEnrich ? describeEvidenceManifest(manifestSource, manifestComponentCount) : undefined;
+
+  // 生成模块级摘要页（按顶层目录聚合）
+  const moduleSummaries = buildModuleSummaries(facts, graph, project);
+
+  if (moduleSummaries.size > 0) {
+    const modulesDir = path.join(evidenceDir, 'modules');
+    await mkdir(modulesDir, { recursive: true });
+
+    for (const [filename, content] of moduleSummaries) {
+      await writeIfChanged(path.join(modulesDir, filename), content);
+    }
+  }
+
+  // 生成 overview.md — 确定性架构概览 (B16)
+  const overview = buildOverview(facts, repoGraph, project, interfaceInventory, callChains);
+  await writeIfChanged(path.join(evidenceDir, 'overview.md'), overview);
+
+  // 生成 team-wiki 标准入口文件
+  const proj = [{ slug: project, label: project }];
+  const ifByType: Record<string, number> = {};
+
+  for (const e of interfaceInventory.entries) {
+    ifByType[e.type] = (ifByType[e.type] ?? 0) + e.count;
+  }
+
+  const indexStats: IndexStats = {
+    totalFacts: visibleFactsOf(facts).length,
+    totalNodes: repoGraph.nodes.length,
+    totalEdges: repoGraph.edges.length,
+    interfaces: Object.keys(ifByType).length > 0 ? ifByType : undefined,
+    callChains: callChains.length > 0 ? callChains.length : undefined,
+  };
+
+  await writeIfChanged(path.join(wikiRoot, 'router.md'), routerTemplate(proj));
+  await writeIfChanged(path.join(wikiRoot, 'hot.md'), HOT_TEMPLATE);
+  await writeIfChanged(path.join(wikiRoot, 'index.md'), indexTemplate(proj, indexStats));
+
+  // 生成 gaps/ — 知识缺口追踪
+  const gaps = [...detectKnowledgeGaps(facts, graph, files), ...astGaps];
+  const gapsDir = path.join(wikiRoot, 'gaps');
+  await mkdir(gapsDir, { recursive: true });
+
+  const gapLines = [
+    '---',
+    'title: Knowledge Gaps',
+    `domain: ${project}`,
+    'source: []',
+    '---',
+    '',
+    '# Knowledge Gaps',
+    '',
+    '在代码知识提取过程中发现的缺口。这些条目表示知识库尚未覆盖的领域，recall 命中 gap 时不应凭空回答。',
+    '',
+    '| ID | Kind | Status | Description | Source |',
+    '|----|------|--------|-------------|--------|',
+  ];
+
+  for (const gap of gaps) {
+    gapLines.push(`| ${gap.id} | ${gap.kind} | open | ${gap.description} | ${gap.source} |`);
+  }
+
+  if (gaps.length === 0) {
+    gapLines.push('| — | — | — | 未发现明显知识缺口 | — |');
+  }
+
+  gapLines.push('');
+  await writeIfChanged(path.join(gapsDir, 'detected.md'), gapLines.join('\n'));
+
+  // 更新 facts 和 interfaces 缓存
+  await saveFactsCache(indicesDir, facts);
+  await saveInterfacesCache(indicesDir, interfaceInventory);
+
+  // 构建完整的 manifest 文件列表
+  let allManifestFiles = collectionManifest.files.map((f) => ({
+    relativePath: f.relativePath,
+    sha256: f.sha256,
+    language: f.language,
+  }));
+
+  if (changedFiles !== undefined && changedFiles.length > 0) {
+    // 有变更/新增文件：合并旧 manifest 中未变更的记录 + 新扫描的记录
+    try {
+      const oldManifestRaw = await readFile(incrementalManifestPath, 'utf-8');
+
+      const oldManifest = SourceManifestSchema.parse(JSON.parse(oldManifestRaw));
+      const changedSet = new Set([...changedFiles, ...deletedFiles]);
+
+      const unchanged = (oldManifest.files ?? []).flatMap((f) => (f && !changedSet.has(f.relativePath)
+        ? [{ relativePath: f.relativePath, sha256: f.sha256, language: f.language ?? '' }]
+        : []));
+
+      allManifestFiles = [...unchanged, ...allManifestFiles];
+    } catch { /* 无旧 manifest，只用当前的 */ }
+  } else if (changedFiles !== undefined && changedFiles.length === 0 && deletedFiles.length > 0) {
+    // 仅删除：从旧 manifest 过滤已删除文件（collectCode 返回全量，不需要合并）
+    const deletedSet = new Set(deletedFiles);
+    allManifestFiles = allManifestFiles.filter(f => !deletedSet.has(f.relativePath));
+  }
+
+  // Persist git baseline from prior incremental manifest when not explicitly supplied
+  const prevRepoUrl = provenanceManifest?.repoUrl;
+  const prevBranch = provenanceManifest?.branch;
+  const prevIngestedMrs = provenanceManifest?.ingestedMrs ?? [];
+  const sameSource = provenanceManifest !== null;
+
+  const headSha = collectionManifest.commit;
+
+  const manifestObject: WrittenSourceManifest = {
+    version: CODE_COLLECTION_VERSION,
+    lastScan: new Date().toISOString(),
+    project,
+    files: allManifestFiles,
+  };
+
+  if (sourceRepo.sourceSubdir !== undefined) manifestObject.sourceSubdir = sourceRepo.sourceSubdir;
+
+  // The hashed git root is what lets a later run recognise this baseline when
+  // the checkout has no remote (#1422). A checkout with a remote is identified
+  // by `repoIdentity`, so nothing reads it there and it is not written.
+  if (!sourceRepo.repoUrl) manifestObject.localRootHash = sourceRepo.localRootHash;
+
+  if (headSha) manifestObject.headSha = headSha;
+  const repoUrl = sourceRepo.repoUrl ?? (sameSource ? prevRepoUrl : undefined);
+  const branch = opts.branch ?? prevBranch;
+
+  if (repoUrl) manifestObject.repoUrl = repoUrl;
+  const currentRepoIdentity = sourceRepo.repoIdentity ?? (sameSource ? provenanceManifest?.repoIdentity : undefined);
+
+  if (currentRepoIdentity) manifestObject.repoIdentity = currentRepoIdentity;
+
+  // branch and MR provenance are tied to a source repository as well.
+  if (branch && (sameSource || opts.branch)) manifestObject.branch = branch;
+  // P5: record ingested MR (upsert by url) when invoked via --from-mr
+  let ingestedMrs = sameSource ? prevIngestedMrs : [];
+  const sourceMrUrls = [opts.sourceMrUrl ?? []].flat();
+
+  if (sourceMrUrls.length > 0) {
+    const at = new Date().toISOString();
+    // One run can ingest several MRs of the same repo (#1104); each is upserted by url.
+    ingestedMrs = [
+      ...ingestedMrs.filter((m) => !sourceMrUrls.includes(m.url)),
+      ...sourceMrUrls.map((url) => ({ url, headSha, at })),
+    ];
+  }
+
+  if (ingestedMrs.length > 0) manifestObject.ingestedMrs = ingestedMrs;
+  const manifestContent = JSON.stringify(manifestObject, null, 2);
+  // The per-codebase sidecar is new output and may be replaced by a local
+  // symlink. Resolve it before writing so it cannot redirect metadata outside
+  // the teamwiki tree.
+  assertSafePath(projectManifestPath, [wikiRoot]);
+  await writeFile(manifestPath, manifestContent, 'utf-8');
+  // Keep a copy with each codebase's evidence. A teamwiki may contain several
+  // imported repositories, while the legacy root manifest is overwritten by
+  // the most recently extracted one.
+  await writeFile(projectManifestPath, manifestContent, 'utf-8');
+
+  const byKind: Record<string, number> = {};
+
+  for (const fact of visibleFactsOf(facts)) {
+    byKind[fact.kind] = (byKind[fact.kind] ?? 0) + 1;
+  }
+
+  const result: ExtractResult = {
+    project,
+    filesScanned: files.length,
+    facts: { total: visibleFactsOf(facts).length, byKind },
+    graph: { nodes: repoGraph.nodes.length, edges: repoGraph.edges.length },
+    incremental: !!opts.incremental && !!changedFiles,
+    outputDir: wikiRoot,
+    manifest: {
+      written: manifestSource !== 'none',
+      source: manifestSource,
+      components: manifestComponentCount,
+    },
+  };
+
+  if (manifestNote) result.manifest.note = manifestNote;
+
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(chalk.green(`[extract] ${project} complete`));
+    console.log(`  Files: ${result.filesScanned}`);
+    console.log(`  Facts: ${result.facts.total} (${Object.entries(byKind).map(([k, v]) => `${k}:${v}`).join(', ')})`);
+    console.log(`  Graph: ${result.graph.nodes} nodes, ${result.graph.edges} edges`);
+
+    if (interfaceInventory.entries.length > 0) {
+      const byType: Record<string, number> = {};
+
+      for (const e of interfaceInventory.entries) byType[e.type] = (byType[e.type] ?? 0) + e.count;
+      console.log(`  Interfaces: ${Object.entries(byType).map(([t, c]) => `${t}:${c}`).join(', ')}`);
+    }
+
+    if (callChains.length > 0) {
+      console.log(`  Call chains: ${callChains.length} chains (max depth ${Math.max(...callChains.map(c => c.depth))})`);
+    }
+
+    console.log(`  Output: ${wikiRoot}`);
+
+    if (manifestNote) {
+      console.log(`  ${manifestNote}`);
+    }
+  }
+
+  return true;
+}

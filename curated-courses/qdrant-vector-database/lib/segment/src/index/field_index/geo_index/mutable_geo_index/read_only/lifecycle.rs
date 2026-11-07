@@ -1,0 +1,90 @@
+use std::path::PathBuf;
+
+use blobstore::BlobstoreReader;
+use common::ambient;
+use common::ambient::hw::HwMetric;
+use common::bitvec::BitSlice;
+use common::reason::reason;
+use common::types::PointOffsetType;
+use common::universal_io::{CachedReadFs, OkNotFound, Populate, UniversalRead, UniversalReadFs};
+
+use super::super::inner::InMemoryGeoIndex;
+use super::ReadOnlyAppendableGeoIndex;
+use crate::common::operation_error::{OperationError, OperationResult};
+use crate::types::{GeoPoint, RawGeoPoint};
+
+impl<S: UniversalRead> ReadOnlyAppendableGeoIndex<S> {
+    /// Schedule background prefetch of the Gridstore files [`open`](Self::open)
+    /// will read.
+    ///
+    /// Returns whether the on-disk directory exists.
+    pub fn preopen(fs: &impl CachedReadFs<File = S>, dir: PathBuf) -> OperationResult<bool> {
+        // Blobstore reader
+        Ok(
+            BlobstoreReader::<Vec<RawGeoPoint>, S>::preopen(fs, dir, Populate::PreferBackground)
+                .ok_not_found()?
+                .is_some(),
+        )
+    }
+
+    /// Open the appendable (Gridstore) geo index read-only, threading every
+    /// file open through the filesystem handle `fs`.
+    ///
+    /// Opens a [`BlobstoreReader`] over the generic filesystem object, then
+    /// rebuilds the in-memory geohash buckets by iterating every stored point
+    /// through [`InMemoryGeoIndex::ingest_raw_points`] — the exact
+    /// reconstruction the writable [`MutableGeoIndex::open_gridstore`][1]
+    /// performs over a writable `Blobstore`. No write path; the reader is
+    /// retained for `files` / `clear_cache`.
+    ///
+    /// Returns [`Ok(None)`] when the on-disk directory doesn't exist, matching
+    /// the `create_if_missing == false` branch of the writable counterpart —
+    /// the read path never creates.
+    ///
+    /// Values at or past `max_point_offset` are skipped, as the id tracker may
+    /// not yet cover them.
+    ///
+    /// [1]: super::super::MutableGeoIndex::open_gridstore
+    pub fn open(
+        fs: &impl UniversalReadFs<File = S>,
+        path: PathBuf,
+        max_point_offset: PointOffsetType,
+        deleted: &BitSlice,
+    ) -> OperationResult<Option<Self>> {
+        let Some(storage) =
+            BlobstoreReader::<Vec<RawGeoPoint>, S>::open(fs, path, Populate::Blocking)
+                .ok_not_found()?
+        else {
+            // Files don't exist, cannot load
+            return Ok(None);
+        };
+
+        let mut in_memory_index = InMemoryGeoIndex::new();
+        let _scope = ambient::unmeasured_guard(reason("Internal operation"));
+        storage
+            .iter::<_, OperationError>(
+                storage.max_point_offset()?.min(max_point_offset),
+                |idx, values: Vec<RawGeoPoint>| {
+                    if deleted.get(idx as usize).is_some_and(|deleted| *deleted) {
+                        return Ok(true);
+                    }
+                    let geo_points = values.into_iter().map(GeoPoint::from).collect::<Vec<_>>();
+                    in_memory_index.add_many_geo_points(idx, geo_points)?;
+                    Ok(true)
+                },
+                // Same counter the writable `open_gridstore` load uses; this is
+                // a disposable counter, so the exact metric is unobservable.
+                HwMetric::PayloadIndexIoRead,
+            )
+            .map_err(|err| {
+                OperationError::service_error(format!(
+                    "Failed to load read-only appendable geo index from gridstore: {err}"
+                ))
+            })?;
+
+        Ok(Some(Self {
+            in_memory_index,
+            storage,
+        }))
+    }
+}

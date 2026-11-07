@@ -1,0 +1,314 @@
+/**
+ * Where `learnings/` is read from and written to.
+ *
+ * Every reader used to build this path itself, from a different base, so a
+ * forgotten call site did not fail: it read an empty directory and `recall`
+ * quietly returned less. One accessor makes the set of roots a single decision,
+ * and makes moving the write target one edit (#485).
+ */
+import path from 'node:path';
+
+import { isAbsolutePath, isWithin } from './agent-path.js';
+import { listFiles, listFilesRecursive } from './fs.js';
+import { isSafeNamespaceSegment } from '../manifest-schema.js';
+import { log } from './logger.js';
+import { learningsBranch } from './learnings-branch.js';
+import { ForeignCheckoutError } from './branch-worktree.js';
+import type { UnreadableFile } from './search-index.js';
+import {
+  getDataHome,
+  getKnowledgeDir,
+  getUserLearningsDir,
+  type LocalConfig,
+} from '../types.js';
+
+export interface LearningsRoots {
+  /**
+   * Where new learnings are written. Always identical to `read[0]`, so a write
+   * is immediately the highest-precedence read.
+   */
+  write: string;
+  /**
+   * Every directory learnings are read from, highest precedence first.
+   *
+   * Invariants:
+   *  - never empty, and `read[0] === write`
+   *  - the knowledge clone's `learnings/` is always among them, whatever the
+   *    write root is, so a team keeps reading the corpus it already wrote
+   *  - entries are absolute and de-duplicated, and may not exist on disk
+   *  - for kind 'http' the write root is the knowledge dir itself: that backend
+   *    has no branch and no worktree
+   *
+   * For the same relative path in two roots the first one wins. That rule is
+   * applied while collecting, not afterwards, because the relative path is also
+   * the id votes are counted by.
+   *
+   * The contribution queue is deliberately NOT here. Recall and the index read
+   * it, so a contribution is findable before it is published, but pruning and
+   * promotion must not act on a learning that has not reached the team yet.
+   * Those callers add `pendingLearningsDir` themselves.
+   */
+  read: readonly string[];
+}
+
+/**
+ * The knowledge clone's learnings directory: what the team wrote before
+ * learnings moved to their own branch. Read forever, written never — nothing
+ * is copied out of it and nothing is deleted from it (#485).
+ */
+function inheritedRoot(localConfig: LocalConfig): string {
+  return path.join(getKnowledgeDir(localConfig), 'learnings');
+}
+
+/**
+ * Where new learnings are written: the `teamai-learnings` worktree. For an
+ * HTTP backend, which has no branch, this is the knowledge dir itself, so the
+ * write and inherited roots collapse into one.
+ */
+function writeRoot(localConfig: LocalConfig): string {
+  return path.join(learningsBranch.dir(localConfig), 'learnings');
+}
+
+/**
+ * Resolve the learnings roots for this repo. Pure: no I/O, no worktree
+ * creation, no network, so it is safe on path-only code paths.
+ */
+export function learningsRoots(localConfig: LocalConfig): LearningsRoots {
+  const write = writeRoot(localConfig);
+  const read = [write];
+
+  // The machine-local mirror is shared by every project on this machine, so it
+  // is only a root when the scope is the machine-wide one. In project scope it
+  // would surface another project's learnings in this project's recall.
+  if (localConfig.scope === 'user') {
+    read.push(getUserLearningsDir());
+  }
+
+  // This scope's own partition cache. `getDataHome` throws for a project-scoped
+  // config with no project root, which the schema allows, so a missing cache is
+  // simply one root fewer.
+  try {
+    read.push(path.join(getDataHome(localConfig), 'learnings'));
+  } catch {
+    // no partition for this config
+  }
+
+  read.push(inheritedRoot(localConfig));
+
+  return { write, read: dedupe(read) };
+}
+
+/**
+ * The read roots an index may be built from: all of them, except the write
+ * root when the learnings checkout there belongs to another repository (a
+ * git/self mode switch, #808). Everything else this project owns, the queue
+ * included, stays indexed. Probes the checkout, so only for index builds.
+ *
+ * With `unreadable`, a checkout whose owner cannot be told stays in its place
+ * and is recorded there as a root the build was given and could not read
+ * (#1006), instead of the error being thrown: the build reads nothing under it
+ * and puts back what the previous index held there, in that root's slot.
+ */
+export async function indexableLearningsRoots(
+  localConfig: LocalConfig, unreadable?: UnreadableFile[],
+): Promise<readonly string[]> {
+  const roots = learningsRoots(localConfig);
+
+  try {
+    await learningsBranch.checkOwner(localConfig);
+
+    return roots.read;
+  } catch (e) {
+    if (!(e instanceof ForeignCheckoutError)) {
+      if (!unreadable) throw e;
+      unreadable.push({ path: roots.write, reason: e instanceof Error ? e.message : String(e) });
+
+      return roots.read;
+    }
+
+    return roots.read.filter((root) => root !== roots.write);
+  }
+}
+
+/**
+ * The directories recalled knowledge is read from: the repo clone (docs, rules,
+ * skills), the user-scope mirror, recall's learnings roots, and the
+ * contribution queue, which recall indexes first and which, for git teams,
+ * lives outside the clone. An adoption question reads excerpts only under them, and
+ * a tool call's read is adoption evidence only under them (#723, #884).
+ *
+ * The clone and the mirror are always included; the rest are added
+ * best-effort, so a failure to resolve them yields the smaller set, never an
+ * error. Another repository's learnings checkout, if one sits where this
+ * project's would (#808), is left out, judged from git's files since a hook
+ * starts no git process.
+ */
+export async function knowledgeRoots(localConfig: LocalConfig): Promise<string[]> {
+  const roots = [localConfig.repo.localPath, getUserLearningsDir()];
+
+  try {
+    const { pendingLearningsDir } = await import('./pending-learnings.js');
+    const checkout = learningsBranch.dir(localConfig);
+    const foreign = await learningsBranch.isForeignByFiles(localConfig);
+    const inCheckout = (root: string) => root === checkout || root.startsWith(`${checkout}${path.sep}`);
+    roots.push(
+      ...learningsRoots(localConfig).read.filter((root) => !foreign || !inCheckout(root)),
+      pendingLearningsDir(localConfig),
+    );
+  } catch (e) {
+    log.debug(`knowledgeRoots: could not resolve the learnings roots: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  return roots.filter(Boolean);
+}
+
+/**
+ * Whether `absPath` is one of `roots` or lies under one, each written on
+ * either platform (agent-path): `/c/kb/x.md` lies under `C:\kb`.
+ */
+export function isUnderRoots(absPath: string, roots: readonly string[]): boolean {
+  const absolute = (p: string): string => isAbsolutePath(p) ? p : path.resolve(p);
+
+  return roots.some((root) => isWithin(absolute(absPath), absolute(root)));
+}
+
+/** One learning file, and the root it actually lives in. */
+export interface LearningFile {
+  /** Path relative to its root, which is also the id votes are counted by. */
+  file: string;
+  /** Absolute path to the file on disk. */
+  absPath: string;
+  /** The root it came from, so an in-place mutation knows where it is. */
+  root: string;
+}
+
+/**
+ * List the flat `.md` learnings across roots, highest precedence first.
+ *
+ * Same precedence rule as the search index: for one relative path the first
+ * root wins, so a superseded copy in an inherited root is never listed twice
+ * and never shadows the current one.
+ */
+export interface LearningsTreeVisitor<T> {
+  onRoot: (root: string) => Promise<T[]>;
+  onNamespace: (root: string, ns: string, nsDir: string) => Promise<T[]>;
+  getId: (item: T) => string;
+}
+
+/**
+ * Shared walk across learnings roots and active namespaces.
+ *
+ * Always enumerates the flat `.md` files at each root. When `namespaces` is
+ * provided, also enumerates `.md` files under `learnings/<ns>/` (recursive)
+ * for each safe namespace (`isSafeNamespaceSegment`).
+ *
+ * For the same id across roots, the first root wins.
+ */
+export async function walkLearningsTree<T>(
+  roots: readonly string[],
+  namespaces: readonly string[] | undefined,
+  visitor: LearningsTreeVisitor<T>,
+): Promise<T[]> {
+  const out: T[] = [];
+  const claimed = new Set<string>();
+
+  for (const root of roots) {
+    const rootItems = await visitor.onRoot(root);
+
+    for (const item of rootItems) {
+      const id = visitor.getId(item);
+
+      if (claimed.has(id)) continue;
+      claimed.add(id);
+      out.push(item);
+    }
+
+    if (namespaces !== undefined) {
+      for (const ns of namespaces) {
+        if (!isSafeNamespaceSegment(ns)) continue;
+        const nsDir = path.join(root, ns);
+        const nsItems = await visitor.onNamespace(root, ns, nsDir);
+
+        for (const item of nsItems) {
+          const id = visitor.getId(item);
+
+          if (claimed.has(id)) continue;
+          claimed.add(id);
+          out.push(item);
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * List the flat `.md` learnings across roots, or root plus active namespaces
+ * when `namespaces` is passed, highest precedence first.
+ *
+ * Same precedence rule as the search index: for one relative path the first
+ * root wins, so a superseded copy in an inherited root is never listed twice
+ * and never shadows the current one.
+ */
+export async function listLearningFiles(
+  roots: readonly string[],
+  namespaces?: readonly string[],
+): Promise<LearningFile[]> {
+  return walkLearningsTree<LearningFile>(roots, namespaces, {
+    onRoot: async (root) => {
+      let files: string[] = [];
+
+      try {
+        files = await listFiles(root);
+      } catch {
+        return [];
+      }
+
+      return files
+        .filter((file) => file.endsWith('.md'))
+        .map((file) => ({ file, absPath: path.join(root, file), root }));
+    },
+    onNamespace: async (root, ns, nsDir) => {
+      let files: string[] = [];
+
+      try {
+        files = await listFilesRecursive(nsDir);
+      } catch {
+        return [];
+      }
+
+      return files
+        .filter((rel) => rel.endsWith('.md'))
+        .map((rel) => ({ file: path.join(ns, rel), absPath: path.join(nsDir, rel), root }));
+    },
+    getId: (item) => item.file,
+  });
+}
+
+/**
+ * Whether this learning lives in the root teamai publishes from.
+ *
+ * A learning outside it is in a checkout nothing pushes: changing it there
+ * reaches no teammate and the next realign can undo it. Every mutation asks
+ * this before deciding whether to write in place or in the write root.
+ */
+export function isInWriteRoot(absPath: string, rootPath: string): boolean {
+  const resolved = path.resolve(absPath);
+  const root = path.resolve(rootPath);
+
+  return resolved === root || resolved.startsWith(root + path.sep);
+}
+
+function dedupe(dirs: string[]): string[] {
+  const seen = new Set<string>();
+
+  return dirs.filter((dir) => {
+    const key = path.resolve(dir);
+
+    if (seen.has(key)) return false;
+    seen.add(key);
+
+    return true;
+  });
+}

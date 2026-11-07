@@ -1,0 +1,269 @@
+import { describe, it, expect } from 'vitest';
+import { isRelevantScore, computeIdfBaseline, normalizeLearningsScoreForRanking, rankingScoreOf, LEARNINGS_RELEVANCE_RATIO, LEARNINGS_ABSOLUTE_FLOOR } from '../recall.js';
+import type { SearchIndex } from '../types.js';
+
+// ─── Helpers ──────────────────────────────────────────────
+
+function makeIndex(entryCount: number, withDf: boolean): SearchIndex {
+  const entries = Array.from({ length: entryCount }, (_, i) => ({
+    filename: `doc-${i}.md`,
+    title: `Doc ${i}`,
+    author: 'test',
+    date: '2026-01-01',
+    tags: [],
+    tokens: ['token'],
+    votes: 0,
+    type: 'learnings' as const,
+  }));
+  return {
+    builtAt: '2026-01-01T00:00:00Z',
+    elapsedMs: 0,
+    entries,
+    df: withDf ? { token: entryCount } : undefined,
+  };
+}
+
+function makeDomainIndex(technicalCount: number, opsCount: number): SearchIndex {
+  const entries = [
+    ...Array.from({ length: technicalCount }, (_, i) => ({
+      filename: `tech-${i}.md`,
+      title: `Tech ${i}`,
+      author: 'test',
+      date: '2026-01-01',
+      tags: [],
+      tokens: ['token'],
+      votes: 0,
+      type: 'learnings' as const,
+      domain: 'technical' as const,
+    })),
+    ...Array.from({ length: opsCount }, (_, i) => ({
+      filename: `ops-${i}.md`,
+      title: `Ops ${i}`,
+      author: 'test',
+      date: '2026-01-01',
+      tags: [],
+      tokens: ['token'],
+      votes: 0,
+      type: 'learnings' as const,
+      domain: 'ops' as const,
+    })),
+  ];
+  return {
+    builtAt: '2026-01-01T00:00:00Z',
+    elapsedMs: 0,
+    entries,
+    df: { token: entries.length },
+    dfByDomain: {
+      technical: { token: technicalCount },
+      ops: { token: opsCount },
+    },
+  };
+}
+
+// ─── computeIdfBaseline ───────────────────────────────────
+
+describe('computeIdfBaseline', () => {
+  it('returns 1 for a legacy index with no df field', () => {
+    const idx = makeIndex(25, false);
+    expect(computeIdfBaseline([idx])).toBe(1);
+  });
+
+  it('returns 1 when entries array is empty (no entries to compute baseline from)', () => {
+    const idx: SearchIndex = {
+      builtAt: '2026-01-01T00:00:00Z',
+      elapsedMs: 0,
+      entries: [],
+      df: {},
+    };
+    expect(computeIdfBaseline([idx])).toBe(1);
+  });
+
+  it('returns log((N+1)/2)+1 for N=25 with df present', () => {
+    const idx = makeIndex(25, true);
+    expect(computeIdfBaseline([idx])).toBeCloseTo(Math.log(13) + 1, 5);
+  });
+
+  it('uses the index with the most entries when multiple indexes are given', () => {
+    const small = makeIndex(5, true);
+    const large = makeIndex(25, true);
+    // should pick large (N=25), not small (N=5)
+    const expected = Math.log((25 + 1) / 2) + 1;
+    expect(computeIdfBaseline([small, large])).toBeCloseTo(expected, 5);
+    expect(computeIdfBaseline([large, small])).toBeCloseTo(expected, 5);
+  });
+
+  it('ignores legacy (no-df) indexes when picking maxEntries', () => {
+    // Legacy index is larger than the df-bearing one — its N must NOT be used.
+    // Without the P2-6 fix, the legacy index's entry count would inflate the
+    // baseline and silently raise the threshold against unrelated results.
+    const legacy = makeIndex(100, false); // large but no df
+    const modern = makeIndex(10, true);   // small but has df
+    const expected = Math.log((10 + 1) / 2) + 1;
+    expect(computeIdfBaseline([legacy, modern])).toBeCloseTo(expected, 5);
+  });
+
+  it('uses the matching domain corpus for a result baseline', () => {
+    const index = makeDomainIndex(25, 100);
+    expect(computeIdfBaseline([index], 'technical')).toBeCloseTo(Math.log(13) + 1, 5);
+    expect(computeIdfBaseline([index], 'ops')).toBeCloseTo(Math.log(101 / 2) + 1, 5);
+  });
+
+  it('does not let unrelated domains raise a result baseline', () => {
+    const technicalOnly = makeDomainIndex(25, 100);
+    const withMoreOps = makeDomainIndex(25, 1000);
+    const expected = Math.log(13) + 1;
+    expect(computeIdfBaseline([technicalOnly], 'technical')).toBeCloseTo(expected, 5);
+    expect(computeIdfBaseline([withMoreOps], 'technical')).toBeCloseTo(expected, 5);
+  });
+});
+
+// ─── cross-source ranking normalization ──────────────────
+
+describe('normalizeLearningsScoreForRanking', () => {
+  it('maps the corpus-aware learnings relevance threshold to the codebase threshold', () => {
+    for (const baseline of [1, 8]) {
+      const threshold = Math.max(baseline * LEARNINGS_RELEVANCE_RATIO, LEARNINGS_ABSOLUTE_FLOOR);
+      expect(normalizeLearningsScoreForRanking(threshold, baseline)).toBeCloseTo(4.0, 5);
+    }
+  });
+
+  it('keeps equivalent relevance ratios on the same scale as the corpus grows', () => {
+    const smallCorpus = normalizeLearningsScoreForRanking(8, 1); // 2x the cold-start threshold
+    const largeCorpus = normalizeLearningsScoreForRanking(21.6, 8); // 2x the relative threshold
+    expect(largeCorpus).toBeCloseTo(smallCorpus, 5);
+  });
+
+  it('is monotonic and bounded, with irrelevant learnings below the relevance threshold', () => {
+    const threshold = Math.max(8 * LEARNINGS_RELEVANCE_RATIO, LEARNINGS_ABSOLUTE_FLOOR);
+    const below = normalizeLearningsScoreForRanking(threshold - 1, 8);
+    const at = normalizeLearningsScoreForRanking(threshold, 8);
+    const above = normalizeLearningsScoreForRanking(threshold * 8, 8);
+    expect(below).toBeLessThan(4);
+    expect(at).toBeCloseTo(4, 5);
+    expect(above).toBe(10);
+  });
+
+  it('uses the cold-start baseline for missing or invalid IDF baselines', () => {
+    expect(normalizeLearningsScoreForRanking(8, 0)).toBeCloseTo(6, 5);
+  });
+});
+
+describe('rankingScoreOf', () => {
+  // A codebase graph score >= 31 saturates the shared 0-10 scale, which is why
+  // generated module overviews used to outrank the hand-written deep pages that
+  // actually answer the question. The penalty exists to break that tie in the
+  // docs' favour without touching either relevance threshold.
+  const SATURATED_CODE_SCORE = Math.min(10, Math.log2(31 + 1) * 2);
+
+  it('ranks a saturated learnings hit above a saturated codebase hit', () => {
+    const baseline = 8;
+    const code = rankingScoreOf({ score: SATURATED_CODE_SCORE, fromCodebase: true }, baseline);
+    const docs = rankingScoreOf({ score: baseline * 64, idfBaseline: baseline }, baseline);
+    expect(docs).toBe(10);
+    expect(code).toBeLessThan(docs);
+  });
+
+  it('keeps the order among codebase hits intact', () => {
+    const weak = rankingScoreOf({ score: 5, fromCodebase: true }, 8);
+    const strong = rankingScoreOf({ score: 9, fromCodebase: true }, 8);
+    expect(weak).toBeLessThan(strong);
+  });
+
+  it('does not change the score that --check and the output report see', () => {
+    // A codebase hit just above the 4.0 bar: the relevance check reads the raw
+    // score, so it stays relevant, while the penalized score it is ordered by
+    // falls below that bar. The two must not be confused.
+    const result = { score: 4.1, fromCodebase: true };
+    expect(isRelevantScore(result.score, true, 8)).toBe(true);
+    expect(rankingScoreOf(result, 8)).toBeLessThan(4.0);
+    expect(result.score).toBe(4.1); // the raw score is what isRelevantScore compares
+  });
+});
+
+// ─── isRelevantScore ─────────────────────────────────────
+
+describe('isRelevantScore', () => {
+  describe('codebase hits (bounded [0,10] scale)', () => {
+    it('returns true when score is exactly at CODEBASE_RELEVANCE_THRESHOLD (4.0)', () => {
+      expect(isRelevantScore(4.0, true, 1)).toBe(true);
+    });
+
+    it('returns false when score is just below threshold (3.9)', () => {
+      expect(isRelevantScore(3.9, true, 1)).toBe(false);
+    });
+
+    it('is not affected by idfBaseline — a large baseline does not change the verdict', () => {
+      // even with a baseline of 100 the codebase branch still uses the fixed threshold
+      expect(isRelevantScore(4.0, true, 100)).toBe(true);
+      expect(isRelevantScore(3.9, true, 100)).toBe(false);
+    });
+  });
+
+  describe('learnings hits (TF-IDF unbounded, floor + ratio)', () => {
+    // The effective threshold is max(baseline * 1.35, 4.0).
+    //
+    // Cross-over baseline: 4.0 / 1.35 ≈ 2.963 (corresponds to N ≈ 6–7).
+    //   - baseline < 2.963 → floor (4.0) wins
+    //   - baseline > 2.963 → relative threshold (baseline * 1.35) wins
+
+    // --- Relative threshold governs (N=25, baseline > cross-over) ---
+    // baseline for N=25: log(26/2)+1 ≈ 3.5649; threshold = 3.5649 * 1.35 ≈ 4.813
+    // floor (4.0) is below the relative threshold, so relative wins.
+    const baseline25 = computeIdfBaseline([makeIndex(25, true)]);
+
+    it('N=25: relative threshold governs — score just above baseline*1.35 passes', () => {
+      // Verify relative threshold is above the floor at this corpus size.
+      expect(baseline25 * 1.35).toBeGreaterThan(4.0);
+      expect(isRelevantScore(4.82, false, baseline25)).toBe(true);
+    });
+
+    it('N=25: relative threshold governs — score just below baseline*1.35 fails', () => {
+      expect(isRelevantScore(4.80, false, baseline25)).toBe(false);
+    });
+
+    // --- Floor governs (idfBaseline = 1, cold-start / legacy fallback) ---
+    // threshold = max(1 * 1.35, 4.0) = 4.0
+    // Before the floor was added, threshold was 1.35 — a single tag match
+    // (~1.7) would have passed on a 1-entry corpus, causing false positives.
+
+    it('cold-start (baseline=1): floor governs — 4.0 passes', () => {
+      // floor: 4.0; relative: 1.35 → floor wins
+      expect(isRelevantScore(4.0, false, 1)).toBe(true);
+    });
+
+    it('cold-start (baseline=1): floor governs — 3.9 fails', () => {
+      expect(isRelevantScore(3.9, false, 1)).toBe(false);
+    });
+
+    it('cold-start (baseline=1): old passing score (1.35) now correctly fails', () => {
+      // Before the floor, isRelevantScore(1.35, false, 1) returned true.
+      // With the floor at 4.0, it must return false to prevent cold-start false positives.
+      expect(isRelevantScore(1.35, false, 1)).toBe(false);
+    });
+
+    // --- Cross-over boundary (baseline ≈ 2.963) ---
+    // At baseline exactly equal to 4.0/1.35, both sides tie at 4.0.
+    // Below this baseline the floor wins; above it the ratio wins.
+    it('below cross-over (baseline=2.0): floor governs — threshold is 4.0', () => {
+      // relative = 2.0 * 1.35 = 2.70 < 4.0 → floor wins
+      expect(isRelevantScore(3.99, false, 2.0)).toBe(false);
+      expect(isRelevantScore(4.0, false, 2.0)).toBe(true);
+    });
+
+    it('above cross-over (baseline=3.5): relative threshold governs', () => {
+      // relative = 3.5 * 1.35 ≈ 4.725 > 4.0 → relative wins
+      // Using computed threshold to avoid floating-point boundary issues.
+      const relThreshold = 3.5 * 1.35; // ≈ 4.725
+      expect(isRelevantScore(relThreshold - 0.001, false, 3.5)).toBe(false);
+      expect(isRelevantScore(relThreshold + 0.001, false, 3.5)).toBe(true);
+    });
+  });
+
+  describe('defensive: idfBaseline = 0', () => {
+    it('treats idfBaseline=0 as 1 — floor (4.0) governs', () => {
+      // baseline 0 is normalised to 1; threshold = max(1.35, 4.0) = 4.0
+      expect(isRelevantScore(3.99, false, 0)).toBe(false);
+      expect(isRelevantScore(4.0, false, 0)).toBe(true);
+    });
+  });
+});

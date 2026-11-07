@@ -1,0 +1,305 @@
+use std::path::PathBuf;
+
+use common::types::PointOffsetType;
+use serde_json::Value;
+
+use super::{StorageType, StructPayloadIndex};
+use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult};
+use crate::index::field_index::FieldIndex;
+use crate::index::field_index::schema_transition::{SchemaTransition, classify};
+use crate::index::payload_config::PayloadFieldSchemaWithIndexType;
+use crate::index::{BuildIndexResult, PayloadIndex};
+use crate::json_path::JsonPath;
+use crate::payload_storage::{PayloadStorage, PayloadStorageRead};
+use crate::types::{
+    Payload, PayloadContainer, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef,
+};
+
+impl PayloadIndex for StructPayloadIndex {
+    fn build_index(
+        &self,
+        field: PayloadKeyTypeRef,
+        payload_schema: &PayloadFieldSchema,
+    ) -> OperationResult<BuildIndexResult> {
+        if let Some(prev_schema) = self.config().indices.get(field) {
+            let transition = classify(&prev_schema.schema, payload_schema);
+            return match transition {
+                SchemaTransition::Identical => Ok(BuildIndexResult::AlreadyBuilt),
+                // Metadata-only changes are persisted by `drop_index_if_incompatible`;
+                // the live index handles stay untouched.
+                SchemaTransition::Compatible(diff) if diff.metadata_only() => {
+                    Ok(BuildIndexResult::AlreadyBuilt)
+                }
+                // `on_disk` flipped (possibly together with `enable_hnsw`): reuse the
+                // existing files, reloaded in the new mode, instead of rebuilding from
+                // payload.
+                SchemaTransition::Compatible(_) => self.reuse_or_build_index(field, payload_schema),
+                SchemaTransition::Incompatible => Ok(BuildIndexResult::IncompatibleSchema),
+            };
+        }
+        let indexes = self.build_field_indexes(field, payload_schema)?;
+        Ok(BuildIndexResult::Built(indexes))
+    }
+
+    fn apply_index(
+        &mut self,
+        field: PayloadKeyType,
+        payload_schema: PayloadFieldSchema,
+        field_index: Vec<FieldIndex>,
+    ) -> OperationResult<()> {
+        // Contract: `field_index` data must already be durable when this is called —
+        // the config saved below is the durable commit marker the loader and WAL
+        // replay trust, and it must never list an index whose postings only exist in
+        // memory. Live builds persist in `Segment::build_field_index` (build phase,
+        // so no index I/O happens here under the segment write lock); the load-time
+        // rebuild persists in `load_from_db`; `SegmentBuilder` segments are exempt
+        // because they are not loadable until the builder flushes and promotes them.
+        let index_types: Vec<_> = field_index
+            .iter()
+            .map(|i| i.get_full_index_type())
+            .collect();
+        self.field_indexes.insert(field.clone(), field_index);
+
+        self.config.indices.insert(
+            field,
+            PayloadFieldSchemaWithIndexType::new(payload_schema, index_types),
+        );
+
+        self.save_config()?;
+
+        Ok(())
+    }
+
+    fn set_indexed(
+        &mut self,
+        field: PayloadKeyTypeRef,
+        payload_schema: impl Into<PayloadFieldSchema>,
+    ) -> OperationResult<()> {
+        let payload_schema = payload_schema.into();
+
+        self.drop_index_if_incompatible(field, &payload_schema)?;
+
+        let field_index = match self.build_index(field, &payload_schema)? {
+            BuildIndexResult::Built(field_index) => field_index,
+            BuildIndexResult::AlreadyBuilt => {
+                // Index already built, no need to do anything
+                return Ok(());
+            }
+            BuildIndexResult::IncompatibleSchema => {
+                // We should have fixed it by now explicitly
+                // If it is not fixed, it is a bug
+                return Err(OperationError::service_error(format!(
+                    "Incompatible schema for field `{field}`. Please drop the index first."
+                )));
+            }
+        };
+
+        self.apply_index(field.to_owned(), payload_schema, field_index)?;
+
+        Ok(())
+    }
+
+    fn drop_index(&mut self, field: PayloadKeyTypeRef) -> OperationResult<bool> {
+        let removed_config = self.config.indices.remove(field);
+        let removed_indexes = self.field_indexes.remove(field);
+
+        let is_removed = removed_config.is_some() || removed_indexes.is_some();
+
+        if let Some(indexes) = removed_indexes {
+            for index in indexes {
+                index.wipe()?;
+            }
+        }
+
+        self.save_config()?;
+
+        Ok(is_removed)
+    }
+
+    fn drop_index_if_incompatible(
+        &mut self,
+        field: PayloadKeyTypeRef,
+        new_payload_schema: &PayloadFieldSchema,
+    ) -> OperationResult<bool> {
+        // `on_disk` flipped on a non-appendable (mmap) segment: the existing files can be
+        // reloaded in the new mode. Per-element indexes are rebuilt with their element maps.
+        let reload_on_disk_flip = match self.storage_type {
+            StorageType::NonAppendable => new_payload_schema.nested().is_none(),
+            StorageType::Appendable => false,
+        };
+
+        let Some(current_schema) = self.config.indices.get_mut(field) else {
+            return Ok(false);
+        };
+
+        match classify(&current_schema.schema, new_payload_schema) {
+            SchemaTransition::Identical => Ok(false),
+            // Metadata-only (`enable_hnsw`): index data does not depend on it, so
+            // persist the new schema and keep the live index handles on every
+            // storage type. Re-opening appendable files would drop their
+            // unflushed updates.
+            SchemaTransition::Compatible(diff) if diff.metadata_only() => {
+                current_schema.schema = new_payload_schema.clone();
+                self.save_config()?;
+                Ok(false)
+            }
+            // Keep the existing files and reload the index in the new mode during
+            // `build_index` instead of dropping and rebuilding from payload.
+            SchemaTransition::Compatible(_) if reload_on_disk_flip => Ok(false),
+            // Appendable Gridstore (its `on_disk` change goes through the normal
+            // drop-and-rebuild path) or any incompatible change: drop so
+            // `build_index` rebuilds.
+            SchemaTransition::Compatible(_) | SchemaTransition::Incompatible => {
+                self.drop_index(field)
+            }
+        }
+    }
+
+    fn overwrite_payload(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+    ) -> OperationResult<()> {
+        self.payload.borrow_mut().overwrite(point_id, payload)?;
+
+        for (field, field_index) in &mut self.field_indexes {
+            for index in field_index {
+                let values = payload.get_value(index.input_path(field));
+                update_index(index, point_id, &values)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn set_payload(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        key: &Option<JsonPath>,
+    ) -> OperationResult<()> {
+        if let Some(key) = key {
+            self.payload
+                .borrow_mut()
+                .set_by_key(point_id, payload, key)?;
+        } else {
+            self.payload.borrow_mut().set(point_id, payload)?;
+        };
+
+        // Re-read the payload after the write so field indexes see the merged
+        // value. Inlined `get_payload` to avoid going through `with_view` from
+        // a `&mut self` write path.
+        let updated_payload = self.payload.borrow().get(point_id)?;
+        for (field, field_index) in &mut self.field_indexes {
+            for index in field_index {
+                let input_path = index.input_path(field);
+                if input_path.is_affected_by_value_set(&payload.0, key.as_ref()) {
+                    let values = updated_payload.get_value(input_path);
+                    update_index(index, point_id, &values)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_payload(
+        &mut self,
+        point_id: PointOffsetType,
+        key: PayloadKeyTypeRef,
+    ) -> OperationResult<Vec<Value>> {
+        let deleted = self.payload.borrow_mut().delete(point_id, key)?;
+
+        let mut updated_payload = None;
+        for (field, indexes) in &mut self.field_indexes {
+            for index in indexes {
+                let input_path = index.input_path(field);
+                if !input_path.is_affected_by_value_remove(key) {
+                    continue;
+                }
+                let payload = match &mut updated_payload {
+                    Some(payload) => payload,
+                    None => updated_payload.insert(self.payload.borrow().get(point_id)?),
+                };
+                let values = payload.get_value(input_path);
+                update_index(index, point_id, &values)?;
+            }
+        }
+        Ok(deleted)
+    }
+
+    fn clear_payload(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>> {
+        self.clear_index_for_point(point_id)?;
+        self.payload.borrow_mut().clear(point_id)
+    }
+
+    fn flusher(&self) -> Flusher {
+        // Most field indices have either 2 or 3 indices (including null), we also have an extra
+        // payload storage flusher. Overallocate to save potential reallocations.
+        let mut field_flushers = Vec::with_capacity(self.field_indexes.len() * 3);
+
+        for field_indexes in self.field_indexes.values() {
+            for index in field_indexes {
+                field_flushers.push(index.flusher());
+            }
+        }
+        let payload_flusher = self.payload.borrow().flusher();
+
+        Box::new(move || {
+            for flusher in field_flushers {
+                match flusher() {
+                    Ok(()) => {}
+                    // Cancelled = the index storage was dropped after flusher capture (e.g. a
+                    // concurrent DropIndex). Skip it but keep flushing: aborting would leave the
+                    // already-flushed indexes durably ahead of payload storage and point
+                    // versions, and WAL replay would re-derive filter-based operations through
+                    // that too-new index, silently skipping points (data loss). The drop itself
+                    // is a versioned operation that replay re-applies.
+                    Err(OperationError::Cancelled { description }) => {
+                        log::debug!("Skipping flush of dropped field index storage: {description}");
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            payload_flusher()?;
+            Ok(())
+        })
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        let mut files = self
+            .field_indexes
+            .values()
+            .flat_map(|indexes| indexes.iter().flat_map(|index| index.files().into_iter()))
+            .collect::<Vec<PathBuf>>();
+        files.push(self.config_path());
+        files
+    }
+
+    fn immutable_files(&self) -> Vec<(PayloadKeyType, PathBuf)> {
+        self.field_indexes
+            .iter()
+            .flat_map(|(key, indexes)| {
+                indexes.iter().flat_map(|index| {
+                    index
+                        .immutable_files()
+                        .into_iter()
+                        .map(|file| (key.clone(), file))
+                })
+            })
+            .collect()
+    }
+}
+
+/// Replace the indexed values of `point_id`, or remove it when its input is missing.
+fn update_index(
+    index: &mut FieldIndex,
+    point_id: PointOffsetType,
+    field_value: &[&Value],
+) -> OperationResult<()> {
+    if field_value.is_empty() {
+        index.remove_point(point_id)
+    } else {
+        index.add_point(point_id, field_value)?;
+        Ok(())
+    }
+}

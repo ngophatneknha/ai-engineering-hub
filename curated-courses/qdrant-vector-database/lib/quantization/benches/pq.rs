@@ -1,0 +1,70 @@
+use std::sync::atomic::AtomicBool;
+
+use common::ambient;
+use common::typelevel::True;
+use criterion::{Criterion, criterion_group, criterion_main};
+use quantization::encoded_storage::TestEncodedStorageBuilder;
+use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
+use quantization::encoded_vectors_pq::{self, EncodedVectorsPQ};
+use rand::RngExt;
+use rand::rngs::SmallRng;
+
+fn encode_bench(c: &mut Criterion) {
+    let mut group = c.benchmark_group("encode");
+
+    let vectors_count = 100_000;
+    let vector_dim = 1024;
+    let mut rng = rand::make_rng::<SmallRng>();
+    let mut list: Vec<f32> = Vec::new();
+    for _ in 0..vectors_count {
+        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
+        list.extend_from_slice(&vector);
+    }
+
+    let vector_parameters = VectorParameters {
+        dim: vector_dim,
+        deprecated_count: None,
+        distance_type: DistanceType::Dot,
+        invert: false,
+    };
+    let quantized_vector_size =
+        encoded_vectors_pq::get_quantized_vector_size(&vector_parameters, 2);
+    let pq_encoded = EncodedVectorsPQ::encode(
+        (0..vectors_count).map(|i| &list[i * vector_dim..(i + 1) * vector_dim]),
+        std::iter::repeat_n(true, vectors_count),
+        TestEncodedStorageBuilder::new(None, quantized_vector_size),
+        &vector_parameters,
+        2,
+        2,
+        None,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+
+    let query: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
+    let encoded_query = pq_encoded.encode_query(&query);
+
+    let mut total = 0.0;
+
+    let _scope = ambient::test_guard();
+    group.bench_function("score random access pq", |b| {
+        b.iter(|| {
+            let random_idx = rng.random_range(0..vectors_count as u32);
+            total += pq_encoded.score_bytes(
+                True,
+                &encoded_query,
+                &pq_encoded.get_quantized_vector(random_idx),
+            );
+        });
+    });
+
+    println!("total: {total}");
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets = encode_bench
+}
+
+criterion_main!(benches);

@@ -1,0 +1,1371 @@
+/**
+ * Hook Handler Registry — maps event+matcher to concrete handler implementations.
+ *
+ * Each handler wraps an existing teamai subcommand function but accepts pre-parsed
+ * STDIN data instead of reading from process.stdin directly. This enables the
+ * dispatcher to read STDIN once and fan out to all handlers.
+ *
+ * Existing standalone subcommands (`teamai pull`, `teamai track --stdin`, etc.)
+ * remain unchanged for backward compatibility during migration.
+ */
+
+import os from 'node:os';
+import path from 'node:path';
+
+import type { ResolvedEntry } from './namespaced-entries.js';
+import { stdinString, type HookHandler, type HookStdin } from './hook-dispatch.js';
+import type { GlobalOptions, LocalConfig, WebhookPayload } from './types.js';
+import type { DriverName } from './workflow/driver-name.js';
+import type { GitHookEvent } from './git-hook.js';
+import { deriveDispatchSessionId, deriveSessionId } from './utils/session-id.js';
+import { log } from './utils/logger.js';
+import { normalizeToolName } from './utils/tool-names.js';
+import { resolveHookCwd } from './utils/hook-cwd.js';
+import { pathExists } from './utils/fs.js';
+import { UPDATE_BUDGET_MS } from './update-policy.js';
+
+// ─── Public types ───────────────────────────────────────
+
+export interface HandlerRegistration {
+  event: string;
+  matcher: string;
+  handler: HookHandler;
+  timeoutMs: number;
+  /** Fire-and-forget: run detached so it can't delay host hook completion. */
+  background?: boolean;
+  /** Left out first when the merged reply is over the host's context limit (see hook-dispatch.ts). */
+  yieldsToContextLimit?: true;
+  /**
+   * Git-provider-only handler. When teamai is configured with an HTTP source
+   * (localConfig.repo.kind === 'http'), these are filtered out at the dispatch
+   * boundary so HTTP consumers never see prompts for git-only workflows
+   * (contribute / import-from-mr / votes push). See filterHandlersForConfig.
+   */
+  gitOnly?: boolean;
+  /**
+   * Team handler: it only makes sense where teamai is set up. Hooks live in HOME
+   * even for a project-scope install, so they fire in every project on the
+   * machine; with no config for the hook's cwd these are filtered out at the
+   * dispatch boundary (#748). See filterHandlersForConfig.
+   */
+  requiresConfig?: boolean;
+}
+
+// ─── Timeout constants ──────────────────────────────────
+
+/**
+ * Unified budget for every *foreground* (inline) handler, kept strictly under 5s.
+ *
+ * Foreground handlers block the host IDE's hook. Empirically CodeBuddy aborts a
+ * hook at ~10s REGARDLESS of the larger `timeout` we declare (see
+ * builtin-hooks.ts: even Stop/SessionStart, declared 15s, are killed at 10000ms),
+ * reporting "Hook timed out after 10000ms" (error 3003) and breaking the IDE.
+ *
+ * So no single foreground handler may approach that ceiling. Since foreground
+ * handlers on an event run concurrently, the whole foreground pass finishes at
+ * ~max(handler timeouts) + node startup/exit, which must stay well under 10s. A
+ * unified <5s cap guarantees that with margin. Healthy endpoints answer in well
+ * under a second, so this is invisible in normal use; it only bounds the worst
+ * case (slow/unreachable endpoint). Any network side-effect truncated here (e.g.
+ * a large first-time resource sync) is completed later by the background
+ * (detached) pass, which is not awaited by the host. The vote push runs there
+ * from the start (votes-push): the exit after a timeout here cuts a git push.
+ */
+const FOREGROUND_HOOK_TIMEOUT_MS = 4_500;
+
+/**
+ * TodoWrite runs on a PostToolUse matcher whose host cap is only 3s
+ * (builtin-hooks.ts), so it needs a tighter budget than the shared foreground
+ * cap. It is a local dedup-cache check that completes in microseconds anyway.
+ */
+const TODOWRITE_HINT_TIMEOUT_MS = 2_500;
+
+/**
+ * Background (detached) local-agent HTTP report/sync. Detached runs are not
+ * awaited by the host, so they keep a full budget to complete real work such as
+ * resource downloads. Foreground local-agent runs use FOREGROUND_HOOK_TIMEOUT_MS.
+ */
+const LOCAL_AGENT_TIMEOUT_MS = 15_000;
+
+/**
+ * Background (detached) vote push: a fetch, then a push of the reports branch
+ * with its fetch + rebase retries, each a round trip to the team remote that a
+ * credential helper or a proxy can stretch to seconds. Detached, so it never
+ * delays the host Stop.
+ */
+const VOTES_PUSH_TIMEOUT_MS = 30_000;
+
+/**
+ * Budget for the detached session-start pull.
+ *
+ * A background handler's timeout is not advisory: the dispatch pass settles on
+ * it and index.ts then `process.exit(0)`s, truncating whatever is still running
+ * (git children orphaned, later sync stages never run). Cold pulls — fetch,
+ * submodule update, resource reconcile — measured 10-25s, so the shared 15s
+ * budget silently cut the pull short. Since the postPull script runs inside
+ * the pull, this budget also covers the deploy wait (sizing lives with the
+ * constants in post-pull.ts, pinned by its guard test).
+ */
+export const PULL_TIMEOUT_MS = 120_000;
+
+// ─── Handler implementations ────────────────────────────
+//
+// Each handler is a thin adapter that:
+//   1. Receives pre-parsed STDIN (Record<string, unknown>)
+//   2. Delegates to the actual subcommand logic
+//   3. Returns output string or null
+//
+// IMPORTANT: These use dynamic imports to keep module loading lazy.
+// The dispatcher only loads the modules that actually need to run.
+
+const pullHandler: HookHandler = {
+  name: 'pull',
+  async execute(stdin, tool, config) {
+    const cwd = resolveHookCwd(stdin);
+
+    // No config resolved: teamai is not set up here, or the project config
+    // cannot be read. Only the second stops the pull, since what detection
+    // loads after that file may be another team's (#784). A cwd that no longer
+    // exists holds no project config, and git refuses to open it.
+    if (!config && (cwd === undefined || await pathExists(cwd))) {
+      const { findUnreadableProjectConfig } = await import('./config.js');
+
+      if (await findUnreadableProjectConfig(cwd) !== null) return null;
+    }
+
+    if (config && !await toolMayDeliver(stdin, tool, config)) return null;
+    const hintCwd = cwd ?? process.cwd();
+    const packageHints = await import('./pkg/pkg-hint.js');
+    const packageHashBeforePull = await packageHints.packageManifestHashForCwd(hintCwd);
+
+    try {
+      const { seedProjectAgentRoot } = await import('./project-agent-root.js');
+      await seedProjectAgentRoot(tool, cwd);
+    } catch (e) {
+      log.debug(`hook-dispatch: seedProjectAgentRoot failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    const { pull, settleLateUsageReport } = await import('./pull.js');
+    const { SessionCaptures } = await import('./session-flow/captures.js');
+    const before = config && await SessionCaptures.checkoutDelivery(config, tool);
+
+    if (config && await needsPreparation(hintCwd, config)) await prepareCheckout(hintCwd, 'session-start');
+    else await pull({ silent: true, sessionStart: true });
+
+    if (config && before) await SessionCaptures.markTeamChanged(config, tool, stdin, before);
+    await packageHints.stashPackageHintAfterPull(
+      hintCwd,
+      deriveSessionId(stdin, { includeCwd: true }),
+      packageHashBeforePull,
+    );
+    // The detached background pass exits once its handlers settle, which would
+    // cut the push of a report pull() stopped waiting for. The host does not
+    // wait for this pass, so waiting here does not delay the session.
+    await settleLateUsageReport();
+    // Finished sessions are archived and judged by a teamai-finished-sessions run in each scope that turns that on, driven
+    // in a process this pass does not wait for.
+    const { FinishedSessions } = await import('./session-flow/finished-sessions.js');
+    const passCwd = await pathExists(hintCwd) ? hintCwd : os.homedir();
+
+    const scopes = await FinishedSessions.backgroundScopes(passCwd).catch((cause: unknown) => {
+      log.debug(`hook-dispatch: could not tell whether sessions are scored or published here: ${cause instanceof Error ? cause.message : String(cause)}`);
+
+      return [];
+    });
+
+    for (const scoped of scopes) await startFinishedSessions(scoped);
+
+    return null;
+  },
+};
+
+/**
+ * Adds the tool's version to the capture the foreground pass wrote at session start (#1178), which never waits on it,
+ * and sweeps the captures of sessions that are gone.
+ */
+const sessionCaptureHandler: HookHandler = {
+  name: 'session-capture',
+  async execute(stdin, tool, config) {
+    if (!config) return null;
+    const { SessionCaptures } = await import('./session-flow/captures.js');
+    await SessionCaptures.addToolVersion(config, tool, stdin);
+    await SessionCaptures.sweep(config).catch((cause: unknown) => log.debug(`session capture: could not sweep captures: ${cause instanceof Error ? cause.message : String(cause)}`));
+
+    return null;
+  },
+};
+
+/**
+ * The pull each trigger of checkout preparation can afford:
+ * - `post-checkout`, git's hook for a new checkout: inline, while git waits.
+ * - `session-start`, in a checkout that needs it (needsPreparation): the session's full pull.
+ * - `tool-use`, likewise, in the background pass: inline, from the team clone as last fetched.
+ * The last two serve worktrees an agent tool created without any git hook.
+ */
+const PREPARING_PULL = {
+  'post-checkout': { inline: true, gitHook: 'post-checkout' },
+  'session-start': { sessionStart: true },
+  'tool-use': { inline: true, localOnly: true },
+} as const satisfies Record<string, GlobalOptions>;
+
+/**
+ * Prepare a new checkout of a project-scope repository: its tool roots, then
+ * the team's resources, then `scripts.postDeploy` on its first delivery. Init
+ * does not run on this path. Git's hook records a failure for doctor; a tool's
+ * hook pulls without the roots it could not create, as its seeding does.
+ */
+async function prepareCheckout(cwd: string, trigger: keyof typeof PREPARING_PULL): Promise<void> {
+  const { createProjectToolRoots } = await import('./project-agent-root.js');
+  const roots = createProjectToolRoots({ cwd });
+
+  if (trigger === 'post-checkout') await roots;
+  else await roots.catch((cause: unknown) => log.debug(`hook-dispatch: could not create tool roots in ${cwd}: ${cause instanceof Error ? cause.message : String(cause)}`));
+  const { pull } = await import('./pull.js');
+  await pull({ silent: true, prepareCheckout: 'once', ...PREPARING_PULL[trigger] });
+}
+
+/**
+ * Whether a tool's hook prepares the checkout at `cwd`: a project-scope linked
+ * worktree no pull delivered into yet, which is not teamai's own. Agent tools
+ * create linked worktrees; a main checkout is where init runs. An HTTP team's
+ * checkout keeps no such record; its resources come through the local agent's sync.
+ */
+async function needsPreparation(cwd: string, config: LocalConfig): Promise<boolean> {
+  if (config.scope !== 'project' || config.repo.kind === 'http' || !config.projectRoot) return false;
+
+  if (!await isLinkedWorktree(config.projectRoot)) return false;
+  const { deliveringCheckoutRecord } = await import('./pull.js');
+
+  return !await deliveringCheckoutRecord(config) && !await isOwnCheckout(cwd, config);
+}
+
+/**
+ * Whether the checkout at `root` is a linked worktree: its `.git` file names a
+ * git dir holding `commondir`. A main checkout, `--separate-git-dir` or not,
+ * and a submodule have none.
+ */
+async function isLinkedWorktree(root: string): Promise<boolean> {
+  const { readFile } = await import('node:fs/promises');
+  const pointer = /^gitdir:\s*(.+)$/m.exec(await readFile(path.join(root, '.git'), 'utf8').catch(() => ''));
+
+  return pointer !== null && pathExists(path.join(path.resolve(root, pointer[1].trim()), 'commondir'));
+}
+
+/** Checkouts teamai itself creates: its knowledge and reports worktrees, under the scope's data home, the team clone, or the user-scope side-branch names. */
+async function isOwnCheckout(cwd: string, config: LocalConfig): Promise<boolean> {
+  const { getDataHome, getTeamaiHomeDir, WORKTREE_DIRNAMES } = await import('./types.js');
+
+  return isWithin(cwd, [
+    getDataHome(config),
+    config.repo.localPath,
+    // The shared side-branch checkouts both scopes resolve now (#1443), and the
+    // user-scope ones an older CLI left in ~/.teamai (#1454/#1445).
+    ...(config.branchHome ? WORKTREE_DIRNAMES.map((dirname) => path.join(config.branchHome!, dirname)) : []),
+    ...WORKTREE_DIRNAMES.map((dirname) => path.join(getTeamaiHomeDir(), dirname)),
+    ...await ownCheckoutsDir(cwd),
+  ]);
+}
+
+/**
+ * `post-checkout` from the git hook: a new checkout (a linked worktree, a
+ * submodule's first checkout) is prepared before git returns
+ * (prepareCheckout). A branch switch, user scope (whose resources live in
+ * HOME), and teamai's own checkouts do nothing.
+ */
+const newWorktreeHandler: HookHandler = {
+  name: 'new-worktree',
+  async execute(stdin, _tool, config) {
+    const { isNewCheckout } = await import('./git-hook.js');
+    const args = Array.isArray(stdin.git_args) ? stdin.git_args.map(String) : [];
+
+    if (!config || config.scope !== 'project' || !isNewCheckout(args)) return null;
+    const cwd = resolveHookCwd(stdin) ?? process.cwd();
+
+    if (await isOwnCheckout(cwd, config)) return null;
+
+    await recordingFailure(config, 'post-checkout', () => prepareCheckout(cwd, 'post-checkout'));
+    // Learnings, reports, sources and the team repo itself refresh after
+    // `git worktree add` returns; it also retries what failed above, and
+    // runs postDeploy when it, not the pull above, writes the first record.
+    await spawnDetachedPull(cwd, 'post-checkout', { prepareCheckout: 'once' });
+
+    return null;
+  },
+};
+
+/**
+ * A tool used in a linked worktree teamai has not delivered into: one an agent
+ * tool created without any git hook (Claude Code's `EnterWorktree`, Codex CLI's
+ * worktrees), or one made before teamai was set up. It is prepared in the
+ * background pass (prepareCheckout); the session's tool hooks find its record
+ * afterwards and do nothing.
+ */
+const newCheckoutHandler: HookHandler = {
+  name: 'new-checkout',
+  async execute(stdin, tool, config) {
+    const cwd = resolveHookCwd(stdin) ?? process.cwd();
+
+    if (!config || !await needsPreparation(cwd, config) || !await toolMayDeliver(stdin, tool, config)) return null;
+    await prepareCheckout(cwd, 'tool-use');
+
+    return null;
+  },
+};
+
+/**
+ * Whether `tool`'s hooks may deliver into the checkout: not when the tool is
+ * excluded, by `uninstall --agent` or an uninstall that could not remove its
+ * hooks, since a pull would restore what was removed (#993), nor when a
+ * workflow launched the session in a checkout it holds (#1176).
+ */
+async function toolMayDeliver(stdin: HookStdin, tool: string, config: LocalConfig): Promise<boolean> {
+  const { isAgentExcluded } = await import('./types.js');
+
+  if (isAgentExcluded(config, tool)) return false;
+  const { LAUNCH_PAYLOAD_KEY, launchHoldsCheckout, readLaunch } = await import('./launch-context.js');
+  const launch = readLaunch(stdin[LAUNCH_PAYLOAD_KEY]);
+
+  return !(launch && await launchHoldsCheckout(config, launch));
+}
+
+/** How long `git pull` waits for its hook's team repo fetch. */
+const GIT_PULL_FETCH_CAP_MS = 5_000;
+
+/**
+ * `post-merge`, `post-rewrite` after a rebase, or `post-checkout` from a rebase
+ * that only fast-forwarded (`git pull`, see isRebaseFastForward): the next session gets what
+ * changed. With a separate team repo, the team repo is fetched inline within
+ * GIT_PULL_FETCH_CAP_MS and delivered when its revision moved (the rev fast
+ * path skips it otherwise); past the cap, and for learnings, reports and
+ * sources, a detached pull takes over. In single-repo (self) mode the team
+ * repo is the working tree `git pull` just updated: delivered with no network.
+ */
+const gitPullHandler: HookHandler = {
+  name: 'git-pull',
+  async execute(stdin, _tool, config) {
+    if (!config || config.scope !== 'project') return null;
+
+    const event = stdin.hook_event_name === 'post-rewrite' || stdin.hook_event_name === 'post-checkout'
+      ? stdin.hook_event_name : 'post-merge';
+
+    const args = Array.isArray(stdin.git_args) ? stdin.git_args.map(String) : [];
+
+    if (event === 'post-rewrite' && args[0] !== 'rebase') return null;
+    const cwd = resolveHookCwd(stdin) ?? process.cwd();
+
+    if (event === 'post-checkout') {
+      const { isRebaseFastForward } = await import('./git-hook.js');
+
+      if (!await isRebaseFastForward(args, process.env.GIT_REFLOG_ACTION, cwd)) return null;
+    }
+
+    const { getDataHome, isSelfMode } = await import('./types.js');
+    const self = isSelfMode(config);
+    // teamai's own checkouts; in self mode the team repo is the member's.
+    const own = [getDataHome(config), ...await ownCheckoutsDir(cwd)];
+
+    if (await isWithin(cwd, self ? own : [...own, config.repo.localPath])) return null;
+
+    const { pull } = await import('./pull.js');
+    await recordingFailure(config, event, () => pull({
+      silent: true, inline: true, gitHook: event, fetchTimeoutMs: GIT_PULL_FETCH_CAP_MS,
+    }));
+
+    if (!self) await spawnDetachedPull(cwd, event);
+
+    return null;
+  },
+};
+
+/**
+ * Run the inline pass of a git hook; what it throws is recorded (the hook is
+ * silent), not raised.
+ */
+async function recordingFailure(
+  config: LocalConfig,
+  event: GitHookEvent,
+  pass: () => Promise<void>,
+): Promise<void> {
+  try {
+    await pass();
+  } catch (e) {
+    const { recordGitHookFailure } = await import('./git-hook.js');
+    await recordGitHookFailure(config, { kind: 'hook-error', event, at: new Date().toISOString(), error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+/**
+ * Start a full `teamai pull --silent` in `cwd` that this process does not wait
+ * for. TEAMAI_PREPARE_CHECKOUT hands it the checkout to prepare, since a
+ * fast-forward `git pull` hands over with the same event.
+ * TEAMAI_GIT_HOOK makes it record its failure, and clear the record when it
+ * succeeds.
+ */
+async function spawnDetachedPull(cwd: string, event: GitHookEvent, how: { prepareCheckout?: 'once' } = {}): Promise<void> {
+  const { resolveCliEntry } = await import('./builtin-hooks.js');
+  const { spawn } = await import('node:child_process');
+  const prepare = how.prepareCheckout ? { TEAMAI_PREPARE_CHECKOUT: how.prepareCheckout } : {};
+  spawn(process.execPath, [resolveCliEntry() ?? '', 'pull', '--silent'], {
+    cwd, detached: process.platform !== 'win32', stdio: 'ignore', windowsHide: true, env: { ...process.env, TEAMAI_GIT_HOOK: event, ...prepare },
+  }).on('error', (e) => log.debug(`git hook: detached pull failed to start: ${e.message}`)).unref();
+}
+
+/** Start `workflow resume <run> --driver <driver>` in `cwd` with `env`, a process this one does not wait for. */
+async function spawnDetachedResume(run: string, { driver, cwd, env }: { driver: DriverName; cwd: string; env: NodeJS.ProcessEnv }): Promise<void> {
+  const { resolveCliEntry } = await import('./builtin-hooks.js');
+  const { spawn } = await import('node:child_process');
+  spawn(process.execPath, [resolveCliEntry() ?? '', 'workflow', 'resume', run, '--driver', driver], { cwd, detached: process.platform !== 'win32', stdio: 'ignore', windowsHide: true, env })
+    .on('error', (e) => log.debug(`hook-dispatch: detached workflow resume ${run} failed to start: ${e.message}`)).unref();
+}
+
+/**
+ * Starts teamai-finished-sessions in `config` as the CLI's own run, then drives it on the driver `workflows.driver`
+ * names with `workflow resume` in a process this one does not wait for, with no agent evidence, though the hook runs
+ * inside an agent session. A run for a driver this machine does not run awaits it, one for any driver is left to it, and
+ * a run already working on that data home is left to its driver.
+ */
+async function startFinishedSessions(config: LocalConfig): Promise<void> {
+  const [{ FinishedSessions }, { resolveWorkflowEnv }, { inProcessClient }, { resolveRunMode }, { withoutAgentEvidence }, { awaitsLine, awaitsOf, driveByDefault }] = await Promise.all([
+    import('./session-flow/finished-sessions.js'), import('./env-resolution.js'), import('./workflow/protocol.js'), import('./launch-context.js'), import('./workflow/attempt-marker.js'),
+    import('./default-driver.js'),
+  ]);
+
+  try {
+    const decided = await driveByDefault(config);
+    const awaits = awaitsOf(decided);
+    const started = await FinishedSessions.start(config, { client: inProcessClient({ config, env: await resolveWorkflowEnv(config) }), mode: resolveRunMode(process.env), awaits });
+
+    switch (started.kind) {
+      case 'failed':
+        log.debug(`hook-dispatch: teamai-finished-sessions did not start: ${started.failure.code}: ${started.failure.message}`);
+
+        return;
+      case 'working':
+      case 'idle':
+        return;
+      case 'started':
+        if (decided.kind === 'drive') await spawnDetachedResume(started.run, { driver: decided.driver, cwd: started.cwd, env: withoutAgentEvidence(process.env) });
+        else if (awaits) log.debug(`hook-dispatch: ${awaitsLine(started.run, awaits.driver)}`);
+
+        return;
+      default: {
+        const unhandled: never = started;
+
+        return unhandled;
+      }
+    }
+  } catch (cause) {
+    log.debug(`hook-dispatch: teamai-finished-sessions did not start: ${cause instanceof Error ? cause.message : String(cause)}`);
+  }
+}
+
+/**
+ * The main checkout's `.teamai/`, where teamai creates its knowledge worktree.
+ * Detection run from inside that worktree resolves the worktree as its own
+ * project root, so the config alone cannot tell it is teamai's.
+ */
+async function ownCheckoutsDir(cwd: string): Promise<string[]> {
+  // Git refuses to open a directory that no longer exists.
+  if (!await pathExists(cwd)) return [];
+  const { resolveAnchors } = await import('./utils/git.js');
+  const anchors = await resolveAnchors(cwd);
+
+  return anchors ? [path.join(anchors.mainCheckout ?? anchors.workspaceRoot, '.teamai')] : [];
+}
+
+/** Whether `dir` is one of `parents` or inside one (real paths). */
+async function isWithin(dir: string, parents: string[]): Promise<boolean> {
+  const { realpath } = await import('node:fs/promises');
+  const real = (p: string) => realpath(p).catch(() => path.resolve(p));
+  const target = await real(dir);
+
+  for (const parent of parents) {
+    const rel = path.relative(await real(parent), target);
+
+    if (!rel.startsWith('..') && !path.isAbsolute(rel)) return true;
+  }
+
+  return false;
+}
+
+const updateHandler: HookHandler = {
+  name: 'update',
+  async execute(_stdin, _tool, config) {
+    const { doUpdate } = await import('./update.js');
+    await doUpdate(config);
+
+    return null;
+  },
+};
+
+/**
+ * Team course-correction keywords of the hook's scope. Only prompt hooks pay for
+ * the team config read; no scope or an unreadable team config means "built-in
+ * keywords only".
+ */
+async function teamCorrectionKeywords(
+  stdin: HookStdin,
+  config: LocalConfig | null,
+): Promise<readonly string[]> {
+  if (stdinString(stdin, 'prompt') === undefined || !config) return [];
+
+  try {
+    const { loadTeamConfig } = await import('./config.js');
+    const { getInterventionSharing } = await import('./types.js');
+    const teamConfig = await loadTeamConfig(config.repo.localPath);
+
+    return teamConfig ? getInterventionSharing(teamConfig).correctionKeywords : [];
+  } catch {
+    return [];
+  }
+}
+
+const dashboardReportHandler: HookHandler = {
+  name: 'dashboard-report',
+  async execute(stdin, tool, config) {
+    // Registered with requiresConfig: a session outside any scope is not recorded.
+    if (!config) return null;
+    const { parseHookEvent, appendEvent, compactEvents, dataHomeKey, eventProjectAnchor, addGitStateAtStart, addGitHeadAtStop, gitStateIn } = await import('./dashboard-collector.js');
+    const { getDataHome } = await import('./types.js');
+    const raw = JSON.stringify(stdin);
+    // The dispatcher's scope, which knows the project even when the event
+    // records no cwd (Copilot) or a symlinked one (#785).
+    const scopeKey = await dataHomeKey(getDataHome(config));
+
+    const event = await parseHookEvent(raw, tool, {
+      correctionKeywords: await teamCorrectionKeywords(stdin, config),
+      // The gateway model-alias map of the hook's scope, its own entries over this
+      // machine's, prices requests that record an alias instead of a model name.
+      modelAliases: config.modelAliases,
+      dataHomeKey: scopeKey,
+    });
+
+    if (event) {
+      event.dataHomeKey = scopeKey;
+
+      const [projectAnchor] = await Promise.all([
+        eventProjectAnchor(event.cwd, event.sessionId),
+        addGitStateAtStart(event, gitStateIn(stdin)),
+        addGitHeadAtStop(event),
+      ]);
+
+      event.projectAnchor = projectAnchor;
+      // The foreground dispatcher's, so a background pass records what the session's own environment said.
+      const { readSessionRun } = await import('./launch-context.js');
+      Object.assign(event, readSessionRun(stdin));
+      await appendEvent(event);
+      // Non-blocking compaction
+      compactEvents().catch(() => {});
+    }
+
+    return null;
+  },
+};
+
+/**
+ * PostToolUse: record the skill a tool call loaded, through the tool's skill
+ * tool or a read of its SKILL.md, once per session turn (#1221), and send the
+ * `skill-use` webhook for it. Detached: it reads the disk and may send.
+ */
+const skillUseHandler: HookHandler = {
+  name: 'skill-use',
+  async execute(stdin, tool, config) {
+    // Registered with requiresConfig: the dispatcher's scope, which knows the
+    // project of a removed worktree (#810).
+    if (!config) return null;
+    const { creditToolCall } = await import('./skill-use.js');
+
+    for (const skillName of await creditToolCall(stdin, tool, config)) {
+      await sendWebhookEvent('skill-use', stdin, tool, config, { skillName });
+    }
+
+    return null;
+  },
+};
+
+/**
+ * PostToolUse: record a recall claim or a read of team knowledge in the recall
+ * log, for the reducer votes-sync runs at Stop, SubagentStop and SessionEnd (#884). One
+ * write per call, whatever number of run ids, docs read or files a search
+ * showed lines of it records, and never a read of the log or of a file, so it
+ * stays inside the foreground budget.
+ */
+const recallAttributionHandler: HookHandler = {
+  name: 'recall-attribution',
+  async execute(stdin, tool, config) {
+    if (process.env.TEAMAI_RECALL_DISABLED === '1' || !config) return null;
+    const { recordToolCall } = await import('./recall-adoption.js');
+    await recordToolCall(stdin, tool, config);
+
+    return null;
+  },
+};
+
+/** UserPromptSubmit: open the session turn and record the skills the prompt mentions (`/name`, `$name`, `/skill:name`). */
+const skillMentionHandler: HookHandler = {
+  name: 'skill-mention',
+  async execute(stdin, tool, config) {
+    // Registered with requiresConfig: the dispatcher's scope (#810).
+    if (!config) return null;
+    const { creditPromptMentions } = await import('./skill-use.js');
+    await creditPromptMentions(stdin, tool, config);
+
+    return null;
+  },
+};
+
+
+/**
+ * Tell the user which recalled team-knowledge entries this session actually
+ * adopted. A deterministic, user-facing summary built from tool-use adoption
+ * evidence teamai already computed (files the agent opened) — the user sees the
+ * real entries with no dependency on the model self-declaring anything. Only
+ * shown when there is at least one adopted entry, so a session that used no team
+ * knowledge stays quiet.
+ *
+ * English, like every other user-facing string (Claude Code prints the Stop
+ * payload to the terminal).
+ */
+export function buildAdoptedSummary(adoptedDocIds: readonly string[]): string {
+  return `[teamai] Adopted team knowledge this session: ${adoptedDocIds.join(', ')}`;
+}
+
+/**
+ * Filter adopted doc-ids to those whose upvote may be attributed to the ACTIVE
+ * scope's vote file. While a project is active, a doc recalled from the inherited
+ * USER scope is read-only (issue #723 review) — crediting it would push a
+ * user-knowledge vote to the project team on the next report, contradicting the
+ * documented "inherited user hits remain read-only while the project is active"
+ * rule and matching how recall.ts already scopes recalled_count. When the active
+ * scope is `user` (or unknown), every adopted doc is eligible. A doc whose scope
+ * is `unknown` (legacy region with no label) is credited to the active scope, as
+ * before — the guard only withholds an EXPLICIT `user` hit during a project.
+ */
+export function eligibleUpvotes(
+  adoptedDocIds: readonly string[],
+  recalledDocScopes: Record<string, 'project' | 'user' | 'unknown'>,
+  activeScope: string | undefined,
+): string[] {
+  if (activeScope !== 'project') return [...adoptedDocIds];
+
+  return adoptedDocIds.filter((id) => recalledDocScopes[id] !== 'user');
+}
+
+const contributeCheckHandler: HookHandler = {
+  name: 'contribute-check',
+  async execute(stdin, tool, localConfig) {
+    // The payload's cwd, not the process's: hook-dispatch changes into it, but
+    // that can fail, and the gate must not then read the launcher's directory.
+    // A removed worktree's session keeps its recorded scope (#810).
+    const { contributeHintAllowed } = await import('./skill-content.js');
+    const { hookScopeDir } = await import('./dashboard-collector.js');
+
+    if (!(await contributeHintAllowed(await hookScopeDir(stdin, tool)))) return null;
+
+    const { contributeCheckForSession } = await import('./contribute-check.js');
+    const { formatStopHookOutput, relayWhenHidden } = await import('./utils/hook-output.js');
+    const { stopStdoutUnsupported } = await import('./utils/tool-names.js');
+
+    // Match dashboard-collector's derivation so events and contribute state
+    // share the same session id even when stdin.session_id is absent.
+    const sessionId = deriveSessionId(stdin, { includeCwd: true });
+    const cwd = resolveHookCwd(stdin);
+    const transcriptPath = stdinString(stdin, 'transcript_path');
+    // Tools whose Stop hook cannot deliver model context: stash the hint (in the same
+    // single state write inside contributeCheckForSession) for delivery on the
+    // next UserPromptSubmit, so contributeCheckForSession returns null here.
+    const stash = stopStdoutUnsupported(tool);
+    // The session's mode and launcher as the dispatcher forwarded them, else as this process's environment has them.
+    const { readSessionRun, sessionRun } = await import('./launch-context.js');
+    const run = readSessionRun(stdin) ?? sessionRun(process.env);
+    const offer = localConfig ? async () => (await import('./session-share.js')).SessionShare.reminderOffer(localConfig, { tool, sessionId, cwd: cwd ?? process.cwd(), run }) : undefined;
+    const { hint } = await contributeCheckForSession(sessionId, cwd, transcriptPath, stash, offer);
+
+    if (!hint) return null;
+
+    // The hint is addressed to the user, so a host that hides the payload needs
+    // the model to pass it on. Claude Code prints it and must not be asked (#719).
+    return formatStopHookOutput(relayWhenHidden(hint, tool), tool);
+  },
+};
+
+/** UserPromptSubmit: deliver contribution hints stashed by stdout-less tools. */
+const pendingHintHandler: HookHandler = {
+  name: 'pending-hint',
+  async execute(stdin, tool) {
+    const { stopStdoutUnsupported } = await import('./utils/tool-names.js');
+
+    if (!stopStdoutUnsupported(tool)) return null;
+
+    // Must match contributeCheckHandler's derivation so Stop and UserPromptSubmit
+    // resolve to the same session file. This cross-process handoff relies on
+    // codebuddy/workbuddy sending a stable, consistent session_id on BOTH the
+    // Stop and the next UserPromptSubmit payload — verified against real session
+    // data (a session's stop and prompt_submit events share one sessionId). If a
+    // tool omits session_id, deriveSessionId falls back to pid+cwd, which can
+    // differ across the two hook processes and orphan the stash (best-effort).
+    const sessionId = deriveSessionId(stdin, { includeCwd: true });
+    const pending = await import('./contribute-check.js');
+    // Always consume the stash so a hint stashed before the team turned the
+    // feature off is not delivered later when it is turned back on.
+    const stashed = await pending.takePendingHint(sessionId);
+    // The votes-hint stash/replay path is removed with the self-declaration
+    // mechanism (#723); only the contribute hint remains. Uses the upstream
+    // contributeHintAllowed(cwd) signature (moved to skill-content).
+    const { contributeHintAllowed } = await import('./skill-content.js');
+    const { hookScopeDir } = await import('./dashboard-collector.js');
+    const hint = (await contributeHintAllowed(await hookScopeDir(stdin, tool))) ? stashed : null;
+
+    if (!hint) return null;
+
+    return JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: hint,
+      },
+    });
+  },
+};
+
+/** UserPromptSubmit: deliver a package notice created by the detached pull. */
+const packagePendingHintHandler: HookHandler = {
+  name: 'package-pending-hint',
+  async execute(stdin, _tool) {
+    const { takePendingPackageHint } = await import('./pkg/pkg-hint.js');
+
+    const hint = await takePendingPackageHint(
+      deriveSessionId(stdin, { includeCwd: true }),
+    );
+
+    if (!hint) return null;
+
+    return JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: hint,
+      },
+    });
+  },
+};
+
+const votesSyncHandler: HookHandler = {
+  name: 'votes-sync',
+  async execute(stdin, tool, localConfig) {
+    if (process.env.TEAMAI_RECALL_DISABLED === '1' || !localConfig) return null;
+
+    try {
+      const { creditAdoptedDocs } = await import('./recall-adoption.js');
+      const { pruneUpvoteLedger } = await import('./votes.js');
+      const { getVotesDir } = await import('./types.js');
+      const votesDir = getVotesDir(localConfig);
+      const votePath = path.join(votesDir, `${localConfig.username}.yaml`);
+      const sessionId = deriveDispatchSessionId(stdin, tool);
+
+      // Count an upvote when this session opened a doc one of its recalls
+      // returned, within 24 h after the run: the reducer joins the recall log's
+      // runs, claims and evidence, which PostToolUse recorded (#884). No
+      // transcript is needed, so hosts that send none vote too. A doc adopted
+      // without opening its file (a subagent summary) is left to the session's
+      // adoption question (recall_adoption). Stop fires every turn: the per-session
+      // ledger in incrementUpvoted credits a doc once, and only the docs this
+      // call credited come back (none when the votes file was busy, and the
+      // next Stop retries). Inherited user-scope docs stay read-only.
+      const { credited, recalled } = await creditAdoptedDocs(localConfig, sessionId);
+      const adoptedDocIds = credited ?? [];
+      // This handler only credits locally: the vote push, a fetch and a push to
+      // the team remote, is votes-push's, in the detached pass of Stop and
+      // SessionEnd. A subagent's end is not the end of the turn either: the
+      // main agent waits on this hook, so the ledger prune waits for the next Stop.
+      const hookEvent = stdinString(stdin, 'hook_event_name')?.toLowerCase() ?? '';
+      const subagentStop = hookEvent === 'subagentstop';
+      // Copilot's SessionEnd ends the session: no one reads its reply, so it
+      // prints no summary.
+      const sessionEnd = hookEvent === 'sessionend';
+
+      // Bound the in-file session ledger even in the default (judge-off) config,
+      // where a recall-but-never-adopt session never reaches incrementUpvoted and
+      // so would never prune (issue #723 review). This runs every Stop, is locked,
+      // and only writes when it actually drops a stale entry.
+      if (!subagentStop) await pruneUpvoteLedger(votePath).catch(() => undefined);
+
+      // A/B measurement (opt-in): one line per Stop. `adopted` is the count
+      // newly credited this turn (after per-session dedup), so summing the log
+      // over a session yields the true number of docs upvoted for it.
+      if (process.env.TEAMAI_ADOPTION_EVAL_LOG) {
+        try {
+          const { appendFile } = await import('node:fs/promises');
+          await appendFile(
+            process.env.TEAMAI_ADOPTION_EVAL_LOG,
+            JSON.stringify({
+              ts: new Date().toISOString(),
+              sessionId,
+              recalled,
+              adopted: adoptedDocIds.length,
+            }) + '\n',
+          );
+        } catch {
+          // best-effort; measurement only
+        }
+      }
+
+      // This session adopted team knowledge → surface the real adopted entries
+      // to the user, so they observe the recall database's effect. Deterministic:
+      // built from tool-use evidence, not from the model self-declaring anything.
+      //
+      // This is a user-facing note, not a model instruction, so we only emit it
+      // on tools that print the Stop payload to the terminal. Tools whose Stop
+      // stdout is ignored deliver stashed content back through the model's
+      // context (additionalContext); routing an FYI summary there would pollute
+      // the next turn, so we simply skip it for those tools rather than misuse
+      // the model channel.
+      // The summary is for Stop alone.
+      if (adoptedDocIds.length > 0 && !subagentStop && !sessionEnd) {
+        const { stopStdoutUnsupported } = await import('./utils/tool-names.js');
+
+        if (!stopStdoutUnsupported(tool)) {
+          const { formatStopHookOutput } = await import('./utils/hook-output.js');
+
+          return formatStopHookOutput(buildAdoptedSummary(adoptedDocIds), tool ?? 'claude');
+        }
+      }
+    } catch (error) {
+      // Non-critical for the session (votes retry on next pull), but the failure
+      // MUST be traceable: a swallowed error here is exactly why upvote
+      // collection could fail silently for an entire team (see #723). Log it.
+      log.debug(`votes-sync handler failed: ${(error instanceof Error ? error.stack : undefined) ?? String(error)}`);
+    }
+
+    return null;
+  },
+};
+
+/**
+ * Push the vote deltas this machine still owes the team, in the detached pass
+ * of Stop and SessionEnd. Inline, a fetch and a push to a remote a few seconds
+ * away outlast FOREGROUND_HOOK_TIMEOUT_MS, and the dispatcher's exit cut the
+ * push and left the vote commit unpushed. This pass starts beside votes-sync,
+ * so a credit it writes after this pass read the deltas goes with the next
+ * Stop or pull.
+ */
+const votesPushHandler: HookHandler = {
+  name: 'votes-push',
+  async execute(_stdin, _tool, localConfig) {
+    if (process.env.TEAMAI_RECALL_DISABLED === '1' || !localConfig) return null;
+
+    try {
+      const { getVotesDir, usesBranchWorktree } = await import('./types.js');
+      const { syncVotesToTeam, hasPendingVoteDeltas, stageVotesMerge, confirmVotesSynced, readUserVotesFromContent } = await import('./votes.js');
+      const votesDir = getVotesDir(localConfig);
+      const votePath = path.join(votesDir, `${localConfig.username}.yaml`);
+
+      if (!usesBranchWorktree(localConfig)) {
+        await syncVotesToTeam(localConfig.repo.localPath, localConfig.username, votesDir);
+      } else if (await hasPendingVoteDeltas(votesDir, localConfig.username)) {
+        // Votes are report data → the teamai-reports orphan branch, written
+        // through an isolated worktree (never the default branch / active tree).
+        // Stop fires every turn: skip the fetch when nothing is pending.
+        const { updateReports, readReportsOriginFile } = await import('./utils/reports-branch.js');
+        await updateReports(localConfig, async (wt, { onDelivered }) => {
+          // Origin's confirmed snapshot is the merge base, never the
+          // worktree copy: that copy may already hold this machine's own
+          // merged-but-unpushed deltas, and merging onto it again would
+          // count them twice on a retry (#1027).
+          const origin = await readReportsOriginFile(wt, `votes/${localConfig.username}.yaml`);
+
+          const staged = await stageVotesMerge(
+            wt,
+            localConfig.username,
+            votesDir,
+            origin === null ? null : readUserVotesFromContent(origin),
+          );
+
+          if (!staged) {
+            return {
+              files: [],
+              message: `[teamai] Update votes for ${localConfig.username}`,
+            };
+          }
+
+          // Deltas are dropped only once origin holds them, and under the
+          // reports lock, so a concurrent sync cannot stage the same deltas
+          // between this publish and this clear. A busy lock, a failed
+          // push, or a crash before delivery keeps them pending for the
+          // next Stop (#1027).
+          onDelivered(() => confirmVotesSynced(votePath, staged.syncedDeltas));
+
+          return {
+            files: [`votes/${localConfig.username}.yaml`],
+            message: `[teamai] Update votes for ${localConfig.username}`,
+          };
+        });
+      }
+    } catch (error) {
+      // The deltas stay pending for the next Stop or pull.
+      log.debug(`votes-push handler failed: ${(error instanceof Error ? error.stack : undefined) ?? String(error)}`);
+    }
+
+    return null;
+  },
+};
+
+/** `teamai.yaml` `language` for this scope, when that file can be read. */
+async function teamAgentLanguage(config: LocalConfig | null): Promise<'en' | 'zh' | undefined> {
+  const { loadTeamAgentLanguage } = await import('./config.js');
+
+  return loadTeamAgentLanguage(config);
+}
+
+const todowriteHintHandler: HookHandler = {
+  name: 'todowrite-hint',
+  async execute(stdin, _tool, config) {
+    if (process.env.TEAMAI_RECALL_DISABLED === '1') return null;
+
+    const toolName = normalizeToolName(stdinString(stdin, 'tool_name') ?? '');
+
+    if (toolName !== 'TodoWrite') return null;
+
+    const { shouldSkipTodoWriteHint, buildHintMessage } = await import('./todowrite-hint.js');
+
+    if (shouldSkipTodoWriteHint(deriveSessionId(stdin))) return null;
+
+    return JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        additionalContext: buildHintMessage(await teamAgentLanguage(config)),
+      },
+    });
+  },
+};
+
+const mrHintHandler: HookHandler = {
+  name: 'mr-hint',
+  async execute(stdin, _tool, config) {
+    const { computeMrHintOutput } = await import('./mr-hint.js');
+    // The session the hint may offer teamai-import-from-mr to, as the Stop hook's reminder resolves it.
+    const { readSessionRun, sessionRun } = await import('./launch-context.js');
+    const session = { sessionId: deriveSessionId(stdin, { includeCwd: true }), cwd: resolveHookCwd(stdin) ?? process.cwd(), run: readSessionRun(stdin) ?? sessionRun(process.env) };
+
+    return computeMrHintOutput(await teamAgentLanguage(config), config, session);
+  },
+};
+
+const packageHintHandler: HookHandler = {
+  name: 'package-hint',
+  async execute(stdin, _tool) {
+    const { claimPackageHintOutput } = await import('./pkg/pkg-hint.js');
+
+    return claimPackageHintOutput(
+      resolveHookCwd(stdin) ?? process.cwd(),
+      deriveSessionId(stdin, { includeCwd: true }),
+    );
+  },
+};
+
+/**
+ * SessionStart: tell the agent which env variables and secrets the scope
+ * delivers, and to run the commands that need them through `teamai env exec`
+ * (#875). That is the one path that gives a command this directory's env in
+ * every tool and shell (#1018). It names what `env exec` applies: nothing
+ * when the scope delivers neither, and no secret while its secret
+ * declarations fail (doctor and pull say so).
+ */
+const teamEnvHintHandler: HookHandler = {
+  name: 'team-env-hint',
+  async execute(_stdin, _tool, config) {
+    if (!config) return null;
+    const { resolveTeamEnv, effectiveTeamEnvVariables, appliedTeamEnv } = await import('./env-resolution.js');
+    const teamEnv = await resolveTeamEnv(config);
+    const applied = appliedTeamEnv(teamEnv);
+    const { declarations } = teamEnv;
+    const secrets = declarations.kind === 'resolved' ? declarations.entries.filter(({ name }) => applied.secretKeys.includes(name)) : [];
+    const declared = effectiveTeamEnvVariables(teamEnv).filter(({ name }) => applied.variables.has(name) && !applied.secretKeys.includes(name));
+
+    // A key a last pull wrote that no file declares now has no description to give.
+    const plain = [...declared, ...[...applied.variables.keys()]
+      .flatMap((name) => (!applied.secretKeys.includes(name) && !declared.some((variable) => variable.name === name) ? [{ name, entry: {} }] : []))];
+
+    if (secrets.length === 0 && plain.length === 0) return null;
+
+    const described = (entries: readonly Pick<ResolvedEntry<{ description?: string }>, 'name' | 'entry'>[]): string => entries.map(({ name, entry }) => {
+      const description = entry.description?.replace(/\s+/g, ' ').trim();
+
+      return description ? `${name} (${description})` : name;
+    }).join(', ');
+
+    return JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'SessionStart',
+        additionalContext: [
+          ...plain.length > 0 ? [`Team env variables in this scope: ${described(plain)}.`] : [],
+          ...secrets.length > 0 ? [`Team secrets in this scope: ${described(secrets)}.`] : [],
+          'Run the commands that need them through `teamai env exec -- <command>` so they get this directory\'s team values.',
+          ...secrets.length > 0
+            ? ['Never ask for, read or print a secret value; if one is missing, ask the member to run `teamai env set KEY` in their own terminal.']
+            : [],
+        ].join(' '),
+      },
+    });
+  },
+};
+
+/**
+ * SessionStart: a project's rules for a tool with no rules format and no
+ * project file of its own (the Codex family, #938; ZCode and DeepSeek
+ * Harness, #946), and for the Codex family its instruction blocks (culture,
+ * shared instructions, recall, #945). The project AGENTS.md is the owners'
+ * file, and other tools read it too. User-scope content is in the tool's own
+ * AGENTS.md, so a session outside a project gets nothing here. Codex runs
+ * SessionStart again after a compaction or a clear; a resumed session already
+ * holds the content in its history. A Codex subagent fires SubagentStart
+ * instead, which gets the same content.
+ */
+const teamRulesHandler: HookHandler = {
+  name: 'team-rules',
+  async execute(stdin, tool, config) {
+    if (!config || config.scope !== 'project' || stdin.source === 'resume') return null;
+    const { getsRulesFromSessionHook } = await import('./resources/rule-format.js');
+    const { isAgentExcluded } = await import('./types.js');
+
+    if (!getsRulesFromSessionHook(tool) || isAgentExcluded(config, tool)) return null;
+    const { loadTeamConfig } = await import('./config.js');
+    const teamConfig = await loadTeamConfig(config.repo.localPath);
+
+    if (!teamConfig) return null;
+    const { deliversInstructionsByHook, instructionHookTextFor } = await import('./instruction-targets.js');
+    const { teamRulesContext } = await import('./resources/rules.js');
+    const text = deliversInstructionsByHook(tool, config.scope) ? await instructionHookTextFor(teamConfig, config, tool) : '';
+    const parts = text ? [text] : [];
+    const rules = await teamRulesContext(teamConfig, config);
+
+    if (rules !== null) parts.push(rules);
+
+    if (parts.length === 0) return null;
+    // Codex rejects output whose hookEventName is not the event it ran.
+    const hookEventName = stdin.hook_event_name === 'SubagentStart' ? 'SubagentStart' : 'SessionStart';
+
+    return JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext: parts.join('\n\n') } });
+  },
+};
+
+/** SessionStart: Cursor's user-scope rules for a workspace its rules walk does not reach (#1197). */
+const cursorUserRulesHandler: HookHandler = {
+  name: 'cursor-user-rules',
+  async execute(stdin, tool, config) {
+    if (tool !== 'cursor' || !config) return null;
+    const cwd = resolveHookCwd(stdin);
+
+    if (!cwd) return null;
+    const { cursorUserRulesContext } = await import('./cursor-user-rules.js');
+    const text = await cursorUserRulesContext(cwd, config);
+
+    if (text === null) return null;
+
+    return JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: text } });
+  },
+};
+
+/**
+ * `instructions`: the culture, claudemd and recall blocks for a tool whose
+ * extension adds them to the prompt instead of reading a file (#945), and for
+ * Pi the project's team rules after them (#946). Resolved for the member,
+ * project and scope of the session's cwd, as a pull would. Nothing when the
+ * tool reads a file in that scope, or is excluded.
+ */
+const instructionsHandler: HookHandler = {
+  name: 'instructions',
+  async execute(_stdin, tool, config) {
+    if (!config) return null;
+    const { deliversInstructionsByHook, instructionHookTextFor } = await import('./instruction-targets.js');
+    const { isAgentExcluded } = await import('./types.js');
+
+    if (!deliversInstructionsByHook(tool, config.scope) || isAgentExcluded(config, tool)) return null;
+    const { loadTeamConfig } = await import('./config.js');
+    const teamConfig = await loadTeamConfig(config.repo.localPath);
+
+    if (!teamConfig) return null;
+    const text = await instructionHookTextFor(teamConfig, config, tool);
+    const parts = text ? [text] : [];
+    const { getsRulesFromExtension } = await import('./resources/rule-format.js');
+
+    if (config.scope === 'project' && getsRulesFromExtension(tool)) {
+      const { teamRulesContext } = await import('./resources/rules.js');
+      const rules = await teamRulesContext(teamConfig, config);
+
+      if (rules !== null) parts.push(rules);
+    }
+
+    if (parts.length === 0) return null;
+
+    return JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: parts.join('\n\n') } });
+  },
+};
+
+/**
+ * The HTTP local agent's prompts from its resource cache for the session's
+ * project (#945), for a tool with no project file the agent could write to.
+ * Pi, OMP and Hermes ask through `instructions`; the Codex family gets them
+ * at SessionStart and SubagentStart, beside the team rules. Runs without a
+ * teamai config, since an HTTP-only machine has none.
+ */
+const localAgentInstructionsHandler: HookHandler = {
+  name: 'http-prompt-instructions',
+  async execute(stdin, tool, config) {
+    const { isAgentExcluded } = await import('./types.js');
+
+    if (config && isAgentExcluded(config, tool)) return null;
+    const { deliversInstructionsByHook } = await import('./instruction-targets.js');
+    const { getsRulesFromSessionHook } = await import('./resources/rule-format.js');
+
+    if (!deliversInstructionsByHook(tool, 'project')) return null;
+    const sessionEvent = stdin.hook_event_name === 'SessionStart' || stdin.hook_event_name === 'SubagentStart';
+
+    // Each tool through its own channel only; a resumed Codex session holds them already.
+    if (getsRulesFromSessionHook(tool) !== sessionEvent || stdin.source === 'resume') return null;
+    const { localAgentInstructionText } = await import('./local-agent.js');
+    const text = await localAgentInstructionText(resolveHookCwd(stdin) ?? process.cwd(), tool);
+
+    if (!text) return null;
+    const hookEventName = stdin.hook_event_name === 'SubagentStart' ? 'SubagentStart' : 'SessionStart';
+
+    return JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext: text } });
+  },
+};
+
+/** HTTP local-agent report/sync + workspace binding prompts. */
+const localAgentHandler: HookHandler = {
+  name: 'local-agent-sync',
+  async execute(stdin, tool, config) {
+    const { isAgentExcluded } = await import('./types.js');
+
+    if (config && isAgentExcluded(config, tool)) return null;
+    const { reportAndSyncFromHook } = await import('./local-agent.js');
+    const output = await reportAndSyncFromHook(stdin, tool);
+
+    // Codex's first prompt must read the cache after this sync, rather than
+    // racing it in another handler. SubagentStart reads the parent's cache.
+    if (stdin.hook_event_name === 'SessionStart') {
+      return await localAgentInstructionsHandler.execute(stdin, tool, config) ?? output;
+    }
+
+    return output;
+  },
+};
+
+/**
+ * Map a host's `hook_event_name` (as normalized by parseStdin) to the canonical
+ * webhook event names teams subscribe to. The handler used to read `stdin.event`,
+ * which hosts never send, so every event was forwarded as `unknown` and no
+ * `skill-use` / `session-start` / `session-stop` subscription ever matched (#702).
+ *
+ * Keyed by the lowercased hook name for a case-insensitive lookup: Claude sends
+ * PascalCase (`SessionStart`) while Cursor/CodeBuddy send camelCase
+ * (`sessionStart`) — see dashboard-collector's mapEventType, which handles both.
+ * A case-sensitive PascalCase-only map silently dropped the camelCase hosts.
+ */
+const WEBHOOK_EVENT_BY_HOOK = new Map([
+  ['sessionstart', 'session-start'],
+  ['stop', 'session-stop'],
+  ['sessionend', 'session-stop'],
+]);
+
+/**
+ * Build the minimal, whitelisted data payload for a webhook event.
+ *
+ * Only a fixed set of non-sensitive fields per event is forwarded. Raw
+ * `tool_input` (which can carry API keys in tool args) and `tool_response`
+ * (which can carry private tool output) are never included (#701). The result is
+ * additionally deep-redacted at the send boundary (see sendWebhook).
+ */
+function buildWebhookData(
+  event: string,
+  stdin: HookStdin,
+): WebhookPayload['data'] {
+  if (event === 'session-start' || event === 'session-stop') {
+    const sessionId = deriveSessionId(stdin);
+
+    return sessionId ? { sessionId } : {};
+  }
+
+  return {};
+}
+
+/** Send one webhook event to the team's configured endpoints; a failure is logged, never thrown. */
+async function sendWebhookEvent(
+  event: string,
+  stdin: HookStdin,
+  tool: string,
+  localConfig: LocalConfig,
+  data: WebhookPayload['data'],
+): Promise<void> {
+  const { sendWebhook, loadWebhookConfig } = await import('./webhook.js');
+
+  try {
+    const config = await loadWebhookConfig(localConfig);
+
+    if (!config.enabled || config.endpoints.length === 0) return;
+
+    const payload = {
+      tool,
+      sessionId: deriveSessionId(stdin),
+      cwd: resolveHookCwd(stdin),
+      username: stdinString(stdin, 'username'),
+      data,
+    };
+
+    await sendWebhook(event, payload, config);
+  } catch (error) {
+    log.debug(`Webhook dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** Webhook notification handler — sends session events to configured endpoints. */
+const webhookHandler: HookHandler = {
+  name: 'webhook-dispatch',
+  async execute(stdin, tool, localConfig) {
+    if (!localConfig) return null;
+    const hookEventName = stdinString(stdin, 'hook_event_name') ?? '';
+    // Case-insensitive so both PascalCase (Claude) and camelCase (Cursor/
+    // CodeBuddy) hook names resolve (#702).
+    const event = WEBHOOK_EVENT_BY_HOOK.get(hookEventName.toLowerCase());
+
+    // Only forward events we can map to a canonical name — never emit `unknown` (#702).
+    if (!event) return null;
+    await sendWebhookEvent(event, stdin, tool, localConfig, buildWebhookData(event, stdin));
+
+    return null;
+  },
+};
+
+// ─── Registry builder ───────────────────────────────────
+
+/**
+ * Build the complete handler registry for the hook dispatcher.
+ * Returns all handler registrations with their event, matcher, timeout, and implementation.
+ */
+export function buildHandlerRegistry(): HandlerRegistration[] {
+  return [
+    // ─── SessionStart ─────────────────────────────────
+    // pull does not produce output the host needs; run detached so git fetch
+    // on a slow network cannot delay session startup. Its own generous budget
+    // (PULL_TIMEOUT_MS) — the shared 15s truncated the pull itself.
+    { event: 'session-start', matcher: '*', handler: pullHandler, timeoutMs: PULL_TIMEOUT_MS, background: true },
+    { event: 'session-start', matcher: '*', handler: sessionCaptureHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+    { event: 'session-start', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'session-start', matcher: '*', handler: teamRulesHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'session-start', matcher: '*', handler: cursorUserRulesHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true, yieldsToContextLimit: true },
+    { event: 'session-start', matcher: '*', handler: mrHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true, requiresConfig: true },
+    { event: 'session-start', matcher: '*', handler: packageHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'session-start', matcher: '*', handler: teamEnvHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'session-start', matcher: '*', handler: localAgentHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
+    // Asked for by the Pi and OMP extensions and the Hermes plugin, which add the result to the prompt.
+    { event: 'instructions', matcher: '*', handler: instructionsHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'instructions', matcher: '*', handler: localAgentInstructionsHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
+    { event: 'session-start', matcher: '*', handler: webhookHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+
+    // Copilot emits SessionEnd after its final turn (not Stop), so the webhook
+    // handler must run here too or those sessions emit no session-stop
+    // notification (#702). Detached, mirroring the stop registration.
+    { event: 'session-end', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+    { event: 'session-end', matcher: '*', handler: webhookHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+    // Copilot's last turn can end with SessionEnd and no Stop, so the recall
+    // reducer runs here too, and votes-push pushes in the detached pass (#884).
+    // A Stop before it already credited the same reads, and the ledger counts a doc once.
+    { event: 'session-end', matcher: '*', handler: votesSyncHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true, requiresConfig: true },
+    { event: 'session-end', matcher: '*', handler: votesPushHandler, timeoutMs: VOTES_PUSH_TIMEOUT_MS, background: true, gitOnly: true, requiresConfig: true },
+
+    // ─── Stop ─────────────────────────────────────────
+    // votes-sync and contribute-check may return a hint the host injects back
+    // into the session, so they run inline (capped at FOREGROUND_HOOK_TIMEOUT_MS).
+    // The rest are pure side effects — the update check in particular shells out
+    // to the npm registry — so they run detached to avoid pushing the Stop hook
+    // past the host's hook timeout (CodeBuddy kills hooks at ~10s regardless of
+    // the declared timeout).
+    { event: 'stop', matcher: '*', handler: updateHandler, timeoutMs: UPDATE_BUDGET_MS, background: true },
+    { event: 'stop', matcher: '*', handler: votesSyncHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true, requiresConfig: true },
+    { event: 'stop', matcher: '*', handler: votesPushHandler, timeoutMs: VOTES_PUSH_TIMEOUT_MS, background: true, gitOnly: true, requiresConfig: true },
+    { event: 'stop', matcher: '*', handler: contributeCheckHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true, requiresConfig: true },
+    { event: 'stop', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+    { event: 'stop', matcher: '*', handler: localAgentHandler, timeoutMs: LOCAL_AGENT_TIMEOUT_MS, background: true },
+    { event: 'stop', matcher: '*', handler: webhookHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+
+    // ─── SubagentStart ────────────────────────────────
+    // Codex only (SUBAGENT_START_SPEC): a fresh subagent fires no SessionStart (#938).
+    { event: 'subagent-start', matcher: '*', handler: teamRulesHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'subagent-start', matcher: '*', handler: localAgentInstructionsHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
+
+    // ─── SubagentStop ─────────────────────────────────
+    // A subagent can finish after the session's last Stop (a background
+    // worker): votes-sync credits what it read then, locally; the next Stop or
+    // pull pushes it (#884). Only the agents in
+    // SUBAGENT_STOP_TOOLS (builtin-hooks.ts) register it.
+    { event: 'subagent-stop', matcher: '*', handler: votesSyncHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true, requiresConfig: true },
+
+    // ─── PostToolUse ──────────────────────────────────
+    // Both return null on every path (pure side effects) and already run
+    // detached for stop/session-end — foreground here, they were the whole
+    // inline pass for a plain tool call, and under Windows disk contention
+    // dashboard-report alone measured 3.8 s inside the host's 10 s budget
+    // (#1216). Detached, the inline pass for a plain call is empty and the
+    // host-visible cost is bundle load + spawn.
+    { event: 'post-tool-use', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+    { event: 'post-tool-use', matcher: '*', handler: recallAttributionHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+    { event: 'post-tool-use', matcher: 'TodoWrite', handler: todowriteHintHandler, timeoutMs: TODOWRITE_HINT_TIMEOUT_MS, requiresConfig: true },
+    { event: 'post-tool-use', matcher: '*', handler: localAgentHandler, timeoutMs: LOCAL_AGENT_TIMEOUT_MS, background: true },
+    { event: 'post-tool-use', matcher: '*', handler: skillUseHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+    // A worktree an agent tool entered without any git hook (Claude Code's EnterWorktree, Codex CLI) gets the
+    // team's resources on its first tool use there; any other checkout costs a few file reads.
+    { event: 'post-tool-use', matcher: '*', handler: newCheckoutHandler, timeoutMs: PULL_TIMEOUT_MS, background: true, requiresConfig: true },
+
+    // ─── UserPromptSubmit ─────────────────────────────
+    { event: 'prompt-submit', matcher: '*', handler: pendingHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true, requiresConfig: true },
+    { event: 'prompt-submit', matcher: '*', handler: packagePendingHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
+    { event: 'prompt-submit', matcher: '*', handler: skillMentionHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'prompt-submit', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'prompt-submit', matcher: '*', handler: localAgentHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
+
+    // ─── Git (`--tool git`, see git-hook.ts) ──────────
+    // Inline: the delivery has to land before `git worktree add` returns. Git
+    // has no hook timeout, so the budget is the detached pull's; git-pull hooks
+    // cap their own fetch.
+    { event: 'post-checkout', matcher: '*', handler: newWorktreeHandler, timeoutMs: PULL_TIMEOUT_MS, requiresConfig: true },
+    { event: 'post-checkout', matcher: '*', handler: gitPullHandler, timeoutMs: PULL_TIMEOUT_MS, requiresConfig: true },
+    { event: 'post-merge', matcher: '*', handler: gitPullHandler, timeoutMs: PULL_TIMEOUT_MS, requiresConfig: true },
+    { event: 'post-rewrite', matcher: '*', handler: gitPullHandler, timeoutMs: PULL_TIMEOUT_MS, requiresConfig: true },
+  ];
+}
+
+/**
+ * Apply the config gates to a handler registry.
+ *
+ * No config (localConfig === null) drops every `requiresConfig` handler. Hooks
+ * live in HOME even for a project-scope install, so they fire in every project
+ * on the machine; a directory without teamai must see no team prompts (#748).
+ * A config that fails to parse also reads as null (loadLocalConfig swallows
+ * parse errors), so a corrupted config withholds team prompts too; `teamai
+ * doctor` reports it.
+ *
+ * HTTP-only teams (localConfig.repo.kind === 'http') must not receive prompts
+ * for git-provider-only features, so every `gitOnly` handler is dropped when the
+ * team source is HTTP. A git source (kind === 'git' or undefined for backward
+ * compatibility) keeps the full registry.
+ *
+ * The gate is keyed on teamai's own configured source, NOT on the current
+ * working directory's git remote — an HTTP-only user working inside a
+ * github/tgit checkout must still see no git-only prompts. This is
+ * intentionally NOT a hard security gate — HTTP write ops are still enforced
+ * at execution time by assertNotReadOnly().
+ */
+export function filterHandlersForConfig(
+  registry: HandlerRegistration[],
+  localConfig: LocalConfig | null,
+): HandlerRegistration[] {
+  if (!localConfig) {
+    return registry.filter((reg) => reg.requiresConfig !== true);
+  }
+
+  if (localConfig.repo.kind === 'http') {
+    return registry.filter((reg) => reg.gitOnly !== true);
+  }
+
+  return registry;
+}

@@ -1,0 +1,167 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { getAgentVersion, clearVersionCache, _readPlistVersion } from '../agent-version.js';
+
+beforeEach(() => {
+  clearVersionCache();
+});
+
+describe('getAgentVersion', () => {
+  it('detects claude version from CLI', async () => {
+    const ver = await getAgentVersion('claude');
+    // Should be a semver-like string (digits and dots), or empty if not installed
+    if (ver) {
+      expect(ver).toMatch(/^\d+\.\d+\.\d+/);
+    }
+  });
+
+  it('detects cursor version from CLI', async () => {
+    const ver = await getAgentVersion('cursor');
+    if (ver) {
+      expect(ver).toMatch(/^\d+\.\d+\.\d+/);
+    }
+  });
+
+  it('detects codebuddy CLI version', async () => {
+    const ver = await getAgentVersion('codebuddy');
+    if (ver) {
+      expect(ver).toMatch(/^\d+\.\d+/);
+    }
+  });
+
+  it('detects codebuddy IDE version from plist', async () => {
+    const ver = await getAgentVersion('codebuddy-ide');
+    if (ver) {
+      expect(ver).toMatch(/^\d+\.\d+/);
+    }
+  });
+
+  it('detects workbuddy version from plist', async () => {
+    const ver = await getAgentVersion('workbuddy');
+    if (ver) {
+      expect(ver).toMatch(/^\d+\.\d+/);
+    }
+  });
+
+  it('detects hermes version from CLI', async () => {
+    const ver = await getAgentVersion('hermes');
+    if (ver) {
+      expect(ver).toMatch(/^\d+\.\d+/);
+    }
+  });
+
+  it('detects openclaw version from CLI', async () => {
+    const ver = await getAgentVersion('openclaw');
+    if (ver) {
+      expect(ver).toMatch(/^\d+\.\d+/);
+    }
+  });
+
+  it('returns empty string for unknown agents', async () => {
+    const ver = await getAgentVersion('nonexistent-agent');
+    expect(ver).toBe('');
+  });
+
+  it('caches results across calls', async () => {
+    const ver1 = await getAgentVersion('claude');
+    const ver2 = await getAgentVersion('claude');
+    expect(ver1).toBe(ver2);
+  });
+});
+
+describe('getAgentVersion with an npm-installed CLI', () => {
+  let binDir: string;
+  let savedPath: string | undefined;
+
+  beforeEach(async () => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), 'teamai-agent-version-'));
+    savedPath = process.env.PATH;
+    // npm writes only `codebuddy.cmd` / `codebuddy.ps1` on Windows, so the
+    // bare name has no `.exe` for CreateProcess to find.
+    if (process.platform === 'win32') {
+      await writeFile(path.join(binDir, 'codebuddy.cmd'), '@echo 2.5.0\r\n');
+    } else {
+      const script = path.join(binDir, 'codebuddy');
+      await writeFile(script, '#!/bin/sh\necho 2.5.0\n');
+      await chmod(script, 0o755);
+    }
+    process.env.PATH = `${binDir}${path.delimiter}${savedPath ?? ''}`;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = savedPath;
+    await rm(binDir, { recursive: true, force: true });
+  });
+
+  it('reads the version through the platform launcher', async () => {
+    expect(await getAgentVersion('codebuddy')).toBe('2.5.0');
+  });
+});
+
+// Each tool's verbatim `--version` output, and the version teamai reports for it.
+describe.each([
+  { tool: 'muse', output: 'Muse Code 1.4.6 (1.4.6-R6000.1)', version: '1.4.6' },
+  { tool: 'agy', output: '1.4.10', version: '1.4.10' },
+])('getAgentVersion for $tool', ({ tool, output, version }) => {
+  let binDir: string;
+  let savedPath: string | undefined;
+
+  beforeEach(async () => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), `teamai-agent-version-${tool}-`));
+    savedPath = process.env.PATH;
+    if (process.platform === 'win32') {
+      await writeFile(path.join(binDir, `${tool}.cmd`), `@echo ${output}\r\n`);
+    } else {
+      const script = path.join(binDir, tool);
+      await writeFile(script, `#!/bin/sh\necho '${output}'\n`);
+      await chmod(script, 0o755);
+    }
+    process.env.PATH = `${binDir}${path.delimiter}${savedPath ?? ''}`;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = savedPath;
+    await rm(binDir, { recursive: true, force: true });
+  });
+
+  it(`reads the release version from \`${tool} --version\``, async () => {
+    expect(await getAgentVersion(tool)).toBe(version);
+  });
+});
+
+describe('_readPlistVersion', () => {
+  it('returns empty string for non-existent path', async () => {
+    const ver = await _readPlistVersion('/nonexistent/App.app');
+    expect(ver).toBe('');
+  });
+});
+
+describe('version regex extraction', () => {
+  it('extracts leading semver from hermes-style output', async () => {
+    // Simulate what detectHermesVersion / detectOpenclawVersion do:
+    // execVersion returns raw stdout, then regex extracts leading digits+dots.
+    const raw = '1.23.4 (build abc123)';
+    const match = raw.match(/^\(?(\d+(?:\.\d+)*)\)?/);
+    expect(match?.[1]).toBe('1.23.4');
+  });
+
+  it('returns full string when no leading version found', async () => {
+    const raw = 'unknown-version-format';
+    const match = raw.match(/^([\d.]+)/);
+    expect(match?.[1]).toBeUndefined();
+  });
+
+  it('handles empty string gracefully', async () => {
+    const raw = '';
+    const match = raw.match(/^([\d.]+)/);
+    expect(match).toBeNull();
+  });
+
+  it('extracts version from parenthesized format like hermes', () => {
+    const raw = '(2026.8.7)\nProject: /hermes-app\nPython: 3.11.6';
+    const match = raw.match(/^\(?(\d+(?:\.\d+)*)\)?/);
+    expect(match?.[1]).toBe('2026.8.7');
+  });
+});

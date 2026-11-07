@@ -1,0 +1,796 @@
+// -*- coding: utf-8 -*-
+/**
+ * MR/PR comment formatting and idempotent posting.
+ *
+ * Supports the GitHub, GitLab (including self-hosted) and TGit REST APIs. A
+ * marker anchor keeps repeated runs on one MR to a single comment, created once
+ * and then updated.
+ */
+
+import { z } from 'zod';
+import type { LearningDraft, CodebaseSuggestion } from '../types.js';
+import { tgitFetch } from '../providers/tgit/rest-auth.js';
+import { getGitLabToken } from '../providers/gitlab/gitlab-api.js';
+import { parseGitLabMRUrl } from '../providers/gitlab/mr-fetch.js';
+import { TEAMAI_COMMENT_SIGNATURE } from '../providers/mr-threads.js';
+import { paginateGitLab } from './gitlab-paginate.js';
+import { log } from '../utils/logger.js';
+
+// ─── Constants ────────────────────────────────────────────────
+
+const DEFAULT_MARKER = '<!-- teamai:ci-extract -->';
+const API_TIMEOUT_MS = 15_000;
+
+// GitLab caps note pages at 100; same guard as fetchGitLabDiscussions (mr-fetch.ts).
+const MAX_NOTE_PAGES = 20;
+
+/**
+ * The GitHub REST API root: `GITHUB_API_URL`, which GitHub Actions sets to the GitHub Enterprise server's API, else
+ * github.com's.
+ */
+export function githubApiUrl(): string {
+  return (process.env['GITHUB_API_URL']?.trim() || 'https://api.github.com').replace(/\/+$/, '');
+}
+
+// ─── Types ────────────────────────────────────────────────
+
+export interface CommentResult {
+  created: boolean;
+  url?: string;
+}
+
+interface ParsedMrUrl {
+  provider: 'github' | 'tgit' | 'gitlab';
+  owner: string;
+  repo: string;
+  number: string;
+}
+
+// ─── URL parsing ────────────────────────────────────────────
+
+/**
+ * Parses the provider, owner/repo and number from an MR/PR URL.
+ */
+export function parseMrUrl(url: string): ParsedMrUrl {
+  // GitHub: https://github.com/{owner}/{repo}/pull/{number}
+  const ghMatch = url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+
+  if (ghMatch) {
+    return { provider: 'github', owner: ghMatch[1], repo: ghMatch[2], number: ghMatch[3] };
+  }
+
+  // TGit: https://git.woa.com/{group}/{project}/merge_requests/{iid}
+  // group may span several path levels
+  const tgitMatch = url.match(/git\.woa\.com\/(.+)\/([^/]+)\/merge_requests\/(\d+)/);
+
+  if (tgitMatch) {
+    return { provider: 'tgit', owner: tgitMatch[1], repo: tgitMatch[2], number: tgitMatch[3] };
+  }
+
+  // GitLab (including self-hosted): https://<host>/<group...>/<project>/-/merge_requests/<iid>
+  // The `/-/` route separator is GitLab-specific, so it identifies the platform on any host.
+  const glMatch = url.match(/^[a-z]+:\/\/[^/]+\/(.+)\/-\/merge_requests\/(\d+)/i);
+
+  if (glMatch) {
+    const projectPath = glMatch[1];
+    const lastSlash = projectPath.lastIndexOf('/');
+
+    if (lastSlash > 0) {
+      return {
+        provider: 'gitlab',
+        owner: projectPath.slice(0, lastSlash),
+        repo: projectPath.slice(lastSlash + 1),
+        number: glMatch[2],
+      };
+    }
+  }
+
+  throw new Error(`Cannot parse MR URL: ${url}; only GitHub, TGit and GitLab are supported`);
+}
+
+// ─── Comment formatting ──────────────────────────────────────
+
+/**
+ * Formats the AI extraction result as a Markdown comment.
+ */
+export function formatComment(
+  learning: LearningDraft | undefined,
+  suggestions: CodebaseSuggestion[] | undefined,
+  marker: string,
+): string {
+  const lines: string[] = [marker, '', '## TeamAI Knowledge Extraction', ''];
+
+  if (learning) {
+    lines.push('### Learning', '');
+    lines.push(`**${learning.title}**`, '');
+    lines.push('<details>', '<summary>Show full content</summary>', '');
+    lines.push('```markdown');
+    lines.push(learning.content);
+    lines.push('```');
+    lines.push('', '</details>', '');
+  }
+
+  if (suggestions && suggestions.length > 0) {
+    lines.push('### Codebase.md update suggestions', '');
+    lines.push('| Section | Action | Preview |');
+    lines.push('|---------|--------|---------|');
+
+    for (const s of suggestions) {
+      const preview = s.content.replace(/\n/g, ' ').slice(0, 80);
+      lines.push(`| ${s.section} | ${s.action} | ${preview} |`);
+    }
+
+    lines.push('');
+  }
+
+  if (!learning && (!suggestions || suggestions.length === 0)) {
+    lines.push('> No knowledge to extract from this MR.', '');
+  }
+
+  lines.push('---');
+  lines.push('> These suggestions are applied to the team knowledge repo once the MR is merged.');
+  lines.push(`> ${TEAMAI_COMMENT_SIGNATURE}`);
+
+  return lines.join('\n');
+}
+
+// ─── GitHub Comment API ─────────────────────────────────
+
+async function githubRequest(path: string, method: string, body?: { body: string }): Promise<Response> {
+  const token = process.env['GITHUB_TOKEN'];
+
+  if (!token) throw new Error('GITHUB_TOKEN environment variable is not set');
+
+  const url = `${githubApiUrl()}${path}`;
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'teamai-cli',
+  };
+
+  return fetch(url, {
+    method,
+    headers: body ? { ...headers, 'Content-Type': 'application/json' } : headers,
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  });
+}
+
+const GitHubCommentSchema = z.object({
+  id: z.number(),
+  body: z.string(),
+});
+
+type GitHubComment = z.infer<typeof GitHubCommentSchema>;
+
+/** The comment GitHub returns for a post or an update; only its link is read. */
+const GitHubPostedCommentSchema = z.object({ html_url: z.string().optional() });
+
+async function findGitHubComment(
+  owner: string,
+  repo: string,
+  prNumber: string,
+  marker: string,
+): Promise<GitHubComment | null> {
+  const resp = await githubRequest(
+    `/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`,
+    'GET',
+  );
+
+  if (!resp.ok) {
+    throw new Error(`GitHub comment list request failed (${resp.status})`);
+  }
+
+  const comments = z.array(GitHubCommentSchema).parse(await resp.json());
+
+  return comments.find((c) => c.body.includes(marker)) ?? null;
+}
+
+async function postGitHubComment(
+  owner: string,
+  repo: string,
+  prNumber: string,
+  body: string,
+): Promise<CommentResult> {
+  const resp = await githubRequest(
+    `/repos/${owner}/${repo}/issues/${prNumber}/comments`,
+    'POST',
+    { body },
+  );
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`GitHub comment post failed (${resp.status}): ${errText}`);
+  }
+
+  const data = GitHubPostedCommentSchema.parse(await resp.json());
+
+  return { created: true, url: data.html_url };
+}
+
+async function updateGitHubComment(
+  owner: string,
+  repo: string,
+  commentId: number,
+  body: string,
+): Promise<CommentResult> {
+  const resp = await githubRequest(
+    `/repos/${owner}/${repo}/issues/comments/${commentId}`,
+    'PATCH',
+    { body },
+  );
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`GitHub comment update failed (${resp.status}): ${errText}`);
+  }
+
+  const data = GitHubPostedCommentSchema.parse(await resp.json());
+
+  return { created: false, url: data.html_url };
+}
+
+// ─── TGit Comment API ───────────────────────────────────
+
+async function tgitRequest(
+  path: string,
+  method: string,
+  body?: { body: string; path?: string; line?: number; line_type?: string },
+): Promise<Response> {
+  return tgitFetch(path, {
+    method,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+const TGitNoteSchema = z.object({
+  id: z.number(),
+  body: z.string(),
+});
+
+type TGitNote = z.infer<typeof TGitNoteSchema>;
+
+const TGitMRInfoSchema = z.object({
+  id: z.number(),
+  iid: z.number(),
+});
+
+/** The branches of an MR, which the compare API takes. */
+const TGitMRBranchesSchema = z.object({ source_branch: z.string(), target_branch: z.string() });
+
+/** A compare result; only the first changed file is read. */
+const TGitCompareSchema = z.object({ diffs: z.array(z.object({ new_path: z.string() })).optional() });
+
+/**
+ * The TGit Notes API takes the MR's global id (not the project-scoped iid), so
+ * look the global id up in the MR list first.
+ */
+async function getMrGlobalId(projectId: string, mrIid: string): Promise<number> {
+  const resp = await tgitRequest(
+    `/projects/${projectId}/merge_requests?iid=${mrIid}`,
+    'GET',
+  );
+
+  if (!resp.ok) {
+    throw new Error(`TGit MR lookup failed (${resp.status})`);
+  }
+
+  const mrs = z.array(TGitMRInfoSchema).parse(await resp.json());
+  const mr = mrs.find((m) => String(m.iid) === mrIid);
+
+  if (!mr) {
+    throw new Error(`TGit MR !${mrIid} not found`);
+  }
+
+  return mr.id;
+}
+
+async function findTGitComment(
+  projectId: string,
+  mrGlobalId: number,
+  marker: string,
+): Promise<TGitNote | null> {
+  const resp = await tgitRequest(
+    `/projects/${projectId}/merge_requests/${mrGlobalId}/notes?per_page=100`,
+    'GET',
+  );
+
+  if (!resp.ok) {
+    throw new Error(`TGit note list request failed (${resp.status})`);
+  }
+
+  const notes = z.array(TGitNoteSchema).parse(await resp.json());
+
+  return notes.find((n) => n.body.includes(marker)) ?? null;
+}
+
+async function postTGitComment(
+  projectId: string,
+  mrGlobalId: number,
+  body: string,
+): Promise<CommentResult> {
+  const resp = await tgitRequest(
+    `/projects/${projectId}/merge_requests/${mrGlobalId}/notes`,
+    'POST',
+    { body },
+  );
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`TGit comment post failed (${resp.status}): ${errText}`);
+  }
+
+  return { created: true };
+}
+
+async function updateTGitComment(
+  projectId: string,
+  mrGlobalId: number,
+  noteId: number,
+  body: string,
+): Promise<CommentResult> {
+  const resp = await tgitRequest(
+    `/projects/${projectId}/merge_requests/${mrGlobalId}/notes/${noteId}`,
+    'PUT',
+    { body },
+  );
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`TGit comment update failed (${resp.status}): ${errText}`);
+  }
+
+  return { created: false };
+}
+
+// ─── GitLab Comment API ─────────────────────────────────
+
+const GitLabNoteSchema = z.object({
+  id: z.number(),
+  body: z.string(),
+});
+
+type GitLabNote = z.infer<typeof GitLabNoteSchema>;
+
+/**
+ * The GitLab Notes API takes the MR's project-scoped iid directly (TGit needs the
+ * global id). The API base and host check reuse parseGitLabMRUrl, so the PAT goes
+ * only to the configured instance.
+ */
+async function gitlabNotesBase(mrUrl: string): Promise<string> {
+  const { apiBase, projectPath, mrIid } = parseGitLabMRUrl(mrUrl);
+
+  return `${apiBase}/projects/${encodeURIComponent(projectPath)}/merge_requests/${mrIid}/notes`;
+}
+
+async function gitlabRequest(mrUrl: string, path: string, method: string, body?: { body: string }): Promise<Response> {
+  const token = getGitLabToken();
+
+  if (!token) {
+    throw new Error(
+      'GitLab authentication unavailable. Set the GITLAB_TOKEN environment variable '
+      + '(a GitLab Personal Access Token with `api` scope).',
+    );
+  }
+
+  return fetch(`${await gitlabNotesBase(mrUrl)}${path}`, {
+    method,
+    headers: { 'PRIVATE-TOKEN': token, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    // Never follow redirects: the PRIVATE-TOKEN header would be forwarded to
+    // whatever origin the 3xx points at. The host check in parseGitLabMRUrl
+    // only covers the first URL.
+    redirect: 'manual',
+  });
+}
+
+async function findGitLabComment(mrUrl: string, marker: string): Promise<GitLabNote | null> {
+  // Markers sit on their own line. Ignore mentions quoted in a sentence.
+  const matchesMarker = (note: GitLabNote) => note.body.split('\n').some((line) => line.trim() === marker);
+
+  // Pipeline updates edit the original comment without changing created_at.
+  // Search recent edits first, then stop at the most recently updated marker.
+  const notes = await paginateGitLab(
+    (page) => gitlabRequest(mrUrl, `?per_page=100&order_by=updated_at&sort=desc&page=${page}`, 'GET'),
+    MAX_NOTE_PAGES,
+    'GitLab note list',
+    { item: GitLabNoteSchema, stopWhen: matchesMarker },
+  );
+
+  return notes.find(matchesMarker) ?? null;
+}
+
+async function postGitLabComment(mrUrl: string, body: string): Promise<CommentResult> {
+  const resp = await gitlabRequest(mrUrl, '', 'POST', { body });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`GitLab comment post failed (${resp.status}): ${errText}`);
+  }
+
+  return { created: true };
+}
+
+async function updateGitLabComment(mrUrl: string, noteId: number, body: string): Promise<CommentResult> {
+  const resp = await gitlabRequest(mrUrl, `/${noteId}`, 'PUT', { body });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`GitLab comment update failed (${resp.status}): ${errText}`);
+  }
+
+  return { created: false };
+}
+
+// ─── Public API ─────────────────────────────────────────
+
+/**
+ * Posts or updates the knowledge extraction comment on an MR/PR, idempotently.
+ *
+ * An HTML comment marker anchors the comment:
+ * - first run: creates a new comment
+ * - later runs: update the existing comment (same marker)
+ *
+ * @param mrUrl       full MR/PR URL
+ * @param learning    learning draft from the AI extraction
+ * @param suggestions codebase update suggestions from the AI extraction
+ * @param marker      anchor string
+ * @param dryRun      when true, call no API
+ * @returns           the result
+ */
+export async function postOrUpdateMrComment(
+  mrUrl: string,
+  learning: LearningDraft | undefined,
+  suggestions: CodebaseSuggestion[] | undefined,
+  marker?: string,
+  dryRun?: boolean,
+): Promise<CommentResult> {
+  const effectiveMarker = marker ?? DEFAULT_MARKER;
+  const body = formatComment(learning, suggestions, effectiveMarker);
+  const parsed = parseMrUrl(mrUrl);
+
+  if (dryRun) {
+    log.info('dry-run: comment that would be posted:');
+    console.log(body);
+
+    return { created: true };
+  }
+
+  if (parsed.provider === 'github') {
+    const existing = await findGitHubComment(
+      parsed.owner,
+      parsed.repo,
+      parsed.number,
+      effectiveMarker,
+    );
+
+    if (existing) {
+      log.debug(`Found existing comment #${existing.id}; updating in place...`);
+
+      return updateGitHubComment(parsed.owner, parsed.repo, existing.id, body);
+    }
+
+    return postGitHubComment(parsed.owner, parsed.repo, parsed.number, body);
+  }
+
+  if (parsed.provider === 'gitlab') {
+    const existing = await findGitLabComment(mrUrl, effectiveMarker);
+
+    if (existing) {
+      log.debug(`Found existing note #${existing.id}; updating in place...`);
+
+      return updateGitLabComment(mrUrl, existing.id, body);
+    }
+
+    return postGitLabComment(mrUrl, body);
+  }
+
+  // TGit — the Notes API takes the MR's global id
+  const projectId = encodeURIComponent(`${parsed.owner}/${parsed.repo}`);
+  const mrGlobalId = await getMrGlobalId(projectId, parsed.number);
+  const existing = await findTGitComment(projectId, mrGlobalId, effectiveMarker);
+
+  if (existing) {
+    log.debug(`Found existing note #${existing.id}; updating in place...`);
+
+    return updateTGitComment(projectId, mrGlobalId, existing.id, body);
+  }
+
+  return postTGitComment(projectId, mrGlobalId, body);
+}
+
+// ─── Individual comments ─────────────────────
+
+/**
+ * Formats one suggestion as its own comment.
+ */
+export function formatIndividualComment(
+  type: 'learning' | 'suggestion',
+  index: number,
+  content: { title?: string; body?: string; section?: string; action?: string; preview?: string },
+  provider: 'github' | 'tgit' | 'gitlab',
+): string {
+  const markerId = type === 'learning' ? 'learning' : `suggestion:${index}`;
+  const marker = `<!-- teamai:ci-extract:${markerId} -->`;
+
+  const lines: string[] = [marker, ''];
+
+  if (type === 'learning') {
+    lines.push(`## TeamAI Learning`, '');
+    lines.push(`**${content.title}**`, '');
+
+    if (content.body) {
+      lines.push('<details>', '<summary>Show full content</summary>', '');
+      lines.push('```markdown');
+      lines.push(content.body);
+      lines.push('```');
+      lines.push('', '</details>');
+    }
+  } else {
+    lines.push(`## TeamAI Codebase Suggestion #${index}`, '');
+    lines.push(`**Section**: ${content.section} | **Action**: ${content.action}`, '');
+
+    if (content.preview) {
+      lines.push('```');
+      lines.push(content.preview.slice(0, 300));
+      lines.push('```');
+    }
+  }
+
+  lines.push('');
+
+  if (provider === 'tgit') {
+    lines.push('> 💡 To keep this out of the team knowledge repo, add a ☝️ emoji reaction to this comment');
+  } else {
+    // GitHub / GitLab: 👎 reaction (a thumbsdown award emoji on GitLab)
+    lines.push('> 💡 To keep this out of the team knowledge repo, add a 👎 reaction to this comment');
+  }
+
+  lines.push('');
+  lines.push(TEAMAI_COMMENT_SIGNATURE);
+
+  return lines.join('\n');
+}
+
+/**
+ * Posts the learning and each suggestion as its own comment/note.
+ *
+ * Each one carries a unique marker, so readRejections can read its state later.
+ * On TGit it is posted as a conversation note, and a reviewer rejects it with a
+ * ☝️ emoji reaction.
+ */
+export async function postIndividualComments(
+  mrUrl: string,
+  learning: LearningDraft | undefined,
+  suggestions: CodebaseSuggestion[] | undefined,
+  dryRun?: boolean,
+): Promise<{ posted: number }> {
+  const parsed = parseMrUrl(mrUrl);
+  let posted = 0;
+
+  const items: Array<{ markerId: string; body: string }> = [];
+
+  // Learning
+  if (learning) {
+    const body = formatIndividualComment(
+      'learning', 0,
+      { title: learning.title, body: learning.content },
+      parsed.provider,
+    );
+
+    items.push({ markerId: 'learning', body });
+  }
+
+  // Suggestions
+  if (suggestions) {
+    for (let i = 0; i < suggestions.length; i++) {
+      const s = suggestions[i];
+
+      const body = formatIndividualComment(
+        'suggestion', i + 1,
+        { section: s.section, action: s.action, preview: s.content },
+        parsed.provider,
+      );
+
+      items.push({ markerId: `suggestion:${i + 1}`, body });
+    }
+  }
+
+  if (items.length === 0) return { posted: 0 };
+
+  if (dryRun) {
+    for (const item of items) {
+      log.info(`dry-run [${item.markerId}]:`);
+      console.log(item.body);
+      console.log('---');
+    }
+
+    return { posted: items.length };
+  }
+
+  if (parsed.provider === 'github') {
+    for (const item of items) {
+      const marker = `<!-- teamai:ci-extract:${item.markerId} -->`;
+      const existing = await findGitHubComment(parsed.owner, parsed.repo, parsed.number, marker);
+
+      if (existing) {
+        await updateGitHubComment(parsed.owner, parsed.repo, existing.id, item.body);
+      } else {
+        await postGitHubComment(parsed.owner, parsed.repo, parsed.number, item.body);
+      }
+
+      posted++;
+    }
+  } else if (parsed.provider === 'gitlab') {
+    // GitLab: posted as a plain conversation note; a reviewer rejects it with a 👎 award emoji
+    for (const item of items) {
+      const marker = `<!-- teamai:ci-extract:${item.markerId} -->`;
+      const existing = await findGitLabComment(mrUrl, marker);
+
+      if (existing) {
+        await updateGitLabComment(mrUrl, existing.id, item.body);
+      } else {
+        await postGitLabComment(mrUrl, item.body);
+      }
+
+      posted++;
+    }
+  } else {
+    // TGit: posted as a code review comment (attached to a file), with a resolve button
+    const projectId = encodeURIComponent(`${parsed.owner}/${parsed.repo}`);
+    const mrGlobalId = await getMrGlobalId(projectId, parsed.number);
+
+    // Fetch the MR's changed files and anchor the code review comment on the first one
+    // Uses the /repository/compare API (/changes is unavailable in some MR states)
+    const mrListResp = await tgitRequest(
+      `/projects/${projectId}/merge_requests?iid=${parsed.number}`,
+      'GET',
+    );
+
+    let anchorFile = 'README.md';
+
+    if (mrListResp.ok) {
+      const mrList = z.array(TGitMRBranchesSchema).parse(await mrListResp.json());
+
+      if (mrList.length > 0) {
+        const { source_branch, target_branch } = mrList[0];
+
+        const compareResp = await tgitRequest(
+          `/projects/${projectId}/repository/compare?from=${target_branch}&to=${source_branch}`,
+          'GET',
+        );
+
+        if (compareResp.ok) {
+          const compareData = TGitCompareSchema.parse(await compareResp.json());
+
+          if (compareData.diffs && compareData.diffs.length > 0) {
+            anchorFile = compareData.diffs[0].new_path;
+          }
+        }
+      }
+    }
+
+    for (const item of items) {
+      const marker = `<!-- teamai:ci-extract:${item.markerId} -->`;
+      // Check whether it already exists
+      const existingNote = await findTGitComment(projectId, mrGlobalId, marker);
+
+      if (existingNote) {
+        await updateTGitComment(projectId, mrGlobalId, existingNote.id, item.body);
+      } else {
+        // Create a code review comment (attached to line 1 of the file)
+        const resp = await tgitRequest(
+          `/projects/${projectId}/merge_requests/${mrGlobalId}/notes`,
+          'POST',
+          { body: item.body, path: anchorFile, line: 1, line_type: 'new' },
+        );
+
+        if (!resp.ok) {
+          // fallback: create a plain note
+          await postTGitComment(projectId, mrGlobalId, item.body);
+        }
+      }
+
+      posted++;
+    }
+  }
+
+  log.success(`Posted ${posted} individual suggestion(s)`);
+
+  return { posted };
+}
+
+// ─── Codebase Graph Change Comment ──────────────────────
+
+const CODEBASE_GRAPH_MARKER = '<!-- teamai:ci-extract:codebase-graph -->';
+
+function formatGraphComment(summary: { added: string[]; removed: string[]; wikiUpdatePreview?: string }): string {
+  const lines: string[] = [];
+  lines.push('## 📊 Codebase Knowledge Graph Changes');
+  lines.push('');
+  lines.push('This MR triggers these code knowledge updates:');
+  lines.push('');
+
+  if (summary.added.length > 0) {
+    lines.push(`### Added nodes (${summary.added.length})`);
+
+    for (const item of summary.added.slice(0, 20)) {
+      lines.push(`- ${item}`);
+    }
+
+    if (summary.added.length > 20) {
+      lines.push(`- _...and ${summary.added.length - 20} more_`);
+    }
+
+    lines.push('');
+  }
+
+  if (summary.removed.length > 0) {
+    lines.push(`### Removed nodes (${summary.removed.length})`);
+
+    for (const item of summary.removed.slice(0, 10)) {
+      lines.push(`- ${item}`);
+    }
+
+    lines.push('');
+  }
+
+  if (summary.wikiUpdatePreview) {
+    lines.push(summary.wikiUpdatePreview);
+    lines.push('');
+  }
+
+  lines.push('---');
+  lines.push('> Add a 👎 reaction to this comment to keep this graph update out of the team knowledge repo');
+  lines.push(CODEBASE_GRAPH_MARKER);
+
+  return lines.join('\n');
+}
+
+export async function postCodebaseGraphComment(
+  mrUrl: string,
+  summary: { added: string[]; removed: string[]; wikiUpdatePreview?: string },
+  dryRun?: boolean,
+): Promise<void> {
+  const body = formatGraphComment(summary);
+  const parsed = parseMrUrl(mrUrl);
+
+  if (dryRun) {
+    log.info('[dry-run] Codebase graph comment:');
+    console.log(body);
+
+    return;
+  }
+
+  if (parsed.provider === 'github') {
+    const existing = await findGitHubComment(parsed.owner, parsed.repo, parsed.number, CODEBASE_GRAPH_MARKER);
+
+    if (existing) {
+      await updateGitHubComment(parsed.owner, parsed.repo, existing.id, body);
+    } else {
+      await postGitHubComment(parsed.owner, parsed.repo, parsed.number, body);
+    }
+  } else if (parsed.provider === 'gitlab') {
+    const existing = await findGitLabComment(mrUrl, CODEBASE_GRAPH_MARKER);
+
+    if (existing) {
+      await updateGitLabComment(mrUrl, existing.id, body);
+    } else {
+      await postGitLabComment(mrUrl, body);
+    }
+  } else {
+    const projectId = encodeURIComponent(`${parsed.owner}/${parsed.repo}`);
+    const mrGlobalId = await getMrGlobalId(projectId, parsed.number);
+    const existing = await findTGitComment(projectId, mrGlobalId, CODEBASE_GRAPH_MARKER);
+
+    if (existing) {
+      await updateTGitComment(projectId, mrGlobalId, existing.id, body);
+    } else {
+      await postTGitComment(projectId, mrGlobalId, body);
+    }
+  }
+
+  log.success('Codebase graph change comment posted');
+}

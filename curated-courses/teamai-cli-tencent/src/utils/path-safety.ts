@@ -1,0 +1,145 @@
+import path from 'node:path';
+import fs from 'node:fs';
+import { getUserHome } from './home.js';
+
+/**
+ * Assert that a resolved target path is within one of the allowed root directories.
+ *
+ * Resolves symlinks on both sides before comparing, preventing symlink-escape attacks.
+ * Throws a descriptive error if the target is outside all allowed roots.
+ *
+ * @param target       The path to validate (will be resolved to absolute).
+ * @param allowedRoots The set of allowed root directories (will be resolved too).
+ * @throws Error with a descriptive message if the target is outside all roots.
+ */
+export function assertSafePath(target: string, allowedRoots: string[]): void {
+  const resolvedTarget = resolveReal(target);
+  const resolvedRoots = allowedRoots.map(resolveReal);
+
+  if (resolvedRoots.some((root) => resolvedTarget === root || resolvedTarget.startsWith(root + path.sep))) {
+    return;
+  }
+
+  throw new Error(
+    `Path traversal detected: "${resolvedTarget}" is outside allowed directories: ${resolvedRoots.join(', ')}`,
+  );
+}
+
+/**
+ * Assert that `candidate` stays within `root`, comparing resolved paths WITHOUT
+ * following symlinks on either side.
+ *
+ * Use this for "write a new file under root" guards where root is ours and the
+ * candidate need not exist yet. Comparing lexically stays consistent under any
+ * symlinked prefix but cannot see a symlink inside the tree; where that gap
+ * matters, use {@link assertSafePath}.
+ *
+ * @param root       The directory the candidate must stay inside.
+ * @param candidate  The path to validate.
+ * @param message    Optional custom error message thrown on violation.
+ * @throws Error if `candidate` resolves outside `root`.
+ */
+export function assertWithinRoot(root: string, candidate: string, message?: string): void {
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+
+  if (resolvedCandidate !== resolvedRoot && !resolvedCandidate.startsWith(resolvedRoot + path.sep)) {
+    throw new Error(message ?? `path traversal detected: "${candidate}" is outside "${root}"`);
+  }
+}
+
+/**
+ * Resolve a path to its real absolute form.
+ *
+ * An existing path and a missing one under the same prefix come back in one
+ * form, so paths that differ only by a symlinked prefix compare equal — as on
+ * macOS, where tmpdirs are reached as /var/... but really live in /private/var.
+ *
+ * Uses fs.realpathSync when the path exists (follows symlinks); a missing path
+ * resolves through its nearest existing ancestor and re-appends the rest. Never
+ * throws and never checks existence or containment — where a dangling symlink
+ * blocks the walk, the unresolved prefix is kept as given.
+ *
+ * @param p  Input path (may be relative, may contain ~).
+ * @returns  Resolved absolute path string.
+ */
+export function resolveReal(p: string): string {
+  const expanded = p.startsWith('~') ? path.join(getUserHome(), p.slice(1)) : p;
+  const abs = path.resolve(expanded);
+
+  try {
+    return fs.realpathSync(abs);
+  } catch {
+    const parent = path.dirname(abs);
+
+    return parent === abs ? abs : path.join(resolveReal(parent), path.basename(abs));
+  }
+}
+
+/**
+ * Return the default allowed roots for user-facing path inputs:
+ * the current working directory and the user's home directory.
+ *
+ * @returns Array of two resolved paths: [cwd, homedir].
+ */
+export function defaultAllowedRoots(): string[] {
+  return [process.cwd(), getUserHome()];
+}
+
+/**
+ * Validate a CLI user-supplied resource name (skill / agent / rule, etc.) for safety.
+ *
+ * Rules enforced:
+ *   - Length must be 1–64 characters
+ *   - Only [A-Za-z0-9._-] characters are allowed
+ *   - Single dot ('.') and double dot ('..') are rejected
+ *   - Must not contain path separators ('/' or '\') after URL-decoding
+ *   - Must not be an absolute path after URL-decoding
+ *   - Must not contain null bytes
+ *   - Percent-encoded variants of the above are also rejected
+ *
+ * @param name  The resource name string to validate.
+ * @throws Error with a descriptive message if the name is invalid.
+ */
+export function assertSafeResourceName(name: string): void {
+  // Reject null bytes before any other check
+  if (name.includes('\0')) {
+    throw new Error('Invalid resource name: contains null byte');
+  }
+
+  // Attempt URL-decode to catch %2e%2e, %2f, etc.
+  let decoded: string;
+
+  try {
+    decoded = decodeURIComponent(name);
+  } catch {
+    throw new Error('Invalid resource name: contains invalid percent-encoding');
+  }
+
+  // Reject null bytes in decoded form too
+  if (decoded.includes('\0')) {
+    throw new Error('Invalid resource name: contains null byte');
+  }
+
+  // Reject path separators (both slash styles) in decoded form
+  if (decoded.includes('/') || decoded.includes('\\')) {
+    throw new Error('Invalid resource name: contains path separator');
+  }
+
+  // Reject absolute paths in decoded form
+  if (path.isAbsolute(decoded)) {
+    throw new Error('Invalid resource name: must not be an absolute path');
+  }
+
+  // Reject dot-only segments
+  if (decoded === '.' || decoded === '..') {
+    throw new Error('Invalid resource name: "." and ".." are not allowed');
+  }
+
+  // Allowlist: only [A-Za-z0-9._-], length 1–64
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+    throw new Error(
+      'Invalid resource name: must be 1–64 characters and contain only [A-Za-z0-9._-]',
+    );
+  }
+}

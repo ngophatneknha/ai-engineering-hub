@@ -1,0 +1,179 @@
+pub mod config;
+pub mod default;
+pub mod handle;
+pub mod on_disk;
+
+#[cfg(test)]
+mod test;
+
+use std::env;
+use std::fmt::Write as _;
+use std::str::FromStr as _;
+
+use chrono::{DateTime, Datelike as _, FixedOffset, Timelike as _};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{filter, reload};
+
+pub use self::config::LoggerConfig;
+pub use self::handle::LoggerHandle;
+
+const DEFAULT_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Info;
+
+const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
+    ("hyper", log::LevelFilter::Info),
+    ("h2", log::LevelFilter::Error),
+    ("tower", log::LevelFilter::Warn),
+    ("rustls", log::LevelFilter::Info),
+    ("wal", log::LevelFilter::Warn),
+    ("raft", log::LevelFilter::Warn),
+];
+
+pub fn setup(mut config: config::LoggerConfig) -> anyhow::Result<LoggerHandle> {
+    // Note that on-disk logger *have* to be initialized *before* default logger!
+    //
+    // If default logger is initialized before on-disk logger, then ANSI escape-sequences (that are
+    // used to apply color and formatting in the terminal, but looks like corrupted text in the text
+    // editor) might appear in the on-disk log-file.
+    //
+    // This happens because when multiple `fmt::Layer`s are initialized in the same subscriber,
+    // the top-level `fmt::Layer` would cache pre-formatted fragments of the log-line
+    // for the next `fmt::Layer`s to reuse.
+    //
+    // And default logger outputs colored log-lines, which on-disk logger reuse even if colors are
+    // disabled for the on-disk logger. :/
+
+    let on_disk_logger = on_disk::new_logger(&mut config.on_disk);
+    let (on_disk_logger, on_disk_logger_handle) = reload::Layer::new(on_disk_logger);
+    let reg = tracing_subscriber::registry().with(on_disk_logger);
+
+    let default_logger = default::new_logger(&config.default);
+    let (default_logger, default_logger_handle) = reload::Layer::new(default_logger);
+    let reg = reg.with(default_logger);
+
+    let logger_handle = LoggerHandle::new(config, default_logger_handle, on_disk_logger_handle);
+
+    // Use `console` or `console-subscriber` feature to enable `console-subscriber`
+    //
+    // Note, that `console-subscriber` requires manually enabling
+    // `--cfg tokio_unstable` rust flags during compilation!
+    //
+    // Otherwise `console_subscriber::spawn` call panics!
+    //
+    // See https://docs.rs/tokio/latest/tokio/#unstable-features
+    #[cfg(all(feature = "console-subscriber", tokio_unstable))]
+    let reg = reg.with(console_subscriber::spawn());
+
+    #[cfg(all(feature = "console-subscriber", not(tokio_unstable)))]
+    eprintln!(
+        "`console-subscriber` requires manually enabling \
+         `--cfg tokio_unstable` rust flags during compilation!"
+    );
+
+    // Use `tracy` or `tracing-tracy` feature to enable `tracing-tracy`
+    #[cfg(feature = "tracing-tracy")]
+    let reg = reg.with(
+        tracing_tracy::TracyLayer::new(tracing_tracy::DefaultConfig::default()).with_filter(
+            tracing_subscriber::filter::filter_fn(|metadata| metadata.is_span()),
+        ),
+    );
+
+    tracing::subscriber::set_global_default(reg)?;
+    tracing_log::LogTracer::init()?;
+
+    Ok(logger_handle)
+}
+
+fn filter(user_filters: &str) -> filter::EnvFilter {
+    let mut filter = String::new();
+
+    let user_log_level = user_filters
+        .rsplit(',')
+        .find_map(|dir| log::LevelFilter::from_str(dir).ok());
+
+    if user_log_level.is_none() {
+        write!(&mut filter, "{DEFAULT_LOG_LEVEL}").unwrap(); // Writing into `String` never fails
+    }
+
+    for &(target, log_level) in DEFAULT_FILTERS {
+        if user_log_level.unwrap_or(DEFAULT_LOG_LEVEL) > log_level {
+            let comma = if filter.is_empty() { "" } else { "," };
+            write!(&mut filter, "{comma}{target}={log_level}").unwrap(); // Writing into `String` never fails
+        }
+    }
+
+    let comma = if filter.is_empty() { "" } else { "," };
+    write!(&mut filter, "{comma}{user_filters}").unwrap(); // Writing into `String` never fails
+
+    filter::EnvFilter::builder()
+        .with_regex(false)
+        .parse_lossy(filter)
+}
+
+/// Log timestamp formatter
+///
+/// Timestamps are in UTC by default. If the `TZ` environment variable is set, they follow that
+/// timezone instead.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TimeFormat {
+    Utc,
+    Local,
+}
+
+impl TimeFormat {
+    fn from_env() -> Self {
+        if env::var_os("TZ").is_some() {
+            Self::Local
+        } else {
+            Self::Utc
+        }
+    }
+}
+
+impl FormatTime for TimeFormat {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        let now = match self {
+            Self::Utc => chrono::Utc::now().fixed_offset(),
+            Self::Local => chrono::Local::now().fixed_offset(),
+        };
+
+        write_rfc3339(w, now)
+    }
+}
+
+/// Write an RFC 3339 timestamp with microsecond precision, without allocating
+///
+/// Matches the default `tracing_subscriber` timer, e.g. `2026-10-13T02:04:27.604091Z`
+/// With a non-UTC offset the offset is included, e.g. `2026-10-13T10:04:27.604091+08:00`
+fn write_rfc3339(w: &mut impl std::fmt::Write, time: DateTime<FixedOffset>) -> std::fmt::Result {
+    let local = time.naive_local();
+    write!(
+        w,
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}",
+        local.year(),
+        local.month(),
+        local.day(),
+        local.hour(),
+        local.minute(),
+        local.second(),
+        local.nanosecond() / 1_000,
+    )?;
+
+    let offset = time.offset().local_minus_utc();
+    if offset == 0 {
+        return w.write_char('Z');
+    }
+
+    let sign = if offset < 0 { '-' } else { '+' };
+    let offset_minutes = offset.unsigned_abs() / 60;
+    let (hours, minutes) = (offset_minutes / 60, offset_minutes % 60);
+    write!(w, "{sign}{hours:02}:{minutes:02}")
+}
+
+#[rustfmt::skip] // `rustfmt` formats this into unreadable single line
+type Logger<S> = filter::Filtered<
+    Option<Box<dyn tracing_subscriber::Layer<S> + Send + Sync>>,
+    filter::EnvFilter,
+    S,
+>;

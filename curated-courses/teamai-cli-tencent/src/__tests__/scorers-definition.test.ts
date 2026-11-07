@@ -1,0 +1,131 @@
+import { describe, expect, it } from 'vitest';
+import { formatScorerDiagnostic, isScorerFile, parseScorer } from '../scorers/definition.js';
+
+const VALID = `---
+labels:
+  - value: good
+    score: 1
+    description: The change does what the step asked.
+  - value: bad
+    score: 0
+    description: The change misses the request.
+passingScore: 1
+---
+Judge whether the change does what the step asked.
+`;
+
+function scorerWith(frontmatter: string, body = 'Judge the change.\n'): string {
+  return `---\n${frontmatter}---\n${body}`;
+}
+
+const LABELS = `labels:
+  - { value: good, score: 1, description: Good. }
+  - { value: bad, score: 0, description: Bad. }
+`;
+
+const COUNT = 'must list 2 to 20 labels: at least one that passes and one that fails';
+
+function problems(file: string, content: string): string[] {
+  const parsed = parseScorer(file, content);
+  return parsed.ok ? [] : parsed.diagnostics.map(formatScorerDiagnostic);
+}
+
+describe('parseScorer', () => {
+  it('reads labels, passing score and prompt, with a sampling rate of 25 by default', () => {
+    expect(parseScorer('scorers/review-quality.md', VALID)).toEqual({
+      ok: true,
+      definition: {
+        name: 'review-quality',
+        labels: [
+          { value: 'good', score: 1, description: 'The change does what the step asked.' },
+          { value: 'bad', score: 0, description: 'The change misses the request.' },
+        ],
+        passingScore: 1,
+        samplingRate: 25,
+        prompt: 'Judge whether the change does what the step asked.\n',
+      },
+    });
+  });
+
+  it('reads model, isolation and an explicit sampling rate', () => {
+    const parsed = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\nsamplingRate: 100\nmodel: fast\nisolation: verified\n`));
+    expect(parsed.ok && parsed.definition).toMatchObject({ samplingRate: 100, model: 'fast', isolation: 'verified' });
+  });
+
+  it('reads the judge tool a scorer prefers, any name of a tool\'s format, and rejects one that is not', () => {
+    const parsed = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\ntool: acme-judge.v2\n`));
+    expect(parsed.ok && parsed.definition.tool).toBe('acme-judge.v2');
+    expect(problems('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\ntool: claude code\n`))).toEqual([
+      'scorers/q.md: tool must be a tool name: letters, digits, ".", "_" and "-", starting with a letter or digit',
+    ]);
+  });
+
+  it('reads a check that decides before the judge, as a benchmark task writes one', () => {
+    const parsed = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: ['test/**', package.json] }\n`));
+    expect(parsed.ok && parsed.definition.check).toEqual({ run: 'npm test', protect: ['test/**', 'package.json'] });
+  });
+
+  it('reads the stages a scorer takes before its judge, and leaves them out when the scorer lists none', () => {
+    const parsed = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\nstages: [protected]\n`));
+    expect(parsed.ok && parsed.definition.stages).toEqual(['protected']);
+    const plain = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\n`));
+    expect(plain.ok && 'stages' in plain.definition).toBe(false);
+  });
+
+  it('reports an invalid label list once while preserving other diagnostics', () => {
+    expect(problems('scorers/q.md', scorerWith('labels: x\npassingScore: nope\n'))).toEqual([
+      `scorers/q.md: labels ${COUNT}`,
+      'scorers/q.md: passingScore must be a number',
+    ]);
+  });
+
+  it.each([
+    ['no frontmatter', 'Just a prompt.\n', 'scorers/q.md: a scorer starts with YAML frontmatter between --- lines'],
+    ['an empty prompt', scorerWith(`${LABELS}passingScore: 1\n`, '\n'), 'scorers/q.md: the prompt after the frontmatter is empty'],
+    ['no labels', scorerWith('passingScore: 1\n'), `scorers/q.md: labels ${COUNT}`],
+    ['one label', scorerWith('labels:\n  - { value: good, score: 1, description: Good. }\npassingScore: 1\n'), `scorers/q.md: labels ${COUNT}`],
+    ['21 labels', scorerWith(`labels:\n${Array.from({ length: 21 }, (_, i) => `  - { value: l${i}, score: ${i}, description: D. }\n`).join('')}passingScore: 1\n`),
+      `scorers/q.md: labels ${COUNT}`],
+    ['a label without a score', scorerWith('labels:\n  - { value: good, description: Good. }\n  - { value: bad, score: 0, description: Bad. }\npassingScore: 1\n'),
+      'scorers/q.md: labels[0].score must be a number'],
+    ['a repeated label', scorerWith('labels:\n  - { value: good, score: 1, description: G. }\n  - { value: good, score: 0, description: B. }\npassingScore: 1\n'),
+      'scorers/q.md: labels[1].value repeats "good"'],
+    ['no label below the passing score', scorerWith(`${LABELS}passingScore: 0\n`),
+      'scorers/q.md: passingScore must have at least one label at or above it and one below it'],
+    ['no passing score', scorerWith(LABELS), 'scorers/q.md: passingScore must be a number'],
+    ['a sampling rate over 100', scorerWith(`${LABELS}passingScore: 1\nsamplingRate: 101\n`), 'scorers/q.md: samplingRate must be a number from 0 to 100'],
+    ['a model with spaces', scorerWith(`${LABELS}passingScore: 1\nmodel: two words\n`), 'scorers/q.md: model must be a non-empty string without spaces'],
+    ['a model with a template', scorerWith(`${LABELS}passingScore: 1\nmodel: "{{inputs.judge}}"\n`), 'scorers/q.md: model cannot contain a template; write an alias or a model name as is'],
+    ['an unknown isolation', scorerWith(`${LABELS}passingScore: 1\nisolation: strict\n`), 'scorers/q.md: isolation must be verified or best-effort'],
+    ['a check without protected paths', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: [] }\n`),
+      'scorers/q.md: check.protect lists every path the check reads and the agent must not supply'],
+    ['a check that adds files', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: [test], add: [test/a.ts] }\n`),
+      'scorers/q.md: check uses `add`, which this teamai does not know. Update teamai.'],
+    ['a stage that is not one', scorerWith(`${LABELS}passingScore: 1\nstages: [lint]\n`),
+      'scorers/q.md: stages lists "lint"; a scorer takes some of check, ci and protected'],
+    ['a stage listed twice', scorerWith(`${LABELS}passingScore: 1\nstages: [ci, ci]\n`), 'scorers/q.md: stages lists "ci" twice'],
+    ['an unknown key', scorerWith(`${LABELS}passingScore: 1\nthreshold: 2\n`),
+      'scorers/q.md: uses `threshold`, which this teamai does not know. Update teamai.'],
+  ])('rejects %s', (_case, content, problem) => {
+    expect(problems('scorers/q.md', content)).toContain(problem);
+  });
+
+  it('rejects a file name that is not a token', () => {
+    expect(problems('scorers/.hidden.md', VALID)).toEqual(['scorers/.hidden.md: the file name must be a token such as review-quality.md']);
+  });
+
+  it('rejects a file named like a generated scorer, with a colon', () => {
+    expect(problems('scorers/teamai:correctness:fix.md', VALID)).toEqual(['scorers/teamai:correctness:fix.md: the file name must be a token such as review-quality.md']);
+  });
+
+  it('rejects a name ending in .md, which --scorer would take for a file', () => {
+    expect(problems('scorers/v1.md.md', VALID)).toEqual(['scorers/v1.md.md: a scorer\'s name cannot end in .md, since teamai score --scorer reads such a value as a scorer file']);
+  });
+});
+
+describe('isScorerFile', () => {
+  it('takes a value with a slash or ending in .md as a file, and any scorer name as a name', () => {
+    expect(['./scorers/x.md', 'scorers/x', 'x.md', '../x.md'].filter(isScorerFile)).toEqual(['./scorers/x.md', 'scorers/x', 'x.md', '../x.md']);
+    expect(['review-quality', 'v1.2', 'a_b'].filter(isScorerFile)).toEqual([]);
+  });
+});

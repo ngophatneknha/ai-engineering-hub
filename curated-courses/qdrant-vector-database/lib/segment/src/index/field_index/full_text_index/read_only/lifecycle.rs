@@ -1,0 +1,191 @@
+use std::path::{Path, PathBuf};
+
+use common::bitvec::BitSlice;
+use common::types::PointOffsetType;
+use common::universal_io::{CachedReadFs, Populate, UniversalRead, UniversalReadFs};
+
+use super::super::mutable_text_index::read_only::ReadOnlyAppendableFullTextIndex;
+use super::super::on_disk_text_index::OnDiskFullTextIndex;
+use super::ReadOnlyFullTextIndex;
+use crate::common::operation_error::OperationResult;
+use crate::data_types::index::TextIndexParams;
+use crate::index::field_index::full_text_index::immutable_text_index::ImmutableFullTextIndex;
+use crate::index::field_index::full_text_index::inverted_index::on_disk_inverted_index::has_doc_len_sidecar;
+use crate::index::payload_config::IndexMutability;
+use crate::types::Memory;
+
+impl<S: UniversalRead> ReadOnlyFullTextIndex<S> {
+    /// Schedule background prefetch for the appendable (Gridstore) format.
+    ///
+    /// Returns `false` when nothing was scheduled (directory absent).
+    pub fn preopen_appendable(
+        fs: &impl CachedReadFs<File = S>,
+        dir: PathBuf,
+    ) -> OperationResult<bool> {
+        ReadOnlyAppendableFullTextIndex::preopen(fs, dir)
+    }
+
+    /// Read-only mirror of [`FullTextIndex::new_gridstore`][1]: open the
+    /// appendable (Gridstore-backed) full-text index read-only, threading
+    /// every file open through the filesystem handle `fs`.
+    ///
+    /// Thin dispatcher over [`ReadOnlyAppendableFullTextIndex::open`] — wraps
+    /// the leaf in [`Self::Appendable`] so callers can hold the parent enum
+    /// uniformly. No `create_if_missing`: the read path never creates;
+    /// [`Ok(None)`] propagates from the leaf when the on-disk directory
+    /// doesn't exist.
+    ///
+    /// [1]: super::super::FullTextIndex::new_gridstore
+    pub fn open_appendable(
+        fs: &impl UniversalReadFs<File = S>,
+        dir: PathBuf,
+        max_point_offset: PointOffsetType,
+        deleted: &BitSlice,
+        config: TextIndexParams,
+    ) -> OperationResult<Option<Self>> {
+        let scoring = config.scoring();
+        Ok(ReadOnlyAppendableFullTextIndex::open(
+            fs,
+            dir,
+            max_point_offset,
+            deleted,
+            config,
+            scoring,
+        )?
+        .map(|index| Self::Appendable(Box::new(index))))
+    }
+
+    /// Schedule background prefetch for the immutable (mmap) format.
+    ///
+    /// Returns `false` when the on-disk index doesn't exist.
+    pub fn preopen_immutable(
+        fs: &impl CachedReadFs<File = S>,
+        path: &Path,
+        memory: Memory,
+    ) -> OperationResult<bool> {
+        let populate = match memory.clamp_to_low_memory().populate_on_open() {
+            true => Populate::PreferBackground,
+            false => Populate::No,
+        };
+
+        OnDiskFullTextIndex::preopen(fs, path, populate)
+    }
+
+    /// Read-only mirror of [`FullTextIndex::new_mmap`][1]: open the immutable
+    /// (mmap-format) full-text index read-only through [`MmapFullTextIndex::open`],
+    /// threading every file open through the filesystem handle `fs`.
+    ///
+    /// The writable enum splits the mmap path into two variants (`Immutable`
+    /// for in-RAM with mmap backing, `Mmap` for on-disk lazy); the read-only
+    /// side collapses to a single [`Self::Immutable`] arm because
+    /// the placement already covers the lazy/eager distinction
+    /// inside [`MmapFullTextIndex`]. `Ok(None)` propagates from the leaf when
+    /// the on-disk index doesn't exist.
+    ///
+    /// [1]: super::super::FullTextIndex::new_mmap
+    pub fn open_immutable(
+        fs: &impl UniversalReadFs<File = S>,
+        path: PathBuf,
+        config: TextIndexParams,
+        memory: Memory,
+        deleted_points: &BitSlice,
+    ) -> OperationResult<Option<Self>> {
+        // Low-memory mode degrades the placement, as the writable open does.
+        let memory = memory.clamp_to_low_memory();
+
+        let populate = Populate::from(memory.populate_on_open());
+        let scoring = config.scoring();
+
+        // Same probe as `new_mmap`, same answer: an index that records no
+        // lengths under scoring is not an index. This side cannot rebuild, so
+        // `None` drops the field until the writer has, which is already what
+        // happens for any other missing file. Opening it instead would answer
+        // `None` per point here and real lengths on the writer.
+        if scoring && !has_doc_len_sidecar(fs, &path)? {
+            log::info!(
+                "Text index at {path} records no document lengths, not opened read-only",
+                path = path.display(),
+            );
+            return Ok(None);
+        }
+
+        let opened = if memory.is_heap() {
+            ImmutableFullTextIndex::open(fs, path, config, populate, deleted_points)?
+                .map(|index| (index.can_score(), Self::Immutable(index)))
+        } else {
+            OnDiskFullTextIndex::open(fs, path, config, populate, deleted_points)?
+                .map(|index| (index.can_score(), Self::OnDisk(index)))
+        };
+        let Some((can_score, index)) = opened else {
+            return Ok(None);
+        };
+
+        // Reachable past the probe when the sidecar exists but `open` rejected
+        // it, or when scoring has no term frequencies, so the log says which
+        // of the two happened.
+        if scoring && !can_score {
+            log::info!(
+                "Text index rejected its document lengths or has no term frequencies, \
+                 not opened read-only"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(index))
+    }
+
+    /// Reports the on-disk format's mutability, mirroring
+    /// [`FullTextIndex::get_mutability_type`][1].
+    ///
+    /// The read-only enum has two variants where the writable side has three:
+    /// `Appendable` corresponds to the writable `Mutable` arm, `Immutable`
+    /// covers both writable `Immutable` (in-RAM with mmap backing) and
+    /// writable `Mmap` (on-disk lazy) — both already report
+    /// [`IndexMutability::Immutable`] on the writable side, so the read-only
+    /// label matches even after the collapse.
+    ///
+    /// [1]: super::super::FullTextIndex::get_mutability_type
+    pub fn get_mutability_type(&self) -> IndexMutability {
+        match self {
+            Self::Appendable(_) => IndexMutability::Mutable,
+            Self::OnDisk(_) => IndexMutability::Immutable,
+            Self::Immutable(_) => IndexMutability::Immutable,
+        }
+    }
+
+    pub fn files(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Appendable(index) => index.files(),
+            Self::Immutable(index) => index.files(),
+            Self::OnDisk(index) => index.files(),
+        }
+    }
+
+    pub fn immutable_files(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Appendable(_) => Vec::new(),
+            Self::Immutable(index) => index.immutable_files(),
+            Self::OnDisk(index) => index.immutable_files(),
+        }
+    }
+
+    /// Populate all pages in the mmap. Block until all pages are populated.
+    pub fn populate(&self) -> OperationResult<()> {
+        match self {
+            // Appendable / Immutable keep their inverted index fully in RAM —
+            // there is nothing to populate.
+            Self::Appendable(_) | Self::Immutable(_) => Ok(()),
+            Self::OnDisk(index) => index.populate(),
+        }
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        match self {
+            Self::Appendable(index) => index.clear_cache(),
+            // Nothing to drop: no file is open, and the load cleared their cache.
+            Self::Immutable(_) => Ok(()),
+            Self::OnDisk(index) => index.clear_cache(),
+        }
+    }
+}

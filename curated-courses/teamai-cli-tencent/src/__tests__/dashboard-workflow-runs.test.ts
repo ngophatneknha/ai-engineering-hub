@@ -1,0 +1,427 @@
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
+import { answerFromDashboard, listLocalRuns, listReportedRuns, workflowRunDetail } from '../dashboard/workflow-runs.js';
+import { HttpError } from '../dashboard/http.js';
+import { getReportsDir, type LocalConfig } from '../types.js';
+import { leaseNext, startRun } from '../workflow/engine.js';
+import { readRun, runsDir } from '../workflow/store.js';
+import type { RunState } from '../workflow/types.js';
+import { knownSecrets } from '../env-resolution.js';
+import type { BenchmarkRunRecord } from '../benchmark/result.js';
+import { fixRecord } from './helpers/benchmark-fixture.js';
+
+const roots: string[] = [];
+const driver = { kind: 'ide', machine: 'host-7f3a', workspace: '/private/work/checkout' };
+const PACKAGE_VERSION: string = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '..', '..', 'package.json'), 'utf8')).version;
+afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+
+function scope(kind: 'self' | 'http'): LocalConfig {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dashboard-runs-'));
+  roots.push(root);
+  return { repo: { localPath: path.join(root, 'repo'), remote: 'local', kind }, username: 'tester', scope: 'project', additionalRoles: [], projectRoot: root, dataHome: path.join(root, 'data') };
+}
+
+/** A run whose `ship` step waits on a HITL request that renders an input into its message. */
+async function waitingRun(hitl = 'approve: { message: "Ship {{ inputs.ticket }}?", required: true }') {
+  const config = scope('self');
+  fs.mkdirSync(path.join(config.repo.localPath, 'workflows'), { recursive: true });
+  fs.writeFileSync(path.join(config.repo.localPath, 'workflows/ship.yaml'), [
+    'schemaVersion: v1alpha1', 'name: ship', 'description: Ship a ticket.', 'inputs: { ticket: string }', 'steps:',
+    '  - id: build', '    command: echo build-secret-command',
+    '  - id: ship', '    needs: [build]', `    ${hitl}`, '    prompt: Deliver {{ inputs.ticket }} as prompt-secret-text',
+  ].join('\n'));
+  expect((await syncScorersThenWorkflows(config)).invalid).toEqual([]);
+  const started = await startRun(config, 'ship', { ticket: 'TICKET-SECRET-42' }, { secrets: await knownSecrets(config) });
+  if ('error' in started) throw new Error(started.error.message);
+  const id = String(started.data.run);
+  const next = () => leaseNext(config, id, driver, { can: { hitl: true } });
+  const lease = await next();
+  if ('error' in lease) throw new Error(lease.error.message);
+  const { attempt, revision } = lease.data.lease as { attempt: string; revision: number };
+  const { reportAttempt } = await import('../workflow/engine.js');
+  await reportAttempt(config, id, { attempt, revision, driver, outcome: 'success', message: 'build-output-secret', tokens: { input: 120, output: 30 } });
+  const asked = await next();
+  expect(asked).toMatchObject({ data: { hitl: { step: 'ship', pass: 1 } } });
+  return { config, id, state: async () => await readRun(config, id) as RunState };
+}
+
+/** Writes `record` where `teamai benchmark report` writes a run's benchmark record on this machine. */
+function reportLocally(config: LocalConfig, record: BenchmarkRunRecord): void {
+  const file = path.join(runsDir(config), record.run, 'benchmark.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(record));
+}
+
+const RESULTS_HEADER = ['Arm', 'Tool', 'Model (source)', 'Planned', 'Passed', 'Failed', 'Error', 'Unscored', 'Not run', 'Stopped by a limit', 'Deviations', 'Not verified', 'Pass rate'];
+const USAGE_HEADER = ['Arm', 'Median tokens (input + output)', 'Median duration', 'Cost'];
+const CAPTION = 'These results hold for these tasks, this run and this machine.';
+
+async function refusal(promise: Promise<unknown>): Promise<{ status: number; message: string }> {
+  const error = await promise.then(() => null, (e: unknown) => e);
+  expect(error).toBeInstanceOf(HttpError);
+  const { status, message } = error as HttpError;
+  return { status, message };
+}
+
+describe('dashboard workflow runs', () => {
+  it('lists a local run with its waiting HITL request and none of its inputs, outputs, prompts, message, or paths', async () => {
+    const run = await waitingRun();
+    const [row] = await listLocalRuns(run.config);
+    expect(row).toMatchObject({ source: 'local', run: run.id, workflow: 'ship', driver: 'ide', status: 'running', current: [], waiting: ['ship'], tokens: 150, prs: [] });
+    expect(row).not.toHaveProperty('endedAt');
+    expect(row).not.toHaveProperty('teamRevision');
+    expect(row?.sourceHash).toEqual(expect.any(String));
+    const detail = await workflowRunDetail(run.config, 'local', run.id);
+    expect(detail?.steps).toEqual([
+      { step: 'build', pass: 1, status: 'succeeded', tokens: { input: 120, output: 30 } },
+      { step: 'ship', pass: 1, status: 'waiting', gate: { kind: 'approve', options: ['yes', 'no'], required: true } },
+    ]);
+    const served = JSON.stringify([row, detail]);
+    for (const secret of ['TICKET-SECRET-42', 'build-secret-command', 'prompt-secret-text', 'build-output-secret', 'Ship ', 'host-7f3a', '/private/work', run.config.dataHome ?? 'data']) {
+      expect(served).not.toContain(secret);
+    }
+  });
+
+  it('says which branches a failed run keeps, and from when doctor --fix may remove them but its pull request branch', async () => {
+    const run = await waitingRun();
+    const file = path.join(runsDir(run.config), `${run.id}.json`);
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as RunState;
+    const branch = (name: string) => `teamai/${run.id}/${name}/p1`;
+    fs.writeFileSync(file, JSON.stringify({
+      ...stored, status: 'failed', updatedAt: '2026-10-20T08:00:00.000Z',
+      copies: { [branch('change')]: { commit: 'a'.repeat(40) }, [branch('docs')]: { commit: 'b'.repeat(40) } },
+      deliveries: [{ url: 'https://github.com/acme/app/pull/7', branch: branch('change'), base: 'main', step: 'change', pass: 1 }],
+    }));
+
+    expect((await workflowRunDetail(run.config, 'local', run.id))?.branches).toEqual({
+      state: 'kept', retention: { kind: 'after', ms: 14 * 86_400_000, text: '14d' }, eligibleAt: '2026-11-03T08:00:00.000Z',
+      branches: [{ branch: branch('change'), isPullRequest: true }, { branch: branch('docs'), isPullRequest: false }],
+    });
+  });
+
+  it('shows what a succeeded run kept of its branches, and deleted, as it settled', async () => {
+    const run = await waitingRun();
+    const file = path.join(runsDir(run.config), `${run.id}.json`);
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as RunState;
+    const leftovers = {
+      by: 'success', at: '2026-10-20T08:00:01.000Z', revision: stored.revision, kept: [{ branch: `teamai/${run.id}/change/p1`, why: 'pr' }],
+      deleted: [`teamai/${run.id}/build-0/p1`], failed: [{ branch: `teamai/${run.id}/build-1/p1`, reason: 'on origin: deleting is not allowed' }],
+    };
+    fs.writeFileSync(file, JSON.stringify({ ...stored, status: 'succeeded', leftovers }));
+
+    const { by, at, kept, deleted, failed } = leftovers;
+    expect((await workflowRunDetail(run.config, 'local', run.id))?.branches).toEqual({ state: 'cleaned', by, at, kept, deleted, failed });
+  });
+
+  it('says nothing of the branches of a run still running', async () => {
+    const run = await waitingRun();
+    expect(await workflowRunDetail(run.config, 'local', run.id)).not.toHaveProperty('branches');
+  });
+
+  it('answers a required HITL request through the non-agent dashboard channel', async () => {
+    const run = await waitingRun();
+    expect(await answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 1, choice: 'yes' }))
+      .toEqual({ answered: { step: 'ship', pass: 1, choice: 'yes', channel: 'dashboard', agent: false } });
+    expect((await run.state()).steps.find((step) => step.id === 'ship')?.answer).toMatchObject({ choice: 'yes', channel: 'dashboard', agent: false });
+    const [row] = await listLocalRuns(run.config);
+    expect(row?.waiting).toEqual([]);
+    expect((await workflowRunDetail(run.config, 'local', run.id))?.steps.find((step) => step.step === 'ship'))
+      .toEqual({ step: 'ship', pass: 1, status: 'pending', answer: { choice: 'yes', channel: 'dashboard' } });
+  });
+
+  it('refuses a required answer from a dashboard served inside an agent session, naming what the person runs', async () => {
+    const run = await waitingRun();
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'agent-1304');
+    try {
+      expect(await refusal(answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 1, choice: 'yes' }))).toEqual({
+        status: 400,
+        message: `Step "ship" needs an answer from the person, and the process that sent this one runs inside an agent session (CLAUDE_CODE_SESSION_ID is set). The person runs teamai workflow respond ${run.id} ship <yes|no> --pass 1 in their own terminal, or answers in a teamai dashboard started there.`,
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect((await run.state()).steps.find((step) => step.id === 'ship')).toMatchObject({ status: 'waiting' });
+  });
+
+  it('leaves out a run of a private workflow, and still lists the other local runs', async () => {
+    const config = scope('self');
+    fs.mkdirSync(path.join(config.repo.localPath, 'workflows'), { recursive: true });
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows/judge.yaml'), [
+      'schemaVersion: v1alpha1', 'name: judge', 'description: Judge on this machine only.', 'private: true', 'steps:', '  - id: label', '    command: echo label',
+    ].join('\n'));
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows/build.yaml'), [
+      'schemaVersion: v1alpha1', 'name: build', 'description: Build.', 'steps:', '  - id: compile', '    command: echo compile',
+    ].join('\n'));
+    expect((await syncScorersThenWorkflows(config)).invalid).toEqual([]);
+    for (const name of ['judge', 'build']) {
+      const started = await startRun(config, name, {}, { secrets: {} });
+      if ('error' in started) throw new Error(started.error.message);
+    }
+    expect((await listLocalRuns(config)).map((row) => row.workflow)).toEqual(['build']);
+  });
+
+  it('says whether a run ran the team\'s definition or teamai\'s default, and which teamai shipped the default', async () => {
+    const team = await waitingRun();
+    expect((await listLocalRuns(team.config))[0]?.origin).toEqual({ source: 'team' });
+
+    const config = scope('self');
+    fs.mkdirSync(config.repo.localPath, { recursive: true });
+    const started = await startRun(config, 'teamai-share-session', { session: '7c1e-session', source: 'claude-code', publish: false, scorers: [], demand: 'named' }, { secrets: {} });
+    if ('error' in started) throw new Error(started.error.message);
+    const [row] = await listLocalRuns(config);
+    expect(row).toMatchObject({ workflow: 'teamai-share-session', origin: { source: 'default', teamaiVersion: PACKAGE_VERSION } });
+    expect(row).not.toHaveProperty('teamRevision');
+  });
+
+  it('names a run by its workflow\'s alias, and publishes the alias with the run record', async () => {
+    const config = scope('self');
+    fs.mkdirSync(path.join(config.repo.localPath, 'workflows'), { recursive: true });
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows/review-and-fix.yaml'), [
+      'schemaVersion: v1alpha1', 'name: review-and-fix', 'alias: fix', 'description: Review the change, then fix it.', 'steps:', '  - id: review', '    command: echo review',
+    ].join('\n'));
+    expect((await syncScorersThenWorkflows(config)).invalid).toEqual([]);
+    const started = await startRun(config, 'fix', {}, { secrets: {} });
+    if ('error' in started) throw new Error(started.error.message);
+
+    const [row] = await listLocalRuns(config);
+    expect(row).toMatchObject({ workflow: 'review-and-fix', alias: 'fix' });
+    const run = await readRun(config, String(started.data.run));
+    if (typeof run !== 'object') throw new Error('the run was not stored');
+    const { buildStartRecord } = await import('../workflow/records.js');
+    expect(buildStartRecord(run, undefined, 'tester')).toMatchObject({ workflow: 'review-and-fix', alias: 'fix' });
+  });
+
+  it('names a run by its workflow\'s name while its alias starts another workflow', async () => {
+    const config = scope('self');
+    fs.mkdirSync(path.join(config.repo.localPath, 'workflows'), { recursive: true });
+    const write = (name: string, alias?: string) => fs.writeFileSync(path.join(config.repo.localPath, `workflows/${name}.yaml`), [
+      'schemaVersion: v1alpha1', `name: ${name}`, ...(alias ? [`alias: ${alias}`] : []), 'description: Review the change.', 'steps:', '  - id: review', '    command: echo review',
+    ].join('\n'));
+    write('review-and-fix', 'fix');
+    write('fix');
+    await syncScorersThenWorkflows(config);
+    const started = await startRun(config, 'review-and-fix', {}, { secrets: {} });
+    if ('error' in started) throw new Error(started.error.message);
+
+    const [row] = await listLocalRuns(config);
+    expect(row).toMatchObject({ workflow: 'review-and-fix' });
+    expect(row).not.toHaveProperty('alias');
+  });
+
+  it('refuses an answer to a pass the page no longer shows, and a repeated one', async () => {
+    const run = await waitingRun('approve: Ship it?');
+    expect(await refusal(answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 2, choice: 'yes' })))
+      .toEqual({ status: 409, message: expect.stringContaining('pass 2 was answered or replaced') });
+    await answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 1, choice: 'no' });
+    expect(await refusal(answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 1, choice: 'yes' })))
+      .toMatchObject({ status: 409 });
+  });
+
+  it('refuses an answer without the pass it answers, or with a choice the request does not offer', async () => {
+    const run = await waitingRun('approve: Ship it?');
+    expect(await refusal(answerFromDashboard(run.config, { run: run.id, step: 'ship', choice: 'yes' }))).toMatchObject({ status: 400 });
+    expect(await refusal(answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 1, choice: 'maybe' })))
+      .toEqual({ status: 400, message: expect.stringContaining('yes, no') });
+  });
+
+  it("shows a run's benchmark results, usage and task by arm matrix once its report wrote the record, and no table before", async () => {
+    const run = await waitingRun();
+    expect(await workflowRunDetail(run.config, 'local', run.id)).not.toHaveProperty('benchmark');
+
+    reportLocally(run.config, fixRecord(run.id, { startedAt: new Date().toISOString(), result: 'not_run' }));
+
+    expect((await workflowRunDetail(run.config, 'local', run.id))?.benchmark).toEqual({
+      results: { header: RESULTS_HEADER, rows: [['claude', 'claude', 'tool default (team)', '1', '0', '0', '0', '0', '1', '0', '0', '0', '0% (0/1)']] },
+      usage: { header: USAGE_HEADER, rows: [['claude', 'unknown (0)', 'unknown (0)', 'unknown (0)']] },
+      matrix: { header: ['Task', 'claude'], rows: [['fix', '0% (0/1)']] },
+      caption: CAPTION,
+    });
+  });
+
+  describe('team-reported history', () => {
+    function publish(config: LocalConfig, record: Record<string, unknown>): void {
+      const dir = path.join(getReportsDir(config), 'workflows/runs');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${String(record.run)}.json`), JSON.stringify(record));
+    }
+    function publishBenchmark(config: LocalConfig, record: Record<string, unknown>): void {
+      const dir = path.join(getReportsDir(config), 'benchmarks/runs');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${String(record.run)}.json`), JSON.stringify(record));
+    }
+    const record = (run: string, extra: Record<string, unknown> = {}) => ({
+      schemaVersion: 'v1alpha1', run, workflow: 'ship', sourceHash: 'a'.repeat(64), phase: 'end', driver: { kind: 'local' }, status: 'succeeded',
+      startedAt: '2026-10-01T10:00:00.000Z', endedAt: '2026-10-01T10:05:00.000Z', durationMs: 300000, username: 'alice', publishedAt: '2026-10-01T10:05:01.000Z',
+      steps: [{ step: 'build', pass: 1, outcome: 'success', tokens: { input: 10, output: 5 } }, { step: 'skip-me', pass: 1 }],
+      stepCounts: { total: 2, succeeded: 1, failed: 0, skipped: 1, cancelled: 0 }, ...extra,
+    });
+
+    it('reads a record without a team revision and keeps its source hash', async () => {
+      const config = scope('http');
+      publish(config, record('r0000000000000001'));
+      const [row] = await listReportedRuns(config);
+      expect(row).toMatchObject({ source: 'reported', run: 'r0000000000000001', username: 'alice', sourceHash: 'a'.repeat(64), tokens: 15, prs: [], durationMs: 300000 });
+      expect(row).not.toHaveProperty('teamRevision');
+      expect((await workflowRunDetail(config, 'reported', 'r0000000000000001'))?.steps.map((step) => [step.step, step.status]))
+        .toEqual([['build', 'succeeded'], ['skip-me', 'skipped']]);
+    });
+
+    it('reads where a record\'s definition came from, and drops an origin it cannot read', async () => {
+      const config = scope('http');
+      publish(config, record('r0000000000000002', { workflow: 'teamai-share-session', origin: { source: 'default', teamaiVersion: '0.22.0' }, startedAt: '2026-10-02T10:00:00.000Z' }));
+      publish(config, record('r0000000000000001', { origin: { source: 'elsewhere' } }));
+      const rows = await listReportedRuns(config);
+      expect(rows[0]).toMatchObject({ workflow: 'teamai-share-session', origin: { source: 'default', teamaiVersion: '0.22.0' } });
+      expect(rows[1]).toMatchObject({ run: 'r0000000000000001' });
+      expect(rows[1]).not.toHaveProperty('origin');
+    });
+
+    it('lists the learnings a run shared, from every pass that recorded one, once each', async () => {
+      const config = scope('http');
+      const learning = (id: string) => ({ kind: 'learning', id });
+      publish(config, record('r0000000000000001', { workflow: 'teamai-share-learnings', steps: [
+        { step: 'learning', pass: 1, outcome: 'success' },
+        { step: 'contribute[0]', pass: 1, outcome: 'success', outcomes: [learning('delay-the-readiness-probe-2026-10-29-k3x9qa')] },
+        { step: 'contribute[1]', pass: 1, outcome: 'success', outcomes: [learning('rollout-status-hides-init-2026-10-29-p0z7mf'), { kind: 'commit', sha: 'c'.repeat(40) }] },
+        { step: 'contribute[1]', pass: 2, outcome: 'success', outcomes: [learning('rollout-status-hides-init-2026-10-29-p0z7mf')] },
+      ] }));
+
+      expect((await listReportedRuns(config))[0]?.learnings).toEqual([
+        'delay-the-readiness-probe-2026-10-29-k3x9qa', 'rollout-status-hides-init-2026-10-29-p0z7mf',
+      ]);
+    });
+
+    it('reads the alias a record names its workflow by', async () => {
+      const config = scope('http');
+      publish(config, record('r0000000000000001', { workflow: 'review-and-fix', alias: 'fix' }));
+      expect((await listReportedRuns(config))[0]).toMatchObject({ workflow: 'review-and-fix', alias: 'fix' });
+    });
+
+    it('lists every delivered pull request of a record, newest run first, and only web links', async () => {
+      const config = scope('http');
+      const prs = ['https://github.com/team/app/pull/1', 'https://github.com/team/app/pull/2', 'https://github.com/team/lib/pull/3'];
+      publish(config, record('r0000000000000002', { prs: [...prs, 'javascript:alert(1)'], teamRevision: 'b'.repeat(40), startedAt: '2026-10-02T10:00:00.000Z' }));
+      publish(config, record('r0000000000000001'));
+      const rows = await listReportedRuns(config);
+      expect(rows.map((row) => row.run)).toEqual(['r0000000000000002', 'r0000000000000001']);
+      expect(rows[0]).toMatchObject({ prs, teamRevision: 'b'.repeat(40) });
+    });
+
+    it('shows what each pass delivered, keeping only outcomes it can read and pull requests on https (#1387)', async () => {
+      const config = scope('http');
+      const pr = 'https://github.com/team/app/pull/43';
+      publish(config, record('r0000000000000001', { steps: [
+        { step: 'fix', pass: 1, outcome: 'success', outcomes: [{ kind: 'commit', sha: 'c'.repeat(40) }, { kind: 'pr', url: pr }, { kind: 'pr', url: 'javascript:alert(1)' }] },
+        { step: 'close', pass: 1, outcome: 'success', outcomes: [{ kind: 'learning', id: 'retry-backoff-2026-10-24-p0x1za' }, { kind: 'issue', id: '7' }] },
+        { step: 'skip-me', pass: 1 },
+      ] }));
+      expect((await workflowRunDetail(config, 'reported', 'r0000000000000001'))?.steps.map((step) => [step.step, step.outcomes])).toEqual([
+        ['fix', [{ kind: 'commit', sha: 'c'.repeat(40) }, { kind: 'pr', url: pr }]],
+        ['close', [{ kind: 'learning', id: 'retry-backoff-2026-10-24-p0x1za' }]],
+        ['skip-me', undefined],
+      ]);
+    });
+
+    it("shows the harness each prompt pass ran with: its tool, model, effort, and the step's role or else the member's, with the team revision", async () => {
+      const config = scope('http');
+      const agent = (selection: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+        v: 1, tool: { name: 'claude', version: '2.1.301' }, teamai: '0.40.0', driver: 'local',
+        team: { revision: 'c'.repeat(40), localChanges: false, selection: { scope: 'project', primaryRole: 'frontend', additionalRoles: ['ops'], ...selection } }, ...extra,
+      });
+      publish(config, record('r0000000000000001', { steps: [
+        { step: 'plan', pass: 1, outcome: 'success', agent: agent({}, { model: { requested: 'claude-plan-1', reported: 'claude-plan-1-20261001' } }) },
+        { step: 'review', pass: 1, outcome: 'success', agent: agent({ stepRole: 'review' }, { model: { requested: 'claude-review-1' }, effort: { requested: 'high' } }) },
+        { step: 'build', pass: 1, outcome: 'success' },
+      ] }));
+
+      expect((await workflowRunDetail(config, 'reported', 'r0000000000000001'))?.steps.map((step) => [step.step, step.harness])).toEqual([
+        ['plan', { tool: 'claude', model: 'claude-plan-1-20261001', role: { of: 'member', names: ['frontend', 'ops'] }, teamRevision: 'c'.repeat(40) }],
+        ['review', { tool: 'claude', model: 'claude-review-1', effort: 'high', role: { of: 'step', names: ['review'] }, teamRevision: 'c'.repeat(40) }],
+        ['build', undefined],
+      ]);
+    });
+
+    it('says what changed in the harness of a pass since the previous pass of the same step', async () => {
+      const config = scope('http');
+      const agent = (model: string, extra: Record<string, unknown> = {}) => ({
+        v: 1, tool: { name: 'claude' }, teamai: '0.40.0', driver: 'local', model: { reported: model },
+        team: { revision: 'c'.repeat(40), localChanges: false, selection: { scope: 'project', primaryRole: 'frontend', additionalRoles: [], stepRole: 'review' } }, ...extra,
+      });
+      publish(config, record('r0000000000000001', { steps: [
+        { step: 'review', pass: 1, outcome: 'failed', agent: agent('claude-sonnet-5-5') },
+        { step: 'plan', pass: 1, outcome: 'success', agent: agent('claude-opus-5-5') },
+        { step: 'review', pass: 2, outcome: 'failed', agent: agent('claude-opus-5-5') },
+        { step: 'review', pass: 3, outcome: 'failed', agent: agent('claude-opus-5-5') },
+        { step: 'review', pass: 4, outcome: 'success', agent: agent('claude-opus-5-5', {
+          effort: { requested: 'high' },
+          team: { revision: 'd'.repeat(40), localChanges: false, selection: { scope: 'project', primaryRole: 'frontend', additionalRoles: [] } },
+        }) },
+      ] }));
+
+      expect((await workflowRunDetail(config, 'reported', 'r0000000000000001'))?.steps.map((step) => [`${step.step} #${step.pass}`, step.harnessChanges])).toEqual([
+        ['review #1', undefined],
+        ['plan #1', undefined],
+        ['review #2', [{ part: 'model', from: 'claude-sonnet-5-5', to: 'claude-opus-5-5' }]],
+        ['review #3', undefined],
+        ['review #4', [
+          { part: 'effort', to: 'high' },
+          { part: 'role', from: { of: 'step', names: ['review'] }, to: { of: 'member', names: ['frontend'] } },
+          { part: 'teamRevision', from: 'c'.repeat(40), to: 'd'.repeat(40) },
+        ]],
+      ]);
+    });
+
+    it('carries no field a record holds outside what the page reads, and skips a record it cannot read', async () => {
+      const config = scope('http');
+      publish(config, record('r0000000000000001', { inputs: { ticket: 'TICKET-SECRET-42' }, workspace: '/private/work' }));
+      publish(config, { run: 'r0000000000000003', workflow: 'broken' });
+      const rows = await listReportedRuns(config);
+      expect(rows.map((row) => row.run)).toEqual(['r0000000000000001']);
+      expect(JSON.stringify(rows)).not.toMatch(/TICKET-SECRET-42|private\/work|publishedAt/);
+    });
+
+    it("shows a published run's benchmark tables from its benchmark record, and lists one whose benchmark record it cannot read without them", async () => {
+      const config = scope('http');
+      const published = fixRecord('r0000000000000003', { startedAt: '2026-10-01T10:00:00.000Z' });
+      const [trial] = published.trials;
+      if (!trial) throw new Error('the record has no trial');
+      publish(config, record('r0000000000000003', { isolated: true }));
+      publishBenchmark(config, { ...published, trials: [{ ...trial, agent: { v: 1, tool: { name: 'codex' }, teamai: '0.0.0', driver: 'local' } }] });
+      publish(config, record('r0000000000000004', { isolated: true }));
+      publishBenchmark(config, { run: 'r0000000000000004', arms: 'broken' });
+
+      const rows = await listReportedRuns(config);
+
+      expect(rows.map((row) => row.run).sort()).toEqual(['r0000000000000003', 'r0000000000000004']);
+      expect((await workflowRunDetail(config, 'reported', 'r0000000000000003'))?.benchmark).toEqual({
+        results: { header: RESULTS_HEADER, rows: [['claude', 'claude', 'tool default (team)', '1', '1', '0', '0', '0', '0', '0', '1', '0', '100% (1/1)']] },
+        usage: { header: USAGE_HEADER, rows: [['claude', 'unknown (0)', 'unknown (0)', 'unknown (0)']] },
+        matrix: { header: ['Task', 'claude'], rows: [['fix', '100% (1/1)']] },
+        caption: CAPTION,
+      });
+      expect(await workflowRunDetail(config, 'reported', 'r0000000000000004')).not.toHaveProperty('benchmark');
+    });
+
+    it('reads no run from another repository\'s reports checkout left at this scope\'s path', async () => {
+      const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dashboard-foreign-')));
+      roots.push(root);
+      const git = (cwd: string, args: string[]) => execFileSync('git', args, { cwd, stdio: 'ignore', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t.co', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t.co' } });
+      const business = path.join(root, 'business');
+      const previous = path.join(root, 'previous-team');
+      for (const dir of [business, previous]) {
+        fs.mkdirSync(dir);
+        git(dir, ['init', '-q']);
+        git(dir, ['commit', '-q', '--allow-empty', '-m', 'init']);
+      }
+      const config: LocalConfig = { repo: { kind: 'self', localPath: path.join(business, '.teamai'), businessRepoRoot: business, remote: 'local' }, username: 'tester', scope: 'project', additionalRoles: [], projectRoot: business, dataHome: path.join(root, 'data') };
+      git(previous, ['worktree', 'add', '-q', '-b', 'teamai-reports', getReportsDir(config)]);
+      publish(config, record('r0000000000000001'));
+      await expect(listReportedRuns(config)).rejects.toMatchObject({ name: 'ForeignCheckoutError' });
+      await expect(workflowRunDetail(config, 'reported', 'r0000000000000001')).rejects.toMatchObject({ name: 'ForeignCheckoutError' });
+    });
+  });
+});

@@ -1,0 +1,711 @@
+import path from 'node:path';
+import fs from 'node:fs';
+import { log } from './utils/logger.js';
+import { readFileSafe, listFiles } from './utils/fs.js';
+import { parseLearningDoc, titleFromFilename } from './utils/search-index.js';
+import { requireInit, detectProjectConfig } from './config.js';
+import { calculateTeamHealth } from './skill-health.js';
+import { createGit } from './utils/git.js';
+import type { RunModeSplit, UserStats, UserModeStats, UserOutcomeStats, TokenUsage } from './types.js';
+import { OUTCOME_MODES, OUTCOME_ROWS, addOutcomeStats } from './outcomes.js';
+import { parseUserStats, totalTokens } from './types.js';
+import { mergeDailyStats, summarizeTrendWindow, type TrendPeriod } from './session-trends.js';
+
+interface SkillChange {
+  name: string;
+  author: string;
+  type: 'new' | 'updated';
+}
+
+interface LearningInfo {
+  title: string;
+  date: string;
+}
+
+// ─── Weekly Team Digest ────────────────────────────────
+//
+//  teamai digest
+//      │
+//      ▼
+//  [read team stats from stats/*.yaml]
+//      │
+//      ▼
+//  [read learnings from learnings/*.md]
+//      │
+//      ▼
+//  [read sessions from sessions/*/*.md]
+//      │
+//      ▼
+//  [generate formatted weekly summary]
+//
+
+/**
+ * Load all team stats from the repo's stats/ directory.
+ */
+async function loadTeamStats(repoPath: string): Promise<UserStats[]> {
+  const statsDir = path.join(repoPath, 'stats');
+  const stats: UserStats[] = [];
+
+  try {
+    const files = await listFiles(statsDir);
+
+    for (const file of files) {
+      if (!file.endsWith('.yaml') && !file.endsWith('.yml')) continue;
+      const content = await readFileSafe(path.join(statsDir, file));
+
+      if (!content) continue;
+
+      try {
+        const parsed = parseUserStats(content);
+
+        if (parsed) {
+          stats.push(parsed);
+        }
+      } catch {
+        log.debug(`Skipping invalid stats file: ${file}`);
+      }
+    }
+  } catch {
+    // stats/ dir doesn't exist yet
+  }
+
+  return stats;
+}
+
+/**
+ * Parse raw git log output (format: hash|author|message, followed by file paths).
+ */
+function parseGitLogOutput(output: string): Array<{ author: string; message: string; files: string[] }> {
+  const commits: Array<{ author: string; message: string; files: string[] }> = [];
+  const lines = output.trim().split('\n');
+  let current: { author: string; message: string; files: string[] } | null = null;
+
+  for (const line of lines) {
+    if (line.includes('|')) {
+      const parts = line.split('|');
+
+      if (parts.length >= 3) {
+        if (current) commits.push(current);
+        current = { author: parts[1], message: parts.slice(2).join('|'), files: [] };
+        continue;
+      }
+    }
+
+    if (current && line.trim().length > 0) {
+      current.files.push(line.trim());
+    }
+  }
+
+  if (current) commits.push(current);
+
+  return commits;
+}
+
+/**
+ * Build the git pathspec + match regex for a team repo's skills SKILL.md files,
+ * accounting for a repo-root-relative `subdir` prefix. Exported for testing —
+ * this is the exact spot that broke in single-repo mode (git emitted
+ * ".teamai/skills/..." paths that never matched a bare "skills/..." regex).
+ */
+export function buildSkillChangePathspec(subdir = '') {
+  const prefix = subdir ? `${subdir.replace(/\/+$/, '')}/` : '';
+  const pathspec = `${prefix}skills/*/SKILL.md`;
+  const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const skillRe = new RegExp(`^${escaped}skills/([^/]+)/SKILL\\.md$`);
+
+  return { pathspec, skillRe };
+}
+
+/**
+ * Detect new and updated skills in the team repo from the past 7 days
+ * by inspecting git log for changes under skills/SKILL.md paths.
+ *
+ * `subdir` is the repo-root-relative directory holding the team repo's `skills/`.
+ * It's '' for standalone team repos (git log runs at the repo root, paths are
+ * `skills/foo/SKILL.md`), but '.teamai' in single-repo mode — there the git log
+ * must run at the BUSINESS repo root with a `.teamai/skills/...` pathspec, and
+ * git emits repo-root-relative paths like `.teamai/skills/foo/SKILL.md`. We build
+ * the pathspec and the match regex from `subdir` so both layouts work.
+ */
+async function getRecentSkillChanges(repoPath: string, subdir = ''): Promise<SkillChange[]> {
+  const seen = new Set<string>();
+  const changes: SkillChange[] = [];
+
+  const { pathspec, skillRe } = buildSkillChangePathspec(subdir);
+
+  try {
+    const git = createGit(repoPath);
+
+    // Get all commits touching skills SKILL.md in the last 7 days (Added or Modified)
+    const rawOutput = await git.raw([
+      'log', '--since=7 days ago', '--diff-filter=AM',
+      '--name-only', '--pretty=format:%H|%an|%s',
+      '--', pathspec,
+    ]);
+
+    if (!rawOutput.trim()) return changes;
+
+    const commits = parseGitLogOutput(rawOutput);
+
+    for (const commit of commits) {
+      for (const file of commit.files) {
+        const match = file.match(skillRe);
+
+        if (!match) continue;
+        const skillName = match[1];
+
+        if (seen.has(skillName)) continue;
+        seen.add(skillName);
+
+        // Extract author from commit message pattern: "from <username>"
+        const authorMatch = commit.message.match(/from (\S+)/);
+        const author = authorMatch ? authorMatch[1] : commit.author;
+
+        changes.push({ name: skillName, author, type: 'updated' });
+      }
+    }
+
+    // Distinguish new vs updated: check if SKILL.md was first Added within the week
+    if (changes.length > 0) {
+      const addedOutput = await git.raw([
+        'log', '--since=7 days ago', '--diff-filter=A',
+        '--name-only', '--pretty=format:%H|%an|%s',
+        '--', pathspec,
+      ]);
+
+      const newSkills = new Set<string>();
+
+      if (addedOutput.trim()) {
+        const addedCommits = parseGitLogOutput(addedOutput);
+
+        for (const commit of addedCommits) {
+          for (const file of commit.files) {
+            const match = file.match(skillRe);
+
+            if (match) {
+              newSkills.add(match[1]);
+            }
+          }
+        }
+      }
+
+      for (const change of changes) {
+        if (newSkills.has(change.name)) {
+          change.type = 'new';
+        }
+      }
+    }
+  } catch {
+    log.debug('Could not read skill changelog from git log');
+  }
+
+  return changes;
+}
+
+/**
+ * Get session summaries from the past week.
+ */
+async function getRecentSessions(repoPath: string): Promise<string[]> {
+  const sessionsDir = path.join(repoPath, 'sessions');
+  const summaries: string[] = [];
+
+  try {
+    const userDirs = await fs.promises.readdir(sessionsDir, { withFileTypes: true });
+
+    for (const userDir of userDirs) {
+      if (!userDir.isDirectory()) continue;
+      const userSessionsDir = path.join(sessionsDir, userDir.name);
+      const files = await listFiles(userSessionsDir);
+
+      for (const file of files) {
+        if (!file.endsWith('.md')) continue;
+        const content = await readFileSafe(path.join(userSessionsDir, file));
+
+        if (content) {
+          // Extract session entries (simplified: just grab content)
+          summaries.push(`[${userDir.name}] ${file}:\n${content.slice(0, 500)}`);
+        }
+      }
+    }
+  } catch {
+    // sessions/ doesn't exist yet
+  }
+
+  return summaries;
+}
+
+/**
+ * Get recent learnings from the past 7 days.
+ *
+ * Filters by date embedded in filename (YYYY-MM-DD pattern),
+ * then parses frontmatter for title metadata.
+ */
+async function getRecentLearnings(
+  learningsDirs: readonly string[],
+  namespaces?: readonly string[],
+): Promise<{ recent: LearningInfo[]; total: number }> {
+  const recent: LearningInfo[] = [];
+  let total = 0;
+
+  try {
+    const { listLearningFiles } = await import('./utils/learnings-roots.js');
+    const mdFiles = await listLearningFiles(learningsDirs, namespaces);
+    total = mdFiles.length;
+
+    // Calculate 7-day cutoff as YYYY-MM-DD string for comparison
+    const cutoff = new Date(Date.now() - 7 * 86_400_000).toISOString().slice(0, 10);
+
+    for (const { file: filename, absPath } of mdFiles) {
+      // Extract date from filename pattern: *-YYYY-MM-DD-*.md
+      const dateMatch = filename.match(/-(\d{4}-\d{2}-\d{2})-/);
+
+      if (!dateMatch) continue;
+
+      const fileDate = dateMatch[1];
+
+      if (fileDate < cutoff) continue;
+
+      // Parse frontmatter for title
+      const content = await readFileSafe(absPath);
+
+      if (!content) continue;
+
+      const parsed = parseLearningDoc(content, filename);
+      const title = parsed?.meta.title ?? titleFromFilename(filename);
+
+      recent.push({ title, date: fileDate });
+    }
+
+    // Sort by date descending
+    recent.sort((a, b) => b.date.localeCompare(a.date));
+  } catch {
+    // learnings/ doesn't exist yet
+  }
+
+  return { recent, total };
+}
+
+/** Aggregated team-wide Human Intervention summary (Issue #34). */
+export interface InterventionSummary {
+  totalSessions: number;
+  totalInterventions: number;
+  interrupt: number;
+  toolReject: number;
+  correction: number;
+  /** Team-wide mean interventions per session. */
+  avgPerSession: number;
+  /** Per-user ranking by intervention rate (highest first = least autonomous). */
+  ranked: Array<{ username: string; sessions: number; total: number; rate: number }>;
+}
+
+/**
+ * Summarize the Human Intervention metric across all reported team stats.
+ * Returns null when no user has reported any interventions yet.
+ */
+export function summarizeInterventions(teamStats: UserStats[]): InterventionSummary | null {
+  const users = teamStats.filter((u) => u.interventions && u.interventions.sessions > 0);
+
+  if (users.length === 0) return null;
+
+  let totalSessions = 0;
+  let interrupt = 0;
+  let toolReject = 0;
+  let correction = 0;
+
+  const ranked = users.map((u) => {
+    const iv = u.interventions!;
+    const total = iv.interrupt + iv.toolReject + iv.correction;
+    totalSessions += iv.sessions;
+    interrupt += iv.interrupt;
+    toolReject += iv.toolReject;
+    correction += iv.correction;
+
+    return {
+      username: u.username,
+      sessions: iv.sessions,
+      total,
+      rate: iv.sessions > 0 ? total / iv.sessions : 0,
+    };
+  }).sort((a, b) => b.rate - a.rate);
+
+  const totalInterventions = interrupt + toolReject + correction;
+
+  return {
+    totalSessions,
+    totalInterventions,
+    interrupt,
+    toolReject,
+    correction,
+    avgPerSession: totalSessions > 0 ? totalInterventions / totalSessions : 0,
+    ranked,
+  };
+}
+
+/**
+ * The team's `count` split by run mode. A member's top-level counter holds every count of their own sessions, and what
+ * neither mode holds was recorded without one, so it is shown apart, never as a mode.
+ */
+export function splitByRunMode(teamStats: UserStats[], count: (stats: UserModeStats | undefined) => number): RunModeSplit {
+  const split: RunModeSplit = { attended: 0, unattended: 0, notRecorded: 0 };
+
+  for (const user of teamStats) {
+    const attended = count(user.attended);
+    const unattended = count(user.unattended);
+    split.attended += attended;
+    split.unattended += unattended;
+    split.notRecorded += Math.max(0, count(user) - attended - unattended);
+  }
+
+  return split;
+}
+
+function formatRunModeSplit(split: RunModeSplit, unit: string, format: (count: number) => string = String): string {
+  return `  By run mode: attended ${format(split.attended)} · unattended ${format(split.unattended)} · not recorded ${format(split.notRecorded)} ${unit}`;
+}
+
+const OUTCOME_MODE_LABELS: Record<(typeof OUTCOME_MODES)[number], string> = {
+  attended: 'attended', unattended: 'unattended', notRecorded: 'not recorded',
+};
+
+function outcomeRow([mode, outcome, sessions, tokens, interventions]: readonly [string, string, string, string, string]): string {
+  return `  ${mode.padEnd(14)}${outcome.padEnd(11)}${sessions.padEnd(11)}${tokens.padEnd(17)}${interventions}`;
+}
+
+/** The team's finished sessions by run mode and outcome (#1387) as the lines of a table; none before any is reported. */
+export function formatOutcomeLines(teamStats: UserStats[]): string[] {
+  const team = teamStats.reduce<UserOutcomeStats>((sum, user) => (user.outcomes ? addOutcomeStats(sum, user.outcomes) : sum), {});
+
+  const rows = OUTCOME_MODES.flatMap((mode) => OUTCOME_ROWS.flatMap((kind) => {
+    const counts = team[mode]?.[kind];
+
+    if (!counts || counts.sessions === 0) return [];
+
+    return [outcomeRow([
+      OUTCOME_MODE_LABELS[mode], kind, String(counts.sessions),
+      formatTokenCount(Math.round((counts.tokens.input + counts.tokens.output) / counts.sessions)),
+      (counts.interventions / counts.sessions).toFixed(1),
+    ])];
+  }));
+
+  if (rows.length === 0) return [];
+
+  return [
+    outcomeRow(['runMode', 'outcome', 'sessions', 'tokens/session', 'interventions/session']),
+    ...rows,
+    '  A session with a pull request and a learning is in both rows, so rows do not add up.',
+  ];
+}
+
+/** Aggregated team-wide conversation-turn + token-usage summary (Issue #75). */
+export interface ConversationSummary {
+  /** Total human conversation turns (UserPromptSubmit) across the team. */
+  totalPrompts: number;
+  /** Team-wide cumulative token usage. */
+  tokens: TokenUsage;
+  /** Grand total of all token buckets. */
+  totalTokens: number;
+  /** Per-user ranking by token usage (highest first). */
+  ranked: Array<{ username: string; prompts: number; tokens: number }>;
+}
+
+/** Compact a token count into a human-friendly string (e.g. 12.3M, 4.5K). */
+export function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+
+  return String(n);
+}
+
+/**
+ * Summarize the conversation-turn count and token usage across all reported team
+ * stats. Returns null when no user has reported any prompts or tokens yet.
+ */
+export function summarizeConversation(teamStats: UserStats[]): ConversationSummary | null {
+  const users = teamStats.filter(
+    (u) => (u.prompts && u.prompts > 0) || (u.tokens && totalTokens(u.tokens) > 0),
+  );
+
+  if (users.length === 0) return null;
+
+  let totalPrompts = 0;
+  const tokens: TokenUsage = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+
+  const ranked = users.map((u) => {
+    const p = u.prompts ?? 0;
+    const t = u.tokens ?? { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+    totalPrompts += p;
+    tokens.input += t.input;
+    tokens.output += t.output;
+    tokens.cacheRead += t.cacheRead;
+    tokens.cacheCreation += t.cacheCreation;
+
+    return { username: u.username, prompts: p, tokens: totalTokens(t) };
+  }).sort((a, b) => b.tokens - a.tokens);
+
+  return { totalPrompts, tokens, totalTokens: totalTokens(tokens), ranked };
+}
+
+export function summarizeTeamTrends(teamStats: UserStats[], now = new Date()): ReturnType<typeof summarizeTrendWindow> | null {
+  let daily: NonNullable<UserStats['daily']> = {};
+
+  for (const user of teamStats) daily = mergeDailyStats(daily, user.daily ?? {});
+
+  return Object.keys(daily).length > 0 ? summarizeTrendWindow(daily, now) : null;
+}
+
+function formatPercent(value: number | null): string {
+  return value === null ? 'collecting…' : `${Math.round(value * 100)}%`;
+}
+
+function formatAverage(value: number | null, suffix = ''): string {
+  return value === null ? 'collecting…' : `${value.toFixed(1)}${suffix}`;
+}
+
+function formatDuration(value: number | null): string {
+  return value === null ? 'collecting…' : `${Math.round(value / 60_000)}m`;
+}
+
+function formatCost(value: number | null): string {
+  return value === null ? 'collecting…' : `$${(value / 1_000_000).toFixed(3)}`;
+}
+
+function comparison(current: string, previous: string): string {
+  return `${previous} → ${current}`;
+}
+
+export function formatTrendLines(periods: { current: TrendPeriod; previous: TrendPeriod }): string[] {
+  const { current, previous } = periods;
+
+  return [
+    `  Session success: ${comparison(formatPercent(current.successRate), formatPercent(previous.successRate))} · ${current.sessionsEnded} ended`,
+    `  Avg prompts/session: ${comparison(formatAverage(current.avgPrompts), formatAverage(previous.avgPrompts))}`,
+    `  Avg active duration: ${comparison(formatDuration(current.avgDurationMs), formatDuration(previous.avgDurationMs))}`,
+    `  Avg LLM request cost (est.): ${comparison(formatCost(current.avgRequestCostMicros), formatCost(previous.avgRequestCostMicros))}`,
+    `  Cache read share: ${comparison(formatPercent(current.cacheReadShare), formatPercent(previous.cacheReadShare))}`,
+    `  Correction rate: ${comparison(formatPercent(current.correctionRate), formatPercent(previous.correctionRate))}`,
+  ];
+}
+
+/**
+ * Generate and display weekly team digest.
+ */
+export async function generateDigest(): Promise<void> {
+  try {
+    // Read-only: the load never persists a migration (#893).
+    const projectConfig = await detectProjectConfig(undefined, undefined, { dryRun: true });
+    const localConfig = projectConfig ?? (await requireInit({ dryRun: true })).localConfig;
+    const repoPath = localConfig.repo.localPath;
+
+    // Knowledge (learnings, skill git-log) lives under localPath on the default
+    // branch; report data (stats, sessions) lives on the teamai-reports orphan
+    // branch for non-HTTP repos — read those from the reports worktree.
+    let reportsRoot = repoPath;
+    const { usesBranchWorktree } = await import('./types.js');
+
+    if (usesBranchWorktree(localConfig)) {
+      const { readableReportsWorktree } = await import('./utils/reports-branch.js');
+      // Read-only: never publish a missing reports branch.
+      reportsRoot = await readableReportsWorktree(localConfig);
+    }
+
+    const teamStats = await loadTeamStats(reportsRoot);
+
+    if (teamStats.length === 0) {
+      console.log('No team usage data available yet.');
+      console.log('Usage data is collected automatically and reported during `teamai pull`.');
+
+      return;
+    }
+
+    const health = calculateTeamHealth(teamStats);
+    const sessions = await getRecentSessions(reportsRoot);
+
+    // Header
+    const now = new Date();
+    const weekStart = new Date(now.getTime() - 7 * 86_400_000);
+    console.log('');
+    console.log('╔════════════════════════════════════════════════════╗');
+    console.log('║           📊 Team AI Weekly Digest                ║');
+    console.log(`║  ${weekStart.toISOString().slice(0, 10)} → ${now.toISOString().slice(0, 10)}                        ║`);
+    console.log('╚════════════════════════════════════════════════════╝');
+    console.log('');
+
+    // Team members active
+    console.log(`👥 Active members: ${teamStats.length}`);
+    console.log('');
+
+    const trends = summarizeTeamTrends(teamStats, now);
+    console.log('📈 Session trends (7d vs prior 7d):');
+
+    if (trends) {
+      for (const line of formatTrendLines(trends)) console.log(line);
+    } else {
+      console.log('  collecting… (daily data starts with the next reported session)');
+    }
+
+    console.log('');
+
+    // Most used skills
+    console.log('🏆 Most Used Skills:');
+
+    for (const item of health.slice(0, 10)) {
+      console.log(`  ${item.stars}  ${item.skill} (${item.totalCount} uses)`);
+    }
+
+    console.log('');
+
+    const totalEvents = teamStats.reduce(
+      (sum, u) => sum + Object.values(u.skills).reduce((s, sk) => s + sk.count, 0),
+      0,
+    );
+
+    console.log(`📈 Total skill invocations: ${totalEvents}`);
+    console.log(`🔧 Unique skills used: ${health.length}`);
+    console.log('');
+
+    // Workflow run totals (#1083): counts and durations only, from the
+    // end-phase records each member published to the reports branch.
+    const workflowTotals = teamStats.reduce(
+      (sum, u) => ({
+        runs: sum.runs + (u.workflows?.runs ?? 0),
+        succeeded: sum.succeeded + (u.workflows?.succeeded ?? 0),
+        failed: sum.failed + (u.workflows?.failed ?? 0),
+        durationMs: sum.durationMs + (u.workflows?.totalDurationMs ?? 0),
+      }),
+      { runs: 0, succeeded: 0, failed: 0, durationMs: 0 },
+    );
+
+    if (workflowTotals.runs > 0) {
+      const minutes = Math.round(workflowTotals.durationMs / 60000);
+      console.log('⚙️ Workflow runs:');
+      console.log(`  ${workflowTotals.runs} total · ${workflowTotals.succeeded} succeeded · ${workflowTotals.failed} failed`);
+      console.log(`  ${minutes} min cumulative run time`);
+      console.log('');
+    }
+
+    // Session highlights
+    if (sessions.length > 0) {
+      console.log('📝 Session Highlights:');
+
+      for (const session of sessions.slice(0, 5)) {
+        console.log(`  ${session.slice(0, 120)}...`);
+      }
+
+      console.log('');
+    }
+
+    // Learnings
+    // Not another repository's learnings checkout, if one sits where this
+    // project's would (#808).
+    const { indexableLearningsRoots } = await import('./utils/learnings-roots.js');
+    const { readWorkspaceChildren, safeDeliveredLearningsNamespaces } = await import('./workspace-children.js');
+
+    const learningsNamespaces = await safeDeliveredLearningsNamespaces(
+      await readWorkspaceChildren(localConfig),
+      'digest',
+    );
+
+    const { recent: recentLearnings, total: totalLearnings } = await getRecentLearnings(
+      await indexableLearningsRoots(localConfig),
+      learningsNamespaces,
+    );
+
+    if (recentLearnings.length > 0) {
+      console.log(`📚 New Learnings This Week: ${recentLearnings.length}`);
+
+      for (const learning of recentLearnings) {
+        console.log(`  • ${learning.title}`);
+      }
+
+      console.log('');
+    }
+
+    if (totalLearnings > 0) {
+      console.log(`📊 Knowledge base total: ${totalLearnings} learnings`);
+      console.log('');
+    }
+
+    // Skill changelog. In self mode skills live at <businessRepoRoot>/.teamai/skills,
+    // so run the git log at the business repo root with a `.teamai` subdir prefix —
+    // running it at repoPath (a subdirectory) makes git emit `.teamai/skills/...`
+    // paths that never match the bare `skills/...` regex (blank changelog).
+    const skillChanges = localConfig.repo.kind === 'self'
+      ? await getRecentSkillChanges(
+        localConfig.repo.businessRepoRoot ?? path.dirname(repoPath),
+        '.teamai',
+      )
+      : await getRecentSkillChanges(repoPath);
+
+    const newSkills = skillChanges.filter((c) => c.type === 'new');
+    const updatedSkills = skillChanges.filter((c) => c.type === 'updated');
+
+    if (newSkills.length > 0) {
+      console.log('🆕 New Skills This Week:');
+
+      for (const skill of newSkills) {
+        console.log(`  • ${skill.name} (by ${skill.author})`);
+      }
+
+      console.log('');
+    }
+
+    if (updatedSkills.length > 0) {
+      console.log('🔄 Recently Updated Skills:');
+
+      for (const skill of updatedSkills) {
+        console.log(`  • ${skill.name}`);
+      }
+
+      console.log('');
+    }
+
+    // Session autonomy — Human Intervention metric (Issue #34)
+    const interventions = summarizeInterventions(teamStats);
+
+    if (interventions) {
+      console.log('🤖 Session Autonomy (Human Intervention):');
+      console.log(
+        `  Team avg: ${interventions.avgPerSession.toFixed(2)} interventions/session ` +
+        `(${interventions.totalSessions} sessions, ${interventions.totalInterventions} interventions)`,
+      );
+      console.log(
+        `  Breakdown: interrupt ${interventions.interrupt} · reject ${interventions.toolReject} · correction ${interventions.correction}`,
+      );
+      console.log(formatRunModeSplit(splitByRunMode(teamStats, (stats) => stats?.interventions?.sessions ?? 0), 'sessions'));
+      console.log('');
+    }
+
+    // What finished sessions delivered (#1387)
+    const outcomeLines = formatOutcomeLines(teamStats);
+
+    if (outcomeLines.length > 0) {
+      console.log('📦 Session Outcomes (finished sessions):');
+
+      for (const line of outcomeLines) console.log(line);
+      console.log('');
+    }
+
+    // Conversation turns + token usage (Issue #75)
+    const conversation = summarizeConversation(teamStats);
+
+    if (conversation) {
+      const t = conversation.tokens;
+      console.log('💬 Lifetime Conversation & Token Usage:');
+      console.log(`  Lifetime human prompts: ${conversation.totalPrompts}`);
+      console.log(formatRunModeSplit(splitByRunMode(teamStats, (stats) => stats?.prompts ?? 0), 'prompts'));
+      console.log(
+        `  Lifetime tokens: ${formatTokenCount(conversation.totalTokens)} ` +
+        `(input ${formatTokenCount(t.input)} · output ${formatTokenCount(t.output)} · ` +
+        `cache read ${formatTokenCount(t.cacheRead)} · cache write ${formatTokenCount(t.cacheCreation)})`,
+      );
+      console.log(formatRunModeSplit(splitByRunMode(teamStats, (stats) => totalTokens(stats?.tokens)), 'tokens', formatTokenCount));
+      console.log('');
+    }
+
+    console.log('─'.repeat(52));
+    console.log('Generated by teamai digest');
+  } catch (e) {
+    log.error(`Failed to generate digest: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}

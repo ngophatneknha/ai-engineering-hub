@@ -1,0 +1,565 @@
+# Core Harness
+
+> Part of the [TeamAI CLI Usage Guide](../usage-guide.md).
+
+## Skills
+
+```bash
+mkdir -p ~/.claude/skills/my-deploy-helper
+cat > ~/.claude/skills/my-deploy-helper/SKILL.md << 'EOF'
+---
+name: my-deploy-helper
+description: Deploy a service for the team
+---
+# Deploy Helper
+When the user requests a deployment, follow these steps:
+1. Check that the current branch is master
+2. Run tests `npm test`
+3. Build `npm run build`
+4. Deploy `./deploy.sh`
+EOF
+
+teamai push
+teamai push --role pm
+```
+
+`push` fills in `name` and `description` when the frontmatter is missing. A new skill goes to `skills/<ns>/<name>/`, where `<ns>` comes from your role or the active projects. Several choices ask which one, including an explicit shared-root choice. `--role` picks a namespace; `--shared` places new resources at the shared root for the whole team, even when namespaces exist. It cannot combine with `--role` or `--project`. Edits of resources already delivered from a namespace keep their destination. When a namespace is selected and the team has `manifest/roles.yaml` or `manifest/projects.yaml`, a role or project there must declare it.
+
+Shared-root skills keep the existing tag-subscription delivery rules when roles or projects filter skills. `--shared` selects the publishing location.
+
+## Rules
+
+```bash
+cat > ~/.claude/rules/code-review-guide.md << 'EOF'
+# Code Review Guidelines
+- All functions must have JSDoc comments
+- `any` type is not allowed
+EOF
+
+teamai push
+```
+
+A rule members cannot delete goes in `teamai.yaml`:
+
+```yaml
+sharing:
+  rules:
+    enforced: [code-review-guide]
+```
+
+A rule you wrote yourself stays. `push` writes back only the body of a rule the team already has.
+
+Antigravity means all three here: the CLI (`agy`), Antigravity 2.0 and Antigravity IDE read the same `~/.gemini/config` and `.agents`, so one pull serves them.
+
+Antigravity loads only rules with a `trigger`, so pull adds one. A rule with `paths:` becomes a rule the model applies when it works on those files:
+
+```markdown
+<!-- rules/api-errors.md in the team repo -->
+---
+paths: ["src/api/**/*.ts"]
+---
+Return typed errors from API handlers.
+
+<!-- ~/.gemini/config/rules/api-errors.md after teamai pull -->
+---
+trigger: model_decision
+description: "Applies when reading or editing files matching src/api/**/*.ts"
+---
+
+Return typed errors from API handlers.
+```
+
+A rule without `paths:` gets `trigger: always_on`.
+
+A rule can also declare relations to other team assets in a `related:`
+frontmatter block (a doc can too; a learning declares them the same way when
+it is contributed):
+
+```markdown
+---
+related:
+  MAPS_TO: teamwiki/evidence/code/pay/modules/ledger-receipts.md
+  REFERENCES: [docs/payments-overview.md]
+---
+```
+
+`MAPS_TO` points at a teamwiki code page, `REFERENCES` at any asset, and
+`SUPERSEDES` / `CONFLICTS_WITH` at a rule, doc or learning. `teamai recall`
+prints each declared relation as a `Related:` line on the hit, and each
+`paths:`-glob-derived one (knowledge guide), so a session that recalls one end
+of the relation starts with the other end too.
+`teamai review --branch` fails a rule or doc whose `related:` block uses a
+relation outside that table; a relation that points at an asset not on the
+branch is a warning, not a failure.
+
+## Agents
+
+`agents/<name>.yaml`. `name` matches the filename. Commit it, or run `teamai push` after editing the copy in a tool.
+
+```yaml
+# agents/code-reviewer.yaml
+name: code-reviewer
+description: Review a change before it is pushed
+instructions: |
+  Read the diff and comment on correctness, tests, and risks.
+tools: [Read, Grep]
+targets: [claude, cursor]
+```
+
+Leave `targets` out to send the agent to every installed tool. An agent for one role goes in `agents/<namespace>/`, declared under `resources.agents`.
+
+```bash
+teamai push
+teamai push --role frontend
+teamai remove agents code-reviewer
+```
+
+### Replace the recall agent
+
+While [recall](knowledge.md#enabling--disabling-recall) is on, teamai installs its own `teamai-recall` agent. A team agent with that name replaces it, the way a team workflow replaces a [default workflow](workflow.md#default-workflows). Put it in `agents/` for everyone, or in `agents/<namespace>/` for one role:
+
+```yaml
+# agents/frontend/teamai-recall.yaml
+name: teamai-recall
+description: Search the team knowledge base for a frontend task and return doc_ids
+tools: [Bash, Read, Grep, Glob]
+instructions: |
+  Run `teamai recall --caller teamai-recall "<task>"` and read the top three hits.
+  For each component the task names, grep src/design-system/ and its Storybook stories.
+  Return at most ten lines: doc_ids, file paths, and the one rule that applies.
+```
+
+Keep `--caller teamai-recall` on each `teamai recall` call, as teamai's agent does: it is how the docs the agent opens are credited to recall.
+
+```console
+# a member with the frontend role
+$ teamai pull
+✔ [workspace] Synced 1 agents
+$ head -3 .claude/agents/teamai-recall.md
+---
+name: teamai-recall
+description: Search the team knowledge base for a frontend task and return doc_ids
+
+# a member with the backend role keeps teamai's
+$ head -3 .claude/agents/teamai-recall.md
+---
+name: teamai-recall
+description: >-
+```
+
+Once the team file exists, edit the copy in a tool and run `teamai push`, as for any team agent. An edit to teamai's own copy is never pushed, so the first version goes into the team repo as a commit. Delete the file, and the next `pull` puts teamai's agent back. While recall is off, pull installs neither.
+
+`pull` writes each tool's own format into that tool's agents directory: `<name>.toml` for the Codex family, `<name>.agent.md` for Copilot, `<name>.json` for Kiro, and `<name>.md` for the rest. Trae and Trae CN load `.trae/agents` only while the Beta setting "Enable Subagents Directory" is on, and accept only their own model ids, so their copy leaves out the agent's `model`. Trae CN's user copy in `~/.trae-cn/agents` takes one an alias or `tool_extras.trae-cn` gives it. A project's `.trae/agents` is read by both editions, so it never gets a `model`, and it takes the other keys of both `tool_extras.trae` and `tool_extras.trae-cn`; an agent whose two editions give one key different values is skipped there, with a warning naming the key. `push` refuses an edit to that file that changes or removes a key the other edition gives.
+
+Antigravity's copy keeps no team `model` (agy skips an agent whose model it does not know), only one an alias maps for agy, and lists agy's own names for the agent's tools: `tools: [Bash, Read]` becomes `run_command`, `view_file` and `read_file`. Without them an agy subagent has no shell. In a project, `.agents/agents` is agy's, so Muse Code gets no copy there while agy is installed. The CLI and Antigravity 2.0 run the agent as a subagent; Antigravity IDE has none, so its model can only hand the work to `agy --agent <name>` when the CLI is installed.
+
+In single-repo mode, your root copy of an agent placed in a namespace is pushed to the placed file. Changing it from `.md` to `.yaml` retires the original file, even while your checkout is behind its own merged PR. Either way, TeamAI compares the placed file with the blob your last merged push delivered there. If the team edited it since, the push stops and prints a `teamai push --carried <path>@<blob>` command. Carry that edit into your root copy, then run it. The option accepts only that version, so a plain retry or a later team edit stops the push again. An agent deleted by the team is not re-added from your root copy. An older placement record without a blob catches a team edit only while your checkout is behind it, until your first edit through it merges and records its blob.
+
+### Model aliases
+
+A name such as `model: strong` is mapped per tool in `models/aliases.yaml`:
+
+```yaml
+aliases:
+  strong:
+    claude: { model: opus, effort: high }
+    codex: { model: gpt-6-sol, effort: high }
+  fast:
+    claude: haiku
+```
+
+An alias starts with a lowercase letter, then lowercase letters, digits, or `-`. A namespace that needs its own mapping uses `models/<ns>/aliases.yaml`.
+
+## Env, hooks and MCP servers by namespace
+
+The root file reaches everyone. A namespace declared under `resources:` reaches only members who have it active, and replaces the root entry of the same name.
+
+```text
+env/env.yaml              hooks/hooks.yaml              mcp/mcp.yaml
+env/<ns>/env.yaml         hooks/<ns>/hooks.yaml         mcp/<ns>/mcp.yaml
+```
+
+```yaml
+# manifest/projects.yaml
+projects:
+  - id: checkout
+    resources:
+      env: [checkout]
+      hooks: [checkout]
+      mcp: [checkout]
+```
+
+## Env (environment variables)
+
+```bash
+teamai env add API_ENDPOINT https://api.example.com --description "Team API endpoint"
+teamai env add API_ENDPOINT https://checkout.internal --project checkout
+teamai env add GITHUB_TOKEN --secret -d "GitHub token with repo scope" --url https://github.com/settings/tokens
+teamai push
+```
+
+```yaml
+# env/env.yaml
+variables:
+  - key: API_ENDPOINT
+    value: https://api.example.com
+    description: Team API endpoint
+```
+
+```yaml
+# env/secrets.yaml
+secrets:
+  - key: GITHUB_TOKEN
+    description: GitHub token with repo scope
+    url: https://github.com/settings/tokens
+```
+
+Secret values stay off the repo. On each machine:
+
+```bash
+teamai env set GITHUB_TOKEN
+teamai env exec -- gh pr create
+```
+
+### Shell environment by directory
+
+A shell gets the team env of the directory it starts in, so several projects open at once each get their own. `teamai pull` adds one block to your shell profile (`.zshenv` for zsh, the bash startup files for bash). An interactive shell switches env on `cd` and puts your own values back when you leave a project.
+
+- In a project: the project's env. With `inheritUserScope: true`, the user scope's variables load too, but a key the project declares stays the project's, and user-scope secrets never load.
+- In a workspace with repos set up inside it: its own env plus theirs. A key two of them set differently is held: the value installed before stays, and `pull` names it.
+- In a project no pull has registered yet: nothing, until you pull there.
+- Anywhere else: the user scope's env.
+- Where git cannot read the repository (git missing, a broken `.git`, `safe.directory`): nothing.
+
+`injectShellProfile: false` turns this off for that team's scope.
+
+Limits:
+
+- Only bash and zsh load env by directory. In fish, PowerShell, or a tool that does not start one of them, run commands through `teamai env exec --`.
+- Team env cannot set names that control the shell or the loader, such as `BASH_ENV`, `HOME`, `IFS`, `PROMPT_COMMAND`, or names starting `__TEAMAI_`. Pull warns and ignores them.
+- `teamai doctor` checks that a shell in this directory loads this scope's env.
+
+## Hooks
+
+`teamai init` installs these built-in hooks:
+
+| Event | What it does |
+|-------|----------------|
+| `SessionStart` | Pull team resources and record the session start |
+| `PostToolUse` | Record skill use |
+| `UserPromptSubmit` | Record the prompt |
+| `Stop` | Check for a CLI update and record the session end |
+
+```bash
+teamai hooks list
+teamai hooks inject --dry-run
+teamai hooks inject
+teamai hooks remove
+```
+
+Only tools that are already installed are touched.
+
+Commit the team's own hooks in `hooks/hooks.yaml`. `id` is lowercase letters, digits, and `-`. `builtin` belongs only in the root file. Use it to turn a built-in hook off, or to change its timeout.
+
+```yaml
+hooks:
+  - id: block-secret
+    description: Scan for secrets before a commit
+    event: PreToolUse
+    matcher: Bash
+    command: bash ~/.teamai/team-scripts/scan-secret.sh
+    timeout: 15
+    tools: [claude, cursor]
+```
+
+A hook for one project goes in `hooks/<ns>/hooks.yaml`.
+
+Four hooks a team can share. A hook reads Claude Code's JSON payload on stdin.
+
+```yaml
+hooks:
+  # Refuse a force push, and say what to run instead.
+  - id: no-force-push
+    description: Refuse git push --force
+    event: PreToolUse
+    matcher: Bash
+    command: >-
+      jq -r '.tool_input.command' | grep -Eq 'git push.* (-f|--force)( |$)'
+      && { echo 'Use git push --force-with-lease' >&2; exit 2; } || true
+
+  # Migrations that shipped are append-only.
+  - id: no-migration-edits
+    description: Keep shipped migrations unchanged
+    event: PreToolUse
+    matcher: Edit|Write
+    command: >-
+      jq -r '.tool_input.file_path // empty' | grep -q '/db/migrations/'
+      && { echo 'Add a new migration instead: make migration name=...' >&2; exit 2; } || true
+
+  # Tell every session about the release freeze.
+  - id: release-freeze
+    description: Announce the release freeze
+    event: SessionStart
+    command: echo 'Release freeze until Friday 18:00 UTC. Only hotfix/* branches merge to main.'
+
+  # Format what the agent wrote.
+  - id: format-on-write
+    description: Run Prettier on edited files
+    event: PostToolUse
+    matcher: Edit|Write
+    command: >-
+      f=$(jq -r '.tool_input.file_path // empty');
+      [ -n "$f" ] && npx --no-install prettier --write "$f" >/dev/null 2>&1; true
+```
+
+What a hook can do depends on its event. Every tool that runs the event does this much. Claude Code does more, such as refusing a prompt when a `UserPromptSubmit` hook exits 2:
+
+| Event | Exit 2 (reason on stderr) | Stdout |
+|-------|---------------------------|--------|
+| `PreToolUse` | Blocks the tool call | — |
+| `SessionStart`, `UserPromptSubmit` | — | Added to the agent's context |
+| `PostToolUse`, `Stop` | — | — |
+
+`teamai hooks list` shows where each team hook runs:
+
+```text
+  [no-force-push] PreToolUse [Bash]  →  jq -r '.tool_input.command' | grep -Eq 'git push.* (-f|--force)( |$)' && { echo 'Use git push --force-with-lease' >&2; exit 2; } || true  (tools: all)  from root
+      runs in: claude, omp, opencode
+      not in: cursor (no PreToolUse hook there)
+```
+
+OpenCode, Oh My Pi, Pi, OpenClaw, Kiro, Hermes, and Antigravity have no Claude Code hook file. Their hooks run through teamai, with Claude Code's payload and tool names (`matcher: Bash` matches OpenCode's `bash` and Hermes's `terminal`). There:
+
+- Only `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop` run. Pull warns about a team hook on any other event.
+- `UserPromptSubmit` adds context but cannot block the prompt.
+- Oh My Pi waits 25 seconds for a `PreToolUse` hook. A slower hook does not block the call. Hermes stops any hook after 300 seconds.
+- OpenClaw and Hermes run `SessionStart` on the session's first prompt. OpenCode, Oh My Pi, and Pi build the system prompt for each request, so they run `SessionStart` again before each request after the first, so what it prints follows a change a `UserPromptSubmit` hook made (a `/ponytail lite` that sets a level shows on the next turn).
+- OpenClaw loads teamai's plugin from `plugins.load.paths` in `openclaw.json`. If `plugins.allow` leaves it out, pull warns and the hooks do not run.
+- teamai reads `openclaw.json` as OpenClaw does, comments included, so a workspace set there is followed. teamai writes that file only while it is plain JSON. In a commented file it adds nothing, and pull prints the line to add by hand:
+
+  ```json5
+  // ~/.openclaw/openclaw.json
+  {
+    agents: { defaults: { workspace: "~/work/team-ws" } }, // teamai writes AGENTS.md here
+    plugins: { load: { paths: ["/Users/ana/.openclaw/teamai/teamai-team-hooks.mjs"] } }, // add by hand
+  }
+  ```
+
+```yaml
+sharing:
+  hooks:
+    autoApply: false          # pull only prints a hint; run teamai hooks inject
+    requireTeamScripts: true  # command must live under ~/.teamai/team-scripts/
+```
+
+Turn team hooks off on this machine with `TEAMAI_HOOKS_DISABLED=1`.
+
+Antigravity runs them too, in the CLI, Antigravity 2.0 and Antigravity IDE alike, through teamai's own hook in `~/.gemini/config/hooks.json`. A hook gets the Claude Code payload (`tool_name: Bash`, `tool_input.command`), and exit 2 blocks the call, so one hook serves both tools:
+
+```yaml
+hooks:
+  - id: block-rm-rf
+    description: Block recursive deletes
+    event: PreToolUse
+    matcher: Bash
+    command: 'grep -q "rm -rf" && { echo "rm -rf is blocked; run git clean -n first." >&2; exit 2; } || exit 0'
+    tools: [claude, agy]
+```
+
+agy then refuses the command with `tool call denied by pre-tool hook: rm -rf is blocked; run git clean -n first.`
+
+## MCP servers
+
+Muse may save stdio servers without `type`. Pull and removal compare that form without rewriting personal servers or unchanged managed entries when another server changes.
+
+```yaml
+# mcp/mcp.yaml
+servers:
+  - name: gpu-analysis
+    description: GPU inventory and pricing
+    transport: http
+    url: https://example.com/api/mcp
+    headers:
+      Authorization: Bearer ${GPU_ANALYSIS_TOKEN}
+    timeout: 600000
+  - name: local-formatter
+    transport: stdio
+    command: npx
+    args: ["-y", "@acme/formatter-mcp"]
+    env:
+      FORMATTER_MODE: strict
+    requires: [npx]
+    tools: [claude, cursor]
+```
+
+Write secrets as `${VAR}` and declare the key in `env/secrets.yaml`. A server for one project goes in `mcp/<ns>/mcp.yaml`.
+
+OpenCode's `opencode.json`, Cursor's `mcp.json` and `hooks.json`, CodeBuddy's settings and MCP files, Qoder's `settings.json` and Pi's `models.json` may hold comments, since those tools read them so. teamai reads them the same way and edits only its own entries: your lines and comments stay as you wrote them. Here is `~/.config/opencode/opencode.json` after a pull of the `local-formatter` server above:
+
+```jsonc
+{
+  "mcp": {
+    "notes": { "type": "local", "command": ["notes-mcp"], "enabled": false }, // off until the API key arrives
+    "local-formatter": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@acme/formatter-mcp"
+      ],
+      "enabled": true
+    },
+  },
+}
+```
+
+When the team drops `local-formatter`, the next pull takes its lines out and leaves `notes` and its comment as they are. Claude Code, Codex, Muse and the other tools reject a commented file, so teamai does too: pull warns that the file does not parse and changes nothing in it.
+
+For stdio servers, `env` keys stay literal in Codex's TOML: `HTTP.PROXY` is one variable, and names such as `ProgramFiles(x86)` are quoted automatically.
+
+Codex MCP table headers can use bare, single-quoted or double-quoted `mcp_servers` keys, including on sub-tables. Quoting does not change which server teamai updates or protects as the member's own.
+
+ZCode servers use `mcp.servers` in `~/.zcode/cli/config.json` or the project's `.zcode/config.json`. This follows the 3.16.2 source; 3.15.1 is not certified. Pull moves only unchanged teamai entries out of `~/.agents/mcp.json`. Doctor names other servers there because the desktop app stops reading that fallback once the native config has servers.
+
+Antigravity takes user servers in `~/.gemini/config/mcp_config.json`. It reads a project's servers only from a plugin, so teamai writes them as one:
+
+```text
+.agents/plugins/teamai/plugin.json       {"name": "teamai"}
+.agents/plugins/teamai/mcp_config.json   {"mcpServers": {"github": {"url": "https://api.githubcopilot.com/mcp/", "headers": {...}}}}
+```
+
+agy takes stdio and HTTP servers, with no `type`; pull skips an `sse` server for agy with a warning. `agy mcp list` shows only the user file's servers; a plugin's appear in a session.
+
+WorkBuddy uses the first existing user file in `~/.workbuddy/.mcp.json`, `~/.workbuddy/mcp.json`, and `~/.codebuddy.json`. `CODEBUDDY_CONFIG_DIR` moves the last file. A project uses `.mcp.json`, or `mcp.json` when only that exists. With `sharing.gitExclude` on, its servers use `projects[<project path>].mcpServers` in `.codebuddy.json`. These paths follow the CodeBuddy 2.168.0 engine; WorkBuddy's launcher binding is not certified. Pull removes only unchanged teamai entries from the former `.workbuddy/mcp.json` project file.
+
+When `.workbuddy-ai/` exists in the home or project (WorkBuddy AI, the international edition), the default skills path moves to `.workbuddy-ai/skills`. Every other surface still waits for `.workbuddy/`, so a member with only `.workbuddy-ai/` gets no rules, team instructions, agents, MCP servers or hooks, and `teamai doctor` fails `workbuddy receives ...` with the ones held.
+
+When a tool's home or configured MCP path moves, pull leaves old copies in place and names them once. Remove them after no tool reads them. Doctor reports unread mappings, moved files, and project MCP that is read only from a session started at the project root. Internal builds with an unknown MCP channel get a note instead of a guessed config.
+
+In a workspace with repos set up inside it, Claude Code, CodeBuddy, and WorkBuddy get the servers through their local scope, not the project's MCP file, so a session in one of those repos does not load them. In single-repo mode, or while tclaude or Muse Code reads that file, Claude Code's servers stay in it, and such a session does load them.
+
+```bash
+teamai mcp list
+teamai mcp inject
+teamai mcp remove
+```
+
+`mcp inject` and `mcp remove` exit with code 1 when a tool's config cannot be read or parsed, including with `--dry-run`. This includes invalid TOML in Codex's `config.toml`; a leading UTF-8 BOM is accepted. Other tools may still be updated; the command lists those changes and reports that the operation is incomplete. Fix the config named in the warning, then rerun the command. The unreadable config and its ownership records are kept for the retry. `uninstall` also preserves the records and exits 1 until the config is repaired.
+
+Muse reordering JSON object keys does not make a managed server a personal edit. Removal compares its recorded content, including nested objects, while preserving real command, argument or environment changes. Older records without that content fingerprint need a matching original definition in team Git history; if that proof is unavailable, removal keeps the server and warns.
+
+## Models
+
+Commit `models/models.yaml` yourself. The key stays on each machine. A catalog for one project goes in `models/<ns>/models.yaml`.
+
+```yaml
+profiles:
+  - id: tokenhub
+    name: Tencent TokenHub
+    base_url: https://tokenhub.tencentmaas.com
+    api_key: ${API_KEY}
+    model_groups:
+      - protocols: [anthropic, openai-chat-completions]
+        models:
+          - glm-5.3
+          - deepseek-v4-flash
+```
+
+```bash
+teamai models switch tokenhub
+```
+
+## Propose a file from a workflow step
+
+A step with `workspace: { team: { branch } }` runs in a fresh clone of the team repo, and `deliver: pr` proposes what it changed there as one pull request. This workflow proposes one scorer file, byte for byte:
+
+```yaml
+schemaVersion: v1alpha1
+name: propose-scorer
+description: Propose one scorer file to the team as a pull request, on a branch of its own.
+inputs: { file: string, name: string }
+steps:
+  - id: propose
+    workspace: { team: { branch: "teamai/scorers/{{ inputs.name }}" } }
+    deliver: pr
+    command: mkdir -p scorers && cp "$FILE" "scorers/$NAME.md"
+    env: { FILE: "{{ inputs.file }}", NAME: "{{ inputs.name }}" }
+```
+
+```text
+teamai workflow start propose-scorer --driver local --inputs '{"file":"/tmp/review.md","name":"review"}'
+  first run                        opens "propose-scorer: scorers/review.md" from teamai/scorers/review
+  /tmp/review.md edited, run again updates that pull request
+  bytes main already has           pushes nothing and opens no pull request
+  name "../review"                 fails before any clone: git cannot name the branch
+```
+
+The commit must be one `teamai pull` would take; [The team workspace](workflow.md#the-team-workspace) lists what is refused. [teamai-session-to-task](benchmarks.md#turn-a-session-into-a-task) proposes the task file it drafts this way.
+
+## Packages
+
+```bash
+teamai packages install typescript
+teamai packages install code-review@claude-plugins-official
+teamai push
+```
+
+```yaml
+packages:
+  npm:
+    - name: typescript
+      version: "*"
+  claude:
+    marketplaces:
+      - name: claude-plugins-official
+        repo: anthropics/claude-plugins-official
+    plugins:
+      - name: code-review@claude-plugins-official
+```
+
+After pull, run `teamai packages`.
+
+## Sessions
+
+Unattended runs now publish their sessions by default. In CI, on a cloud VM or in a hosted job, [`teamai score --drain`](scorers.md#drain-before-an-unattended-job-ends) archives, through a `teamai-finished-sessions` run, the sessions this machine captured as unattended, and the step sessions of the workflow runs driven here, scrubbed, on `teamai-reports`. The local driver runs it at the end of an unattended run. To keep the old behavior, set `unattended: off`:
+
+```yaml
+# teamai.yaml
+sessions: { publish: { unattended: off } }
+```
+
+`sessions.publish` takes `off`, `ask` or `auto` for each run mode. These are the defaults, written out:
+
+```yaml
+# teamai.yaml
+sessions:
+  publish: { attended: ask, unattended: auto }
+```
+
+Attended `ask` proposes publishing when the friction reminder offers [`teamai-share-learnings`](workflow.md#teamai-share-learnings-and-teamai-share-session), and the person confirms it once, at the start. An agent that starts the run with `--confirmed` can confirm it for them, and teamai cannot check that they did. Otherwise a person's sessions are archived only by a command such as `teamai session push`. Unattended `ask` acts as `off`, since nobody is there to confirm. Attended `auto` archives a session once nothing has happened in it for six hours, in the [`teamai-finished-sessions`](scorers.md#teamai-finished-sessions) run a session start begins, which also judges finished sessions. A session pushed by hand before it finished is archived again once something happened in it after that push. Publishing always scrubs, which also rewrites local paths ([what a scrubbed session keeps](dashboard.md#what-a-scrubbed-session-keeps)). An HTTP team keeps no session archive, so there `sessions.publish` acts as `off`, and `teamai doctor` says so.
+
+A member's `config.yaml` wins, one mode at a time. A mode it does not name falls through to `teamai.yaml`:
+
+```yaml
+# config.yaml
+sessions:
+  publish: { attended: ask }   # attended only; unattended still follows the team
+```
+
+`teamai doctor` reports a value that is not `off`, `ask` or `auto`, with its file and key, and teamai ignores it, so that mode falls to the next level. `teamai review --branch` fails a branch whose `teamai.yaml` has such a value. [Finished sessions](scorers.md#finished-sessions) covers `sessions` in `scorers/scoring.yaml`, which decides whether sessions are judged.
+
+## Docs
+
+Put files in the team repo's `docs/`. Members receive them on `pull`. To limit a directory, declare it under `resources.docs`:
+
+```yaml
+# manifest/projects.yaml
+projects:
+  - id: checkout
+    resources:
+      docs: [checkout]
+```
+
+In self mode, pushing an edited skill from a checkout behind the default branch stops with exit 2 if it would overwrite an upstream file. The check covers the whole skill directory, including references and deletions, even when your edit is in another file. Merge the default branch, reconcile the skill, and retry; a copy that already contains the upstream changes can be pushed.
+
+If the team recreates a retired agent at its old namespace, edit that namespace source directly; the old flattened copy remains a backup. Deleting the retired root copy does not make its remaining tool copies new agents. Editing or converting a placed agent also checks the last delivered blob after the checkout has caught up with the default branch.

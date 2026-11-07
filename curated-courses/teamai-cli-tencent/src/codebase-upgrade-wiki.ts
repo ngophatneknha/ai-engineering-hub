@@ -1,0 +1,157 @@
+import { readdir, readFile } from 'node:fs/promises';
+import path from 'node:path';
+
+import chalk from 'chalk';
+import matter from 'gray-matter';
+
+import { autoDetectInit } from './config.js';
+import { publishTeamwikiViaMR, refreshTeamwikiIndexes } from './import-codebase.js';
+import { DetachedTeamRepoError } from './utils/git.js';
+import { log } from './utils/logger.js';
+import { pathExists } from './utils/fs.js';
+
+export interface UpgradeCodebaseWikiOptions {
+  cwd: string;
+  dryRun?: boolean;
+  json?: boolean;
+}
+
+interface MigrationResult {
+  migrated: string[];
+  skipped: string[];
+  errors: string[];
+}
+
+export async function upgradeCodebaseWiki(opts: UpgradeCodebaseWikiOptions): Promise<void> {
+  const teamCodebaseDir = path.join(opts.cwd, 'docs', 'team-codebase', 'repos');
+
+  if (!await pathExists(teamCodebaseDir)) {
+    if (opts.json) {
+      console.log(JSON.stringify({ status: 'nothing-to-migrate', reason: 'docs/team-codebase/repos/ not found' }));
+    } else {
+      log.info('no docs/team-codebase/repos/ directory found, no migration needed.');
+    }
+
+    return;
+  }
+
+  const files = await readdir(teamCodebaseDir);
+  const mdFiles = files.filter(f => f.endsWith('.md'));
+
+  if (mdFiles.length === 0) {
+    if (opts.json) {
+      console.log(JSON.stringify({ status: 'nothing-to-migrate', reason: 'no .md files in repos/' }));
+    } else {
+      log.info('no .md files under repos/, no migration needed.');
+    }
+
+    return;
+  }
+
+  if (!opts.json) {
+    log.info(`found ${mdFiles.length} legacy repo docs, starting migration to teamwiki/ graph format...`);
+  }
+
+  const result: MigrationResult = { migrated: [], skipped: [], errors: [] };
+  const pending: Array<{ slug: string; url: string }> = [];
+
+  for (const file of mdFiles) {
+    const slug = file.replace('.md', '');
+    const filePath = path.join(teamCodebaseDir, file);
+
+    try {
+      const content = await readFile(filePath, 'utf-8');
+      const parsed = matter(content);
+      const source = parsed.data['source'] ?? parsed.data['repo_url'];
+
+      if (!source) {
+        result.skipped.push(`${slug}: missing source/repo_url field`);
+        continue;
+      }
+
+      if (opts.dryRun) {
+        result.migrated.push(`${slug} → teamai import --from-repo ${String(source)}`);
+        continue;
+      }
+
+      pending.push({ slug, url: String(source) });
+    } catch (err) {
+      result.errors.push(`${slug}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (pending.length > 0) {
+    // The same import as `teamai import --from-repo`, one repository at a time: the evidence lands in the team repo's
+    // teamwiki/, published once for the whole migration below.
+    const { ImportFromRepo } = await import('./import-from-repo.js');
+    const { resolveTeamwiki } = await import('./utils/teamwiki-root.js');
+    const exitCode = process.exitCode;
+
+    try {
+      const ended = await ImportFromRepo.start({
+        mode: 'update',
+        items: pending.map(({ url }) => ({ kind: 'repo', url })),
+        settings: { depth: 1, forceSsh: false, incremental: true, skipEnrich: false },
+        target: await resolveTeamwiki(),
+        command: 'teamai codebase --upgrade-wiki',
+      });
+
+      const imported = ImportFromRepo.importedOf(ended);
+
+      for (const [index, { slug }] of pending.entries()) {
+        const entry = imported.at(index);
+
+        if (entry && !entry.failed) result.migrated.push(slug);
+        else result.errors.push(`${slug}: the import failed; the step that failed is named above`);
+      }
+    } catch (err) {
+      DetachedTeamRepoError.rethrow(err);
+
+      for (const { slug } of pending) result.errors.push(`${slug}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      process.exitCode = exitCode;
+    }
+  }
+
+  if (!opts.dryRun && result.migrated.length > 0) {
+    // oxlint-disable-next-line teamai/config-load-options -- this publishing branch runs only when opts.dryRun is false
+    const team = await autoDetectInit();
+    await refreshTeamwikiIndexes(path.join(team.localConfig.repo.localPath, 'teamwiki'));
+    await publishTeamwikiViaMR(team, '[teamai] Migrate docs/team-codebase to teamwiki');
+  }
+
+  if (opts.json) {
+    console.log(JSON.stringify({ status: 'done', ...result }, null, 2));
+  } else {
+    if (result.migrated.length > 0) {
+      const noun = result.migrated.length === 1 ? 'repository' : 'repositories';
+      log.success(`migrated ${result.migrated.length} ${noun} to teamwiki/ format`);
+
+      for (const m of result.migrated) {
+        console.log(chalk.green(`  ✓ ${m}`));
+      }
+    }
+
+    if (result.skipped.length > 0) {
+      console.log(chalk.yellow(`skipped ${result.skipped.length}:`));
+
+      for (const s of result.skipped) {
+        console.log(chalk.yellow(`  - ${s}`));
+      }
+    }
+
+    if (result.errors.length > 0) {
+      console.log(chalk.red(`failed ${result.errors.length}:`));
+
+      for (const e of result.errors) {
+        console.log(chalk.red(`  ✗ ${e}`));
+      }
+    }
+
+    if (!opts.dryRun && result.migrated.length > 0) {
+      log.info('');
+      log.info('migration complete. old docs/team-codebase/ directory preserved (not deleted).');
+      log.info('after confirming the new graph works, you can manually delete docs/team-codebase/.');
+    }
+  }
+}

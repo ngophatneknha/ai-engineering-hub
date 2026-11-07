@@ -1,0 +1,1825 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import path from 'node:path';
+import os from 'node:os';
+import fse from 'fs-extra';
+import YAML from 'yaml';
+import { parseFrontmatter } from '../utils/frontmatter.js';
+
+vi.mock('../utils/logger.js', () => ({
+  log: {
+    info: vi.fn(),
+    success: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+    dim: vi.fn(),
+  },
+}));
+
+import { SkillsHandler } from '../resources/skills.js';
+import { skillsGuardBase } from '../builtin-skills.js';
+import { allowsSkillDirectory, mayDeleteSkillCopy, scanTeamRepoNamespaces, ensureSkillFrontmatter, createSkillPushItem } from '../resources/skills.js';
+import { contentHash } from '../resources/delivered-copies.js';
+import { log } from '../utils/logger.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
+import type { TeamaiConfig, LocalConfig } from '../types.js';
+
+describe('skill push item construction', () => {
+  it.each([
+    ['scanned kept skill', 'modified', 'svc-a', true],
+    ['explicit --skill fallback', 'modified', 'svc-a', true],
+    ['legacy duplicate resolution', 'modified', 'svc-a', true],
+    ['new resource awaiting placement', 'new', undefined, false],
+  ] as const)('%s keeps its origin and relocation fields together', (_path, status, namespace, inactive) => {
+    const item = createSkillPushItem({
+      name: 'a-skill',
+      sourcePath: '/project/skills/a-skill',
+      status,
+      namespace,
+      ...(inactive ? { fromInactiveNamespace: true as const } : {}),
+    });
+
+    expect(item).toMatchObject({
+      name: 'a-skill',
+      type: 'skills',
+      sourcePath: '/project/skills/a-skill',
+      relativePath: namespace ? `skills/${namespace}/a-skill` : 'skills/a-skill',
+      status,
+      namespace,
+      ...(inactive ? { fromInactiveNamespace: true } : {}),
+    });
+    expect(item!.fromInactiveNamespace).toBe(inactive ? true : undefined);
+  });
+});
+
+describe('SkillsHandler.scanLocalForPush', () => {
+  let tmpDir: string;
+  let homeDir: string;
+  let handler: SkillsHandler;
+  let teamConfig: TeamaiConfig;
+  let localConfig: LocalConfig;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skills-test-'));
+    homeDir = path.join(tmpDir, 'home');
+
+    const repoPath = path.join(tmpDir, 'team-repo');
+    await fse.ensureDir(path.join(repoPath, 'skills'));
+    await fse.ensureDir(path.join(homeDir, '.claude', 'skills'));
+
+    vi.stubEnv('HOME', homeDir);
+
+    handler = new SkillsHandler();
+
+    teamConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit' as const,
+      reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: {
+        claude: { skills: '.claude/skills', rules: '.claude/rules' },
+      },
+    };
+
+    localConfig = {
+      repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+additionalRoles: [],
+scope: 'user',
+    };
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it.each([
+    ['shared-root origin with a newly active namespace copy', 'shared-root'],
+    ['two tools with distinct proven destinations', 'distinct'],
+    ['two different edits of one proven destination', 'same-destination-different'],
+    ['identical edits of one proven destination', 'same-destination-identical'],
+  ] as const)('preserves delivered copy identity: %s', async (_label, scenario) => {
+    const repoPath = localConfig.repo.localPath;
+    const teamSkill = (name: string, content: string, namespace?: string): string => {
+      const dir = path.join(repoPath, 'skills', ...(namespace ? [namespace] : []), name);
+      fse.ensureDirSync(dir);
+      fse.writeFileSync(path.join(dir, 'SKILL.md'), content);
+      return dir;
+    };
+    const original = (name: string, tag: string): string => `---\nname: ${name}\ndescription: ${name}\n---\n\n# ${tag}\n`;
+    const projectManifest = { version: 1, projects: [
+      { id: 'svc-a', resources: { skills: ['svc-a'] } },
+      { id: 'svc-b', resources: { skills: ['svc-b'] } },
+    ] };
+    await fse.outputFile(path.join(repoPath, 'manifest', 'projects.yaml'), YAML.stringify(projectManifest));
+    const deliveries: Record<string, string> = {};
+    const addLocalCopy = async (tool: 'claude' | 'codex', teamDir: string, content: string): Promise<string> => {
+      const skillsRoot = path.join(homeDir, tool === 'claude' ? '.claude/skills' : '.codex/skills');
+      const dest = path.join(skillsRoot, 'foo');
+      await fse.ensureDir(dest);
+      await fse.writeFile(path.join(dest, 'SKILL.md'), content);
+      deliveries[path.join(dest, 'SKILL.md')] = contentHash(await fse.readFile(path.join(teamDir, 'SKILL.md')));
+      return dest;
+    };
+    let copies: string[] = [];
+    if (scenario === 'shared-root') {
+      const root = teamSkill('foo', original('foo', 'shared root'));
+      teamSkill('foo', original('foo', 'active namespace'), 'svc-b');
+      localConfig.projects = ['svc-b'];
+      await addLocalCopy('claude', root, `${original('foo', 'shared root')}\nMember edit.\n`);
+    } else {
+      const a = teamSkill('foo', original('foo', 'svc-a'), 'svc-a');
+      const b = teamSkill('foo', original('foo', 'svc-b'), 'svc-b');
+      localConfig.projects = ['svc-a', 'svc-b'];
+      teamConfig.toolPaths.codex = { skills: '.codex/skills' };
+      if (scenario === 'distinct') {
+        await addLocalCopy('claude', a, `${original('foo', 'svc-a')}\nClaude edit.\n`);
+        await addLocalCopy('codex', b, `${original('foo', 'svc-b')}\nCodex edit.\n`);
+      } else {
+        const left = scenario === 'same-destination-identical'
+          ? `${original('foo', 'svc-a')}\nShared edit.\n`
+          : `${original('foo', 'svc-a')}\nClaude edit.\n`;
+        const right = scenario === 'same-destination-identical'
+          ? left
+          : `${original('foo', 'svc-a')}\nCodex edit.\n`;
+        copies = [
+          await addLocalCopy('claude', a, left),
+          await addLocalCopy('codex', a, right),
+        ];
+        // A copy's age is its newest file's mtime, not its directory's.
+        const newer = new Date(Date.now() + 1_000);
+        await fse.utimes(path.join(copies[1], 'SKILL.md'), newer, newer);
+      }
+    }
+    localConfig.enabledAgents = scenario === 'distinct' || scenario.startsWith('same-destination')
+      ? ['claude', 'codex'] : ['claude'];
+    vi.spyOn(await import('../pull.js'), 'deliveredHashes').mockResolvedValue(deliveries);
+    vi.mocked(log.warn).mockClear();
+    await fse.ensureDir(repoPath);
+    commitTeamRepo(repoPath, `r7-${scenario}`);
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    if (scenario === 'shared-root') {
+      expect(items).toHaveLength(1);
+      expect(items[0].relativePath).toBe('skills/foo');
+    } else if (scenario === 'distinct') {
+      expect(items.map((item) => item.relativePath).sort()).toEqual(['skills/svc-a/foo', 'skills/svc-b/foo']);
+    } else {
+      expect(items).toHaveLength(1);
+      expect(items[0].sourcePath).toBe(copies[1]);
+      if (scenario === 'same-destination-different') {
+        expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(copies[0]));
+      } else {
+        expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('another edited copy'));
+      }
+    }
+    vi.restoreAllMocks();
+  });
+
+  it('should detect a new skill with status "new"', async () => {
+    const skillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), '# My Skill');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'my-skill');
+    expect(item).toBeDefined();
+    expect(item!.status).toBe('new');
+  });
+
+  it('refuses deletion of a member-owned leaf link while delivery may keep it', async () => {
+    const skillDir = path.join(homeDir, '.claude', 'skills', 'member-skill');
+    const target = path.join(homeDir, 'my-skills', 'member-skill');
+    await fse.ensureDir(target);
+    await fse.writeFile(path.join(target, 'SKILL.md'), 'member-owned\n');
+    await fse.symlink(target, skillDir, 'dir');
+
+    expect(await allowsSkillDirectory(homeDir, skillDir)).toBe(false);
+    expect(await allowsSkillDirectory(homeDir, skillDir, { keepSkillLink: true })).toBe(true);
+    expect(await mayDeleteSkillCopy(localConfig, skillDir)).toBe(false);
+    expect(await fse.readFile(path.join(target, 'SKILL.md'), 'utf8')).toBe('member-owned\n');
+  });
+
+  it.each([
+    { env: 'COPILOT_HOME', skillPath: 'nested/skills/fixture' },
+    { env: 'COPILOT_HOME', skillPath: 'skills/fixture' },
+    { env: 'HERMES_HOME', skillPath: 'skills/fixture' },
+    { env: 'HERMES_HOME', skillPath: 'skills/ns/fixture' },
+    { env: 'OPENCLAW_WORKSPACE_DIR', skillPath: 'skills/fixture' },
+    { env: 'OPENCLAW_WORKSPACE_DIR', skillPath: 'skills/ns/fixture' },
+  ])('refuses deletion through a linked $env outside home ($skillPath)', async ({ env, skillPath }) => {
+    const toolHome = path.join(tmpDir, 'outside', 'tool-home');
+    const target = path.join(tmpDir, 'elsewhere');
+    await fse.ensureDir(path.join(target, skillPath));
+    await fse.writeFile(path.join(target, skillPath, 'SKILL.md'), 'fixture\n');
+    await fse.ensureDir(path.dirname(toolHome));
+    await fse.symlink(target, toolHome, 'dir');
+    vi.stubEnv(env, toolHome);
+
+    expect(await skillsGuardBase(homeDir, path.join(toolHome, path.dirname(skillPath)))).toBe(path.dirname(toolHome));
+    expect(await mayDeleteSkillCopy(localConfig, path.join(toolHome, skillPath))).toBe(false);
+  });
+
+  it('should NOT detect a skill without SKILL.md', async () => {
+    const skillDir = path.join(homeDir, '.claude/skills', 'no-skillmd');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'README.md'), 'not a skill');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const names = items.map((i) => i.name);
+    expect(names).not.toContain('no-skillmd');
+  });
+
+  it('should detect a modified skill with status "modified"', async () => {
+    // Team repo has v1
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), '# v1');
+
+    // Local has v2
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# v2');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'my-skill');
+    expect(item).toBeDefined();
+    expect(item!.status).toBe('modified');
+  });
+
+  it('should NOT include an unchanged skill', async () => {
+    const content = '# Same Skill';
+
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'same-skill');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), content);
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'same-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), content);
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const names = items.map((i) => i.name);
+    expect(names).not.toContain('same-skill');
+  });
+
+  it('should NOT detect modification when skill only has extra files locally', async () => {
+    // Extra local files (scripts, agents, etc.) should not trigger "modified" status.
+    // Only changes to files that exist in the team repo should count.
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), '# Skill');
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# Skill');
+    await fse.writeFile(path.join(localSkillDir, 'helper.sh'), 'echo hi');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const names = items.map((i) => i.name);
+    expect(names).not.toContain('my-skill');
+  });
+
+  it('should detect modification when team repo file content differs', async () => {
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), '# Skill v1');
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# Skill v2');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'my-skill');
+    expect(item).toBeDefined();
+    expect(item!.status).toBe('modified');
+  });
+
+  it('should not detect a tombstoned skill', async () => {
+    const skillDir = path.join(homeDir, '.claude/skills', 'removed-skill');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), '# Removed');
+
+    // Write tombstone
+    const tombstonePath = path.join(localConfig.repo.localPath, 'skills', '.removed');
+    await fse.writeFile(tombstonePath, 'removed-skill\n');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const names = items.map((i) => i.name);
+    expect(names).not.toContain('removed-skill');
+  });
+
+  it('should not detect a tombstoned modified skill', async () => {
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'removed-skill');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), '# v1');
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'removed-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# v2');
+
+    const tombstonePath = path.join(localConfig.repo.localPath, 'skills', '.removed');
+    await fse.writeFile(tombstonePath, 'removed-skill\n');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const names = items.map((i) => i.name);
+    expect(names).not.toContain('removed-skill');
+  });
+
+  it('should not detect a new skill listed in ~/.teamai/pushignore', async () => {
+    const ignoredSkillDir = path.join(homeDir, '.claude/skills', 'ignored-skill');
+    await fse.ensureDir(ignoredSkillDir);
+    await fse.writeFile(path.join(ignoredSkillDir, 'SKILL.md'), '# Ignored');
+
+    const trackedSkillDir = path.join(homeDir, '.claude/skills', 'tracked-skill');
+    await fse.ensureDir(trackedSkillDir);
+    await fse.writeFile(path.join(trackedSkillDir, 'SKILL.md'), '# Tracked');
+
+    await fse.ensureDir(path.join(homeDir, '.teamai'));
+    await fse.writeFile(path.join(homeDir, '.teamai', 'pushignore'), 'ignored-skill\n');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const names = items.map((i) => i.name);
+    expect(names).not.toContain('ignored-skill');
+    expect(names).toContain('tracked-skill');
+  });
+
+  it('should not detect a modified skill listed in ~/.teamai/pushignore', async () => {
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'ignored-skill');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), '# v1');
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'ignored-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# v2');
+
+    await fse.ensureDir(path.join(homeDir, '.teamai'));
+    await fse.writeFile(path.join(homeDir, '.teamai', 'pushignore'), '\n  ignored-skill  \n');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const names = items.map((i) => i.name);
+    expect(names).not.toContain('ignored-skill');
+  });
+
+  it('never offers the directories earlier releases deployed as new skills to push', async () => {
+    // A member who runs `teamai push --all` after upgrading but before their
+    // next pull still has the legacy trees on disk; they are the CLI's, not theirs.
+    for (const legacy of ['team-wiki-codebase', 'teamai-share-learnings', 'teamai']) {
+      const dir = path.join(homeDir, '.claude/skills', legacy);
+      await fse.ensureDir(dir);
+      await fse.writeFile(path.join(dir, 'SKILL.md'), '# packaged by an earlier release');
+    }
+    const mine = path.join(homeDir, '.claude/skills', 'teamai-workflow');
+    await fse.ensureDir(mine);
+    await fse.writeFile(path.join(mine, 'SKILL.md'), '# mine');
+
+    const names = (await handler.scanLocalForPush(teamConfig, localConfig)).map((i) => i.name);
+    expect(names).not.toContain('team-wiki-codebase');
+    expect(names).not.toContain('teamai-share-learnings');
+    expect(names).not.toContain('teamai');
+    expect(names).toContain('teamai-workflow');
+  });
+
+  it('never offers a skill pull generated from a workflow, edited or not', async () => {
+    const generated = path.join(homeDir, '.claude/skills', 'workflow-ship');
+    await fse.ensureDir(generated);
+    await fse.writeFile(path.join(generated, 'SKILL.md'), `---\nname: workflow-ship\ndescription: Ship it.\nmetadata:\n  teamai-generated: workflow/ship sha256:${'0'.repeat(64)}\n---\nEdited.\n`);
+    const unmarked = path.join(homeDir, '.claude/skills', 'workflow-build');
+    await fse.ensureDir(unmarked);
+    await fse.writeFile(path.join(unmarked, 'SKILL.md'), '---\nname: workflow-build\ndescription: Mine.\n---\nMine.\n');
+
+    const names = (await handler.scanLocalForPush(teamConfig, localConfig)).map((i) => i.name);
+    expect(names).not.toContain('workflow-ship');
+    expect(names).toContain('workflow-build');
+  });
+
+  it('should detect both new and modified skills together', async () => {
+    // Modified
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'existing');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), '# v1');
+
+    const localExisting = path.join(homeDir, '.claude/skills', 'existing');
+    await fse.ensureDir(localExisting);
+    await fse.writeFile(path.join(localExisting, 'SKILL.md'), '# v2');
+
+    // New
+    const localNew = path.join(homeDir, '.claude/skills', 'brand-new');
+    await fse.ensureDir(localNew);
+    await fse.writeFile(path.join(localNew, 'SKILL.md'), '# New');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.find((i) => i.name === 'existing')?.status).toBe('modified');
+    expect(items.find((i) => i.name === 'brand-new')?.status).toBe('new');
+  });
+
+  it('should pick the modified version from the tool dir with latest mtime across multiple tools', async () => {
+    await fse.ensureDir(path.join(homeDir, '.codex', 'skills'));
+    teamConfig.toolPaths.codex = { skills: '.codex/skills', rules: '.codex/rules' };
+
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'shared');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), '# original');
+
+    // claude dir has an older modification
+    const claudeDir = path.join(homeDir, '.claude/skills', 'shared');
+    await fse.ensureDir(claudeDir);
+    await fse.writeFile(path.join(claudeDir, 'SKILL.md'), '# claude-modified');
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // codex dir has a newer modification
+    const codexDir = path.join(homeDir, '.codex/skills', 'shared');
+    await fse.ensureDir(codexDir);
+    await fse.writeFile(path.join(codexDir, 'SKILL.md'), '# codex-modified');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'shared');
+    expect(item).toBeDefined();
+    expect(item!.status).toBe('modified');
+    expect(item!.sourcePath).toBe(codexDir);
+  });
+
+  it('should detect modification even if only one tool dir differs and others match', async () => {
+    await fse.ensureDir(path.join(homeDir, '.codex', 'skills'));
+    teamConfig.toolPaths.codex = { skills: '.codex/skills', rules: '.codex/rules' };
+
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'shared');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), '# original');
+
+    // claude matches team repo
+    const claudeDir = path.join(homeDir, '.claude/skills', 'shared');
+    await fse.ensureDir(claudeDir);
+    await fse.writeFile(path.join(claudeDir, 'SKILL.md'), '# original');
+
+    // codex has a modification
+    const codexDir = path.join(homeDir, '.codex/skills', 'shared');
+    await fse.ensureDir(codexDir);
+    await fse.writeFile(path.join(codexDir, 'SKILL.md'), '# modified');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'shared');
+    expect(item).toBeDefined();
+    expect(item!.status).toBe('modified');
+    expect(item!.sourcePath).toBe(codexDir);
+  });
+
+  it('should NOT detect modification when only CONTRIBUTORS differs in team repo', async () => {
+    const content = '# Same Skill';
+
+    const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), content);
+    await fse.writeFile(path.join(teamSkillDir, 'CONTRIBUTORS'), 'alice\nbob\n');
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), content);
+    // Local has no CONTRIBUTORS file
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const names = items.map((i) => i.name);
+    expect(names).not.toContain('my-skill');
+  });
+
+  it('should not crash when a toolPath has no skills property', async () => {
+    // Add a tool entry without a skills path (e.g., a hypothetical tool with only rules)
+    (teamConfig.toolPaths as Record<string, unknown>)['no-skills-tool'] = { rules: '.no-skills-tool/rules' };
+
+    const skillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), '# My Skill');
+
+    // Should not throw and should still find skills from other tools
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.find((i) => i.name === 'my-skill')).toBeDefined();
+  });
+
+  it('scans role-scoped team skill namespaces when a primary role is configured', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = ['pm'];
+    await fse.ensureDir(path.join(localConfig.repo.localPath, 'skills', 'hai', 'role-skill'));
+    await fse.writeFile(path.join(localConfig.repo.localPath, 'skills', 'hai', 'role-skill', 'SKILL.md'), '# v1');
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'role-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# v2');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.find((item) => item.name === 'role-skill')?.status).toBe('modified');
+  });
+
+  it('keeps the role-id fallback when a valid roles.yaml no longer lists the role', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+    await fse.outputFile(
+      path.join(localConfig.repo.localPath, 'manifest', 'roles.yaml'),
+      'version: 1\nroles:\n  - id: pm\n    resources:\n      knowledge: []\n      skills: [pm]\n',
+    );
+    await fse.outputFile(path.join(localConfig.repo.localPath, 'skills', 'hai', 'role-skill', 'SKILL.md'), '# v1');
+    await fse.outputFile(path.join(homeDir, '.claude/skills', 'role-skill', 'SKILL.md'), '# v2');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.find((item) => item.name === 'role-skill')?.status).toBe('modified');
+  });
+
+  it('stops the scan when roles.yaml exists but does not parse, instead of guessing', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+    await fse.outputFile(path.join(localConfig.repo.localPath, 'manifest', 'roles.yaml'), 'version: 1\nroles: [\n');
+
+    await expect(handler.scanLocalForPush(teamConfig, localConfig)).rejects.toThrow(/Invalid roles manifest YAML/);
+  });
+
+  it('refuses a role id that cannot be a namespace when roles.yaml is absent, instead of joining it onto the repo', async () => {
+    localConfig.primaryRole = '../../outside';
+    localConfig.additionalRoles = [];
+
+    await expect(handler.scanLocalForPush(teamConfig, localConfig)).rejects.toThrow(
+      /Invalid role id used as a skills namespace "\.\.\/\.\.\/outside"/,
+    );
+  });
+
+  it('blocks skills that exist in non-allowed namespaces', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+
+    // Create a skill in a non-allowed namespace (thpc_dev)
+    await fse.ensureDir(path.join(localConfig.repo.localPath, 'skills', 'thpc_dev', 'blocked-skill'));
+    await fse.writeFile(path.join(localConfig.repo.localPath, 'skills', 'thpc_dev', 'blocked-skill', 'SKILL.md'), '# v1');
+
+    // Create the same skill locally
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'blocked-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# v2 - local version');
+
+    // Scan should NOT include this skill because it's in a non-allowed namespace
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.find((item) => item.name === 'blocked-skill')).toBeUndefined();
+  });
+
+  it('recognizes root-level flat skills in role mode and does not mark them as new', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+
+    // Create a root-level flat skill in team repo (has SKILL.md directly)
+    const rootSkillDir = path.join(localConfig.repo.localPath, 'skills', 'autoresearch-skill');
+    await fse.ensureDir(rootSkillDir);
+    await fse.writeFile(path.join(rootSkillDir, 'SKILL.md'), '# Root skill');
+
+    // Create the same skill locally with identical content
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'autoresearch-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# Root skill');
+
+    // Should NOT appear in push candidates since local == team repo
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.find((item) => item.name === 'autoresearch-skill')).toBeUndefined();
+  });
+
+  it('detects modified root-level flat skill in role mode', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+
+    // Create a root-level flat skill in team repo
+    const rootSkillDir = path.join(localConfig.repo.localPath, 'skills', 'autoresearch-skill');
+    await fse.ensureDir(rootSkillDir);
+    await fse.writeFile(path.join(rootSkillDir, 'SKILL.md'), '# v1');
+
+    // Create the same skill locally with modified content
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'autoresearch-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# v2 — modified locally');
+
+    // Should appear as "modified", not "new"
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'autoresearch-skill');
+    expect(item).toBeDefined();
+    expect(item!.status).toBe('modified');
+    // Root-level flat skills have no namespace
+    expect(item!.namespace).toBeUndefined();
+  });
+
+  it('writes an edited overridden skill back to its role namespace and leaves the root untouched', async () => {
+    // The active hai/review replaces the root review for this member (#707),
+    // so the local copy is hai's.
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+    const repoSkills = path.join(localConfig.repo.localPath, 'skills');
+    await fse.outputFile(path.join(repoSkills, 'review', 'SKILL.md'), '# Root review');
+    await fse.outputFile(path.join(repoSkills, 'review', 'root-only.md'), 'root file');
+    await fse.outputFile(path.join(repoSkills, 'hai', 'review', 'SKILL.md'), '# hai review');
+    await fse.outputFile(path.join(homeDir, '.claude/skills', 'review', 'SKILL.md'), '# hai review, edited');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'review');
+    expect(item?.status).toBe('modified');
+    expect(item?.namespace).toBe('hai');
+    expect(item?.relativePath).toBe('skills/hai/review');
+
+    for (const pushed of items) await handler.pushItem(pushed, teamConfig, localConfig);
+    expect(await fse.readFile(path.join(repoSkills, 'hai', 'review', 'SKILL.md'), 'utf8')).toContain('# hai review, edited');
+    expect(await fse.readFile(path.join(repoSkills, 'review', 'SKILL.md'), 'utf8')).toBe('# Root review');
+    expect(await fse.pathExists(path.join(repoSkills, 'review', 'root-only.md'))).toBe(true);
+  });
+
+  // Pull does not deliver a directory without SKILL.md (#707), so push must
+  // not take it for the member's copy: that would publish the root skill into
+  // it, and make it a namespace skill that replaces the root one.
+  it('does not map a skill to a role namespace directory that has no SKILL.md', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+    const repoSkills = path.join(localConfig.repo.localPath, 'skills');
+    await fse.outputFile(path.join(repoSkills, 'review', 'SKILL.md'), '# Root review');
+    await fse.outputFile(path.join(repoSkills, 'hai', 'review', 'notes.md'), 'draft notes');
+    await fse.outputFile(path.join(homeDir, '.claude/skills', 'review', 'SKILL.md'), '# Root review');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    const item = items.find((i) => i.name === 'review');
+    expect(item?.status).not.toBe('modified');
+    expect(item?.relativePath).not.toBe('skills/hai/review');
+  });
+
+  it('scans project skill namespaces as well as role ones', async () => {
+    const repoPath = localConfig.repo.localPath;
+    await fse.outputFile(path.join(repoPath, 'manifest', 'projects.yaml'), [
+      'version: 1',
+      'projects:',
+      '  - id: shop',
+      '    resources:',
+      '      skills: [checkout]',
+      '  - id: finance',
+      '    resources:',
+      '      skills: [billing]',
+    ].join('\n'));
+    localConfig.projects = ['shop'];
+    // `billing` sorts first; only the active project's copy is this member's.
+    await fse.outputFile(path.join(repoPath, 'skills', 'billing', 'pay', 'SKILL.md'), '# billing pay');
+    await fse.outputFile(path.join(repoPath, 'skills', 'checkout', 'pay', 'SKILL.md'), '# checkout pay');
+    await fse.outputFile(path.join(homeDir, '.claude/skills', 'pay', 'SKILL.md'), '# checkout pay, edited');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'pay');
+    expect(item?.status).toBe('modified');
+    expect(item?.relativePath).toBe('skills/checkout/pay');
+  });
+
+  it('detects modified skill in namespaced team repo when no primaryRole is set', async () => {
+    // No primaryRole — legacy mode
+    // Team repo uses namespaced layout: skills/tencent/tgit/SKILL.md
+    const namespacedSkillDir = path.join(localConfig.repo.localPath, 'skills', 'tencent', 'tgit');
+    await fse.ensureDir(namespacedSkillDir);
+    await fse.writeFile(path.join(namespacedSkillDir, 'SKILL.md'), '# v1');
+
+    // Local has modified version
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'tgit');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# v2');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'tgit');
+    expect(item).toBeDefined();
+    expect(item!.status).toBe('modified');
+    // Modified skill should carry its original namespace from team repo
+    expect(item!.namespace).toBe('tencent');
+    expect(item!.relativePath).toBe('skills/tencent/tgit');
+  });
+
+  it('skips an undelivered copy of a name several namespaces hold, advising what can push it', async () => {
+    for (const namespace of ['svc-a', 'svc-b']) {
+      const dir = path.join(localConfig.repo.localPath, 'skills', namespace, 'foo');
+      await fse.ensureDir(dir);
+      await fse.writeFile(path.join(dir, 'SKILL.md'), `# ${namespace}`);
+    }
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'foo');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# edited');
+    vi.mocked(log.warn).mockClear();
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    expect(items.filter((i) => i.name === 'foo')).toEqual([]);
+    // The scan never sees --role, so the advice names the --skill run that does.
+    const warning = vi.mocked(log.warn).mock.calls.map(([message]) => String(message))
+      .find((message) => message.includes('several skills with this name'));
+    expect(warning).toContain(`teamai push --skill ${localSkillDir} --role <ns>`);
+  });
+
+  it('detects unchanged skill in namespaced team repo when no primaryRole is set', async () => {
+    // No primaryRole — legacy mode
+    const content = '# Same Skill';
+    const namespacedSkillDir = path.join(localConfig.repo.localPath, 'skills', 'tencent', 'same-skill');
+    await fse.ensureDir(namespacedSkillDir);
+    await fse.writeFile(path.join(namespacedSkillDir, 'SKILL.md'), content);
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'same-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), content);
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.map((i) => i.name)).not.toContain('same-skill');
+  });
+
+  it('handles mixed flat and namespaced layout without primaryRole', async () => {
+    const flatSkillDir = path.join(localConfig.repo.localPath, 'skills', 'flat-skill');
+    await fse.ensureDir(flatSkillDir);
+    await fse.writeFile(path.join(flatSkillDir, 'SKILL.md'), '# v1');
+
+    // Namespaced skill
+    const nsSkillDir = path.join(localConfig.repo.localPath, 'skills', 'myns', 'ns-skill');
+    await fse.ensureDir(nsSkillDir);
+    await fse.writeFile(path.join(nsSkillDir, 'SKILL.md'), '# v1');
+
+    // Local has modified versions of both
+    const localFlat = path.join(homeDir, '.claude/skills', 'flat-skill');
+    await fse.ensureDir(localFlat);
+    await fse.writeFile(path.join(localFlat, 'SKILL.md'), '# v2');
+
+    const localNs = path.join(homeDir, '.claude/skills', 'ns-skill');
+    await fse.ensureDir(localNs);
+    await fse.writeFile(path.join(localNs, 'SKILL.md'), '# v2');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const flatItem = items.find((i) => i.name === 'flat-skill');
+    const nsItem = items.find((i) => i.name === 'ns-skill');
+    expect(flatItem?.status).toBe('modified');
+    expect(flatItem?.namespace).toBeUndefined(); // flat skill has no namespace
+    expect(nsItem?.status).toBe('modified');
+    expect(nsItem?.namespace).toBe('myns'); // carries original namespace
+    expect(nsItem?.relativePath).toBe('skills/myns/ns-skill');
+  });
+
+  it('does not treat namespace directories as new skills', async () => {
+    // Team repo has namespace dir "tencent" with a skill inside
+    const nsSkillDir = path.join(localConfig.repo.localPath, 'skills', 'tencent', 'tgit');
+    await fse.ensureDir(nsSkillDir);
+    await fse.writeFile(path.join(nsSkillDir, 'SKILL.md'), '# TGit');
+
+    // Local has a completely unrelated skill
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-new-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# New');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    // "tencent" should NOT appear as a skill name
+    expect(items.map((i) => i.name)).not.toContain('tencent');
+    // "my-new-skill" should be detected as new with no namespace
+    const newItem = items.find((i) => i.name === 'my-new-skill');
+    expect(newItem?.status).toBe('new');
+    expect(newItem?.namespace).toBeUndefined();
+  });
+
+  it('allows skills in allowed namespaces and new skills', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+
+    // Create a skill in an allowed namespace
+    await fse.ensureDir(path.join(localConfig.repo.localPath, 'skills', 'hai', 'allowed-skill'));
+    await fse.writeFile(path.join(localConfig.repo.localPath, 'skills', 'hai', 'allowed-skill', 'SKILL.md'), '# v1');
+
+    // Create a new skill locally that doesn't exist in team repo
+    const newSkillDir = path.join(homeDir, '.claude/skills', 'new-skill');
+    await fse.ensureDir(newSkillDir);
+    await fse.writeFile(path.join(newSkillDir, 'SKILL.md'), '# new');
+
+    // Create local version of allowed skill (modified)
+    const localAllowedDir = path.join(homeDir, '.claude/skills', 'allowed-skill');
+    await fse.ensureDir(localAllowedDir);
+    await fse.writeFile(path.join(localAllowedDir, 'SKILL.md'), '# v2 - modified');
+
+    // Scan should include allowed skill (modified) and new skill
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.find((item) => item.name === 'allowed-skill')?.status).toBe('modified');
+    expect(items.find((item) => item.name === 'new-skill')?.status).toBe('new');
+  });
+});
+
+describe('SkillsHandler.pushItem', () => {
+  let tmpDir: string;
+  let homeDir: string;
+  let handler: SkillsHandler;
+  let teamConfig: TeamaiConfig;
+  let localConfig: LocalConfig;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skills-push-'));
+    homeDir = path.join(tmpDir, 'home');
+
+    const repoPath = path.join(tmpDir, 'team-repo');
+    await fse.ensureDir(path.join(repoPath, 'skills'));
+    await fse.ensureDir(path.join(homeDir, '.claude', 'skills'));
+
+    vi.stubEnv('HOME', homeDir);
+
+    handler = new SkillsHandler();
+
+    teamConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit' as const,
+      reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: {
+        claude: { skills: '.claude/skills', rules: '.claude/rules' },
+      },
+    };
+
+    localConfig = {
+      repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+additionalRoles: [],
+scope: 'user',
+    };
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it('should create CONTRIBUTORS file with current user on first push', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+
+    const item = {
+      name: 'my-skill',
+      type: 'skills' as const,
+      sourcePath: localSkillDir,
+      relativePath: 'skills/my-skill',
+    };
+
+    await handler.pushItem(item, teamConfig, localConfig);
+
+    const contribPath = path.join(localConfig.repo.localPath, 'skills', 'my-skill', 'CONTRIBUTORS');
+    const content = await fse.readFile(contribPath, 'utf-8');
+    expect(content).toBe('testuser\n');
+  });
+
+  it('does not push a link inside the skill into the team repo, and names it (#993)', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+    const outside = path.join(tmpDir, 'notes.md');
+    await fse.writeFile(outside, 'private');
+    await fse.symlink(outside, path.join(localSkillDir, 'notes.md'));
+    const warn = vi.spyOn(log, 'warn');
+
+    await handler.pushItem({ name: 'my-skill', type: 'skills' as const, sourcePath: localSkillDir, relativePath: 'skills/my-skill' }, teamConfig, localConfig);
+
+    const pushed = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    expect(await fse.readFile(path.join(pushed, 'SKILL.md'), 'utf-8')).toContain('# My Skill');
+    expect(await fse.pathExists(path.join(pushed, 'notes.md'))).toBe(false);
+    expect(warn.mock.calls.flat().join('\n')).toContain('notes.md');
+  });
+
+  it('should not duplicate username on repeated push', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+
+    const item = {
+      name: 'my-skill',
+      type: 'skills' as const,
+      sourcePath: localSkillDir,
+      relativePath: 'skills/my-skill',
+    };
+
+    await handler.pushItem(item, teamConfig, localConfig);
+    await handler.pushItem(item, teamConfig, localConfig);
+
+    const contribPath = path.join(localConfig.repo.localPath, 'skills', 'my-skill', 'CONTRIBUTORS');
+    const content = await fse.readFile(contribPath, 'utf-8');
+    expect(content).toBe('testuser\n');
+  });
+
+  it('should append new user to existing CONTRIBUTORS', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+
+    // Pre-seed CONTRIBUTORS in the team repo destination
+    const destDir = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    await fse.ensureDir(destDir);
+    await fse.writeFile(path.join(destDir, 'CONTRIBUTORS'), 'alice\n');
+
+    const item = {
+      name: 'my-skill',
+      type: 'skills' as const,
+      sourcePath: localSkillDir,
+      relativePath: 'skills/my-skill',
+    };
+
+    await handler.pushItem(item, teamConfig, localConfig);
+
+    const contribPath = path.join(destDir, 'CONTRIBUTORS');
+    const content = await fse.readFile(contribPath, 'utf-8');
+    expect(content).toBe('alice\ntestuser\n');
+  });
+
+  it('should mirror deleted local skill files without removing CONTRIBUTORS', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(path.join(localSkillDir, 'references'));
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+    await fse.writeFile(path.join(localSkillDir, 'references', 'new.md'), 'new');
+
+    const destDir = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    await fse.ensureDir(path.join(destDir, 'references'));
+    await fse.writeFile(path.join(destDir, 'SKILL.md'), '# My Skill');
+    await fse.writeFile(path.join(destDir, 'references', 'old.md'), 'old');
+    await fse.writeFile(path.join(destDir, 'CONTRIBUTORS'), 'alice\n');
+
+    await handler.pushItem({
+      name: 'my-skill',
+      type: 'skills',
+      sourcePath: localSkillDir,
+      relativePath: 'skills/my-skill',
+    }, teamConfig, localConfig);
+
+    expect(await fse.pathExists(path.join(destDir, 'references', 'old.md'))).toBe(false);
+    expect(await fse.readFile(path.join(destDir, 'references', 'new.md'), 'utf-8')).toBe('new');
+    expect(await fse.readFile(path.join(destDir, 'CONTRIBUTORS'), 'utf-8')).toBe('alice\ntestuser\n');
+  });
+
+  it('should preserve existing contributors when user already listed', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+
+    const destDir = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    await fse.ensureDir(destDir);
+    await fse.writeFile(path.join(destDir, 'CONTRIBUTORS'), 'alice\ntestuser\n');
+
+    const item = {
+      name: 'my-skill',
+      type: 'skills' as const,
+      sourcePath: localSkillDir,
+      relativePath: 'skills/my-skill',
+    };
+
+    await handler.pushItem(item, teamConfig, localConfig);
+
+    const contribPath = path.join(destDir, 'CONTRIBUTORS');
+    const content = await fse.readFile(contribPath, 'utf-8');
+    expect(content).toBe('alice\ntestuser\n');
+  });
+
+  it('pushes role-scoped skills into skills/<role>/<name>', async () => {
+    localConfig.primaryRole = 'hai';
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+
+    const item = {
+      name: 'my-skill',
+      type: 'skills' as const,
+      sourcePath: localSkillDir,
+      relativePath: 'skills/hai/my-skill',
+      namespace: 'hai',
+    };
+
+    await handler.pushItem(item, teamConfig, localConfig);
+
+    const contribPath = path.join(localConfig.repo.localPath, 'skills', 'hai', 'my-skill', 'CONTRIBUTORS');
+    const content = await fse.readFile(contribPath, 'utf-8');
+    expect(content).toBe('testuser\n');
+  });
+
+  it('uses relativePath as the push destination instead of re-deriving it from primaryRole', async () => {
+    localConfig.primaryRole = 'backend';
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+
+    const item = {
+      name: 'my-skill',
+      type: 'skills' as const,
+      sourcePath: localSkillDir,
+      relativePath: 'skills/my-skill',
+      status: 'modified' as const,
+    };
+
+    await handler.pushItem(item, teamConfig, localConfig);
+
+    expect(await fse.pathExists(
+      path.join(localConfig.repo.localPath, 'skills', 'my-skill', 'SKILL.md'),
+    )).toBe(true);
+    expect(await fse.pathExists(
+      path.join(localConfig.repo.localPath, 'skills', 'backend', 'my-skill'),
+    )).toBe(false);
+  });
+
+  it('should NOT copy .git directory when skill source is a git repo', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'git-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# Git Skill\nContent here');
+    await fse.writeFile(path.join(localSkillDir, 'helper.py'), 'print("hello")');
+    // Simulate a .git directory (as if skill was cloned from a git repo)
+    await fse.ensureDir(path.join(localSkillDir, '.git', 'objects'));
+    await fse.writeFile(path.join(localSkillDir, '.git', 'HEAD'), 'ref: refs/heads/main');
+
+    const item = {
+      name: 'git-skill',
+      type: 'skills' as const,
+      sourcePath: localSkillDir,
+      relativePath: 'skills/git-skill',
+    };
+
+    await handler.pushItem(item, teamConfig, localConfig);
+
+    const destDir = path.join(localConfig.repo.localPath, 'skills', 'git-skill');
+    expect(await fse.pathExists(path.join(destDir, 'SKILL.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(destDir, 'helper.py'))).toBe(true);
+    expect(await fse.pathExists(path.join(destDir, '.git'))).toBe(false);
+  });
+});
+
+describe('SkillsHandler.readContributors', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-contrib-'));
+  });
+
+  afterEach(async () => {
+    await fse.remove(tmpDir);
+  });
+
+  it('should return contributors from CONTRIBUTORS file', async () => {
+    const skillDir = path.join(tmpDir, 'my-skill');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'CONTRIBUTORS'), 'alice\nbob\n');
+
+    const contributors = await SkillsHandler.readContributors(skillDir);
+    expect(contributors).toEqual(['alice', 'bob']);
+  });
+
+  it('should return empty array when CONTRIBUTORS does not exist', async () => {
+    const skillDir = path.join(tmpDir, 'my-skill');
+    await fse.ensureDir(skillDir);
+
+    const contributors = await SkillsHandler.readContributors(skillDir);
+    expect(contributors).toEqual([]);
+  });
+
+  it('should handle empty CONTRIBUTORS file', async () => {
+    const skillDir = path.join(tmpDir, 'my-skill');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'CONTRIBUTORS'), '');
+
+    const contributors = await SkillsHandler.readContributors(skillDir);
+    expect(contributors).toEqual([]);
+  });
+
+  it('should trim whitespace and skip blank lines', async () => {
+    const skillDir = path.join(tmpDir, 'my-skill');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'CONTRIBUTORS'), '  alice  \n\n  bob  \n\n');
+
+    const contributors = await SkillsHandler.readContributors(skillDir);
+    expect(contributors).toEqual(['alice', 'bob']);
+  });
+});
+
+describe('scanTeamRepoNamespaces', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-ns-'));
+  });
+
+  afterEach(async () => {
+    await fse.remove(tmpDir);
+  });
+
+  it('returns namespace directories (those without SKILL.md)', async () => {
+    const repoPath = path.join(tmpDir, 'repo');
+    // Namespace dir
+    await fse.ensureDir(path.join(repoPath, 'skills', 'tencent', 'tgit'));
+    await fse.writeFile(path.join(repoPath, 'skills', 'tencent', 'tgit', 'SKILL.md'), '# TGit');
+    // Flat skill
+    await fse.ensureDir(path.join(repoPath, 'skills', 'flat-skill'));
+    await fse.writeFile(path.join(repoPath, 'skills', 'flat-skill', 'SKILL.md'), '# Flat');
+
+    const namespaces = await scanTeamRepoNamespaces(repoPath);
+    expect(namespaces).toContain('tencent');
+    expect(namespaces).not.toContain('flat-skill');
+  });
+
+  it('returns empty array for purely flat layout', async () => {
+    const repoPath = path.join(tmpDir, 'repo');
+    await fse.ensureDir(path.join(repoPath, 'skills', 'skill-a'));
+    await fse.writeFile(path.join(repoPath, 'skills', 'skill-a', 'SKILL.md'), '# A');
+    await fse.ensureDir(path.join(repoPath, 'skills', 'skill-b'));
+    await fse.writeFile(path.join(repoPath, 'skills', 'skill-b', 'SKILL.md'), '# B');
+
+    const namespaces = await scanTeamRepoNamespaces(repoPath);
+    expect(namespaces).toEqual([]);
+  });
+
+  it('returns empty array when skills dir does not exist', async () => {
+    const repoPath = path.join(tmpDir, 'repo');
+    await fse.ensureDir(repoPath);
+
+    const namespaces = await scanTeamRepoNamespaces(repoPath);
+    expect(namespaces).toEqual([]);
+  });
+
+  it('ignores a leftover directory that holds no skills', async () => {
+    // A skill whose source has empty subdirectories (e.g. an unused assets/)
+    // leaves those untracked, empty shells behind in the team repo working tree
+    // once git switches back to the default branch — git tracks files, not
+    // directories. The shell has no SKILL.md, so it used to be reported as a
+    // namespace and the next push nested every new skill inside it.
+    const repoPath = path.join(tmpDir, 'repo');
+    await fse.ensureDir(path.join(repoPath, 'skills', 'channel-bill-push-test', 'assets'));
+    await fse.ensureDir(path.join(repoPath, 'skills', 'channel-bill-push-test', 'references'));
+
+    const namespaces = await scanTeamRepoNamespaces(repoPath);
+    expect(namespaces).toEqual([]);
+  });
+
+  it('detects multiple namespaces', async () => {
+    const repoPath = path.join(tmpDir, 'repo');
+    await fse.ensureDir(path.join(repoPath, 'skills', 'tencent', 'tgit'));
+    await fse.writeFile(path.join(repoPath, 'skills', 'tencent', 'tgit', 'SKILL.md'), '# TGit');
+    await fse.ensureDir(path.join(repoPath, 'skills', 'hai_dev', 'hai-log'));
+    await fse.writeFile(path.join(repoPath, 'skills', 'hai_dev', 'hai-log', 'SKILL.md'), '# Log');
+
+    const namespaces = await scanTeamRepoNamespaces(repoPath);
+    expect(namespaces).toContain('tencent');
+    expect(namespaces).toContain('hai_dev');
+    expect(namespaces).toHaveLength(2);
+  });
+});
+
+describe('ensureSkillFrontmatter', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-frontmatter-'));
+  });
+
+  afterEach(async () => {
+    await fse.remove(tmpDir);
+  });
+
+  it('injects frontmatter when SKILL.md has none', async () => {
+    const skillDir = path.join(tmpDir, 'my-skill');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), '# My Awesome Skill\n\nDoes cool things.');
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'my-skill');
+    expect(changed).toBe(true);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    const { data, body } = parseFrontmatter(content);
+    expect(data.name).toBe('my-skill');
+    expect(data.description).toBe('My Awesome Skill');
+    // Original content preserved after frontmatter
+    expect(body).toContain('# My Awesome Skill');
+    expect(body).toContain('Does cool things.');
+  });
+
+  it('does not throw or overwrite malformed frontmatter', async () => {
+    const skillDir = path.join(tmpDir, 'malformed');
+    await fse.ensureDir(skillDir);
+    const original = '---\nname: original\ncustom: [\n---\n# Body\n';
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), original);
+
+    await expect(ensureSkillFrontmatter(skillDir, 'malformed')).resolves.toBe(false);
+    await expect(fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf8')).resolves.toBe(original);
+  });
+
+  it('does not throw on scalar frontmatter', async () => {
+    const skillDir = path.join(tmpDir, 'scalar');
+    await fse.ensureDir(skillDir);
+    const original = '---\njust-a-scalar\n---\n# Body\n';
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), original);
+
+    await expect(ensureSkillFrontmatter(skillDir, 'scalar')).resolves.toBe(false);
+    await expect(fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf8')).resolves.toBe(original);
+  });
+
+  it('preserves comments and quoting when adding a missing field', async () => {
+    const skillDir = path.join(tmpDir, 'preserve-format');
+    await fse.ensureDir(skillDir);
+    const original = '---\nname: preserve-format\n# keep me\nallowed-tools: "Bash(git:*)"\n---\n# Body\n';
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), original);
+
+    await expect(ensureSkillFrontmatter(skillDir, 'preserve-format')).resolves.toBe(true);
+    const updated = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf8');
+    expect(updated).toContain('# keep me\nallowed-tools: "Bash(git:*)"');
+    expect(updated).toContain('description: Body\n---\n# Body\n');
+  });
+
+  it('completes byte-identical frontmatter independently for multiple skills', async () => {
+    for (const skillName of ['skill-a', 'skill-b']) {
+      const skillDir = path.join(tmpDir, skillName);
+      await fse.ensureDir(skillDir);
+      await fse.writeFile(path.join(skillDir, 'SKILL.md'), '---\ntrigger: shared\n---\n# Shared Body\n');
+      await expect(ensureSkillFrontmatter(skillDir, skillName)).resolves.toBe(true);
+      const { data } = parseFrontmatter(await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf8'));
+      expect(data).toMatchObject({ trigger: 'shared', name: skillName, description: 'Shared Body' });
+    }
+  });
+
+  it('does not modify SKILL.md when frontmatter already has name and description', async () => {
+    const skillDir = path.join(tmpDir, 'complete-skill');
+    await fse.ensureDir(skillDir);
+    const original = '---\nname: complete-skill\ndescription: Already has metadata\n---\n\n# Complete Skill';
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), original);
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'complete-skill');
+    expect(changed).toBe(false);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    expect(content).toBe(original);
+  });
+
+  it('adds missing name field to existing frontmatter', async () => {
+    const skillDir = path.join(tmpDir, 'no-name');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(
+      path.join(skillDir, 'SKILL.md'),
+      '---\ndescription: Has description only\n---\n\n# No Name Skill',
+    );
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'no-name');
+    expect(changed).toBe(true);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    const { data } = parseFrontmatter(content);
+    expect(data.name).toBe('no-name');
+    expect(data.description).toBe('Has description only');
+  });
+
+  it('adds missing description field to existing frontmatter', async () => {
+    const skillDir = path.join(tmpDir, 'no-desc');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: no-desc\n---\n\n# A Skill Without Description',
+    );
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'no-desc');
+    expect(changed).toBe(true);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    const { data } = parseFrontmatter(content);
+    expect(data.name).toBe('no-desc');
+    expect(typeof data.description).toBe('string');
+    expect(String(data.description).length).toBeGreaterThan(0);
+  });
+
+  it('uses first non-empty line when no heading is found', async () => {
+    const skillDir = path.join(tmpDir, 'no-heading');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(
+      path.join(skillDir, 'SKILL.md'),
+      'This skill does something interesting and useful for the team.',
+    );
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'no-heading');
+    expect(changed).toBe(true);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    const { data } = parseFrontmatter(content);
+    expect(data.description).toBe('This skill does something interesting and useful for the team.');
+  });
+
+  it('falls back to skill name when content is too short', async () => {
+    const skillDir = path.join(tmpDir, 'short');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), 'Hi');
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'short');
+    expect(changed).toBe(true);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    const { data } = parseFrontmatter(content);
+    expect(data.description).toBe('short skill');
+  });
+
+  it('returns false for missing SKILL.md', async () => {
+    const skillDir = path.join(tmpDir, 'empty');
+    await fse.ensureDir(skillDir);
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'empty');
+    expect(changed).toBe(false);
+  });
+
+  it('truncates very long descriptions', async () => {
+    const skillDir = path.join(tmpDir, 'long-desc');
+    await fse.ensureDir(skillDir);
+    const longLine = 'A'.repeat(100);
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), longLine);
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'long-desc');
+    expect(changed).toBe(true);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    const { data } = parseFrontmatter(content);
+    const desc = String(data.description ?? '');
+    expect(desc.length).toBeLessThanOrEqual(80);
+    expect(desc).toContain('...');
+  });
+
+  it('pushItem auto-injects frontmatter for skills without it', async () => {
+    const homeDir = path.join(tmpDir, 'home');
+    const repoPath = path.join(tmpDir, 'team-repo');
+    await fse.ensureDir(path.join(repoPath, 'skills'));
+    await fse.ensureDir(path.join(homeDir, '.claude', 'skills'));
+
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'bare-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# Bare Skill\n\nNo frontmatter here.');
+
+    const handler = new SkillsHandler();
+    const teamConfig: TeamaiConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit' as const,
+      reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: { claude: { skills: '.claude/skills', rules: '.claude/rules' } },
+    };
+    const localConfig: LocalConfig = {
+      repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      additionalRoles: [],
+      scope: 'user',
+    };
+
+    const item = {
+      name: 'bare-skill',
+      type: 'skills' as const,
+      sourcePath: localSkillDir,
+      relativePath: 'skills/bare-skill',
+    };
+
+    await handler.pushItem(item, teamConfig, localConfig);
+
+    // Verify frontmatter was injected in the team repo copy
+    const pushedContent = await fse.readFile(
+      path.join(repoPath, 'skills', 'bare-skill', 'SKILL.md'),
+      'utf-8',
+    );
+    const { data, body } = parseFrontmatter(pushedContent);
+    expect(data.name).toBe('bare-skill');
+    expect(data.description).toBe('Bare Skill');
+    expect(body).toContain('# Bare Skill');
+  });
+
+  it('does not double-inject frontmatter for CRLF line endings', async () => {
+    const skillDir = path.join(tmpDir, 'crlf-skill');
+    await fse.ensureDir(skillDir);
+    const crlf = '---\r\nname: crlf-skill\r\ndescription: CRLF Skill\r\n---\r\n\r\n# CRLF Skill\r\n';
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), crlf);
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'crlf-skill');
+    expect(changed).toBe(false);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    const { data } = parseFrontmatter(content);
+    expect(data.name).toBe('crlf-skill');
+    expect(data.description).toBe('CRLF Skill');
+    // Ensure frontmatter not duplicated
+    const nameMatches = content.match(/name:/g);
+    expect(nameMatches).toHaveLength(1);
+  });
+
+  it('does not double-inject frontmatter for UTF-8 BOM files', async () => {
+    const skillDir = path.join(tmpDir, 'bom-skill');
+    await fse.ensureDir(skillDir);
+    const bom = '﻿---\nname: bom-skill\ndescription: BOM Skill\n---\n\n# BOM Skill\n';
+    await fse.writeFile(path.join(skillDir, 'SKILL.md'), bom);
+
+    const changed = await ensureSkillFrontmatter(skillDir, 'bom-skill');
+    expect(changed).toBe(false);
+
+    const content = await fse.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8');
+    const { data } = parseFrontmatter(content);
+    expect(data.name).toBe('bom-skill');
+    expect(data.description).toBe('BOM Skill');
+    // Ensure frontmatter not duplicated
+    const nameMatches = content.match(/name:/g);
+    expect(nameMatches).toHaveLength(1);
+  });
+});
+
+describe('SkillsHandler.pullItem honors disabledAgents', () => {
+  let tmpDir: string;
+  let homeDir: string;
+  let handler: SkillsHandler;
+  let teamConfig: TeamaiConfig;
+  let localConfig: LocalConfig;
+  let sourcePath: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skills-pull-disabled-'));
+    homeDir = path.join(tmpDir, 'home');
+    const repoPath = path.join(tmpDir, 'team-repo');
+
+    // Both tools installed (root dirs exist) so isToolInstalled alone wouldn't skip either.
+    await fse.ensureDir(path.join(homeDir, '.claude', 'skills'));
+    await fse.ensureDir(path.join(homeDir, '.codex', 'skills'));
+
+    // Team-repo source skill to pull.
+    sourcePath = path.join(repoPath, 'skills', 'team-skill');
+    await fse.ensureDir(sourcePath);
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), '---\nname: team-skill\ndescription: X\n---\n');
+
+    vi.stubEnv('HOME', homeDir);
+    handler = new SkillsHandler();
+
+    teamConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit' as const,
+      reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: {
+        claude: { skills: '.claude/skills', rules: '.claude/rules' },
+        codex: { skills: '.codex/skills', rules: '.codex/rules' },
+      },
+    };
+
+    localConfig = {
+      repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      additionalRoles: [],
+      scope: 'user',
+      disabledAgents: ['claude'],
+    };
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it('skips a disabled tool but still syncs the others', async () => {
+    const item = {
+      name: 'team-skill',
+      type: 'skills' as const,
+      sourcePath,
+      relativePath: 'skills/team-skill',
+    };
+
+    await handler.pullItem(item, teamConfig, localConfig);
+
+    // claude is disabled → not written, even though ~/.claude exists
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'team-skill'))).toBe(false);
+    // codex is not disabled → synced normally
+    expect(await fse.pathExists(path.join(homeDir, '.codex', 'skills', 'team-skill'))).toBe(true);
+  });
+});
+
+describe('SkillsHandler.pullItem through a skills directory that links away', () => {
+  let tmpDir: string;
+  let homeDir: string;
+  let teamConfig: TeamaiConfig;
+  let localConfig: LocalConfig;
+  let sourcePath: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skills-link-away-')));
+    homeDir = path.join(tmpDir, 'home');
+    const repoPath = path.join(tmpDir, 'team-repo');
+    sourcePath = path.join(repoPath, 'skills', 'team-skill');
+    await fse.ensureDir(sourcePath);
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), '---\nname: team-skill\ndescription: X\n---\n');
+    vi.stubEnv('HOME', homeDir);
+    teamConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit' as const,
+      reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: { claude: { skills: '.claude/skills' } },
+    };
+    localConfig = {
+      repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      additionalRoles: [],
+      scope: 'user',
+      disabledAgents: [],
+    };
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it('names the link and where it points, once per pull', async () => {
+    const elsewhere = path.join(tmpDir, 'elsewhere');
+    await fse.ensureDir(elsewhere);
+    await fse.ensureDir(path.join(homeDir, '.claude'));
+    await fse.symlink(elsewhere, path.join(homeDir, '.claude', 'skills'), 'dir');
+    const item = { name: 'team-skill', type: 'skills' as const, sourcePath, relativePath: 'skills/team-skill' };
+    vi.mocked(log.warn).mockClear();
+
+    await new SkillsHandler().pullItem(item, teamConfig, localConfig);
+    await new SkillsHandler().pullItem(item, teamConfig, localConfig);
+
+    const expected = `Skipped team-skill (claude): ${path.join(homeDir, '.claude', 'skills')} links to ${elsewhere}, outside ${homeDir}. `
+      + 'Point the skill directory inside the same repository.';
+    expect(vi.mocked(log.warn).mock.calls.map(([message]) => String(message)).filter((message) => message === expected)).toHaveLength(1);
+    expect(await fse.pathExists(path.join(elsewhere, 'team-skill'))).toBe(false);
+  });
+});
+
+describe('SkillsHandler.pullItem skips hermes when not installed', () => {
+  let tmpDir: string;
+  let homeDir: string;
+  let handler: SkillsHandler;
+  let teamConfig: TeamaiConfig;
+  let localConfig: LocalConfig;
+  let sourcePath: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skills-pull-hermes-'));
+    homeDir = path.join(tmpDir, 'home');
+    const repoPath = path.join(tmpDir, 'team-repo');
+
+    sourcePath = path.join(repoPath, 'skills', 'team-skill');
+    await fse.ensureDir(sourcePath);
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), '---\nname: team-skill\ndescription: X\n---\n');
+
+    vi.stubEnv('HOME', homeDir);
+    handler = new SkillsHandler();
+
+    teamConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit' as const,
+      reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: {
+        hermes: { skills: '.hermes/skills' },
+      },
+    };
+
+    localConfig = {
+      repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      additionalRoles: [],
+      scope: 'user',
+      disabledAgents: [],
+    };
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  const item = () => ({
+    name: 'team-skill',
+    type: 'skills' as const,
+    sourcePath,
+    relativePath: 'skills/team-skill',
+  });
+
+  it('does not create a hermes home that was never installed', async () => {
+    vi.stubEnv('HERMES_HOME', path.join(homeDir, '.hermes'));
+
+    await handler.pullItem(item(), teamConfig, localConfig);
+
+    expect(await fse.pathExists(path.join(homeDir, '.hermes'))).toBe(false);
+  });
+
+  it('syncs normally when the hermes home exists', async () => {
+    const hermesHome = path.join(homeDir, '.hermes');
+    await fse.ensureDir(hermesHome);
+    vi.stubEnv('HERMES_HOME', hermesHome);
+
+    await handler.pullItem(item(), teamConfig, localConfig);
+
+    expect(await fse.pathExists(path.join(hermesHome, 'skills', 'team-skill', 'SKILL.md'))).toBe(true);
+  });
+
+  it('delivers a skill without the links in its source, and names each one it skipped (#993)', async () => {
+    const hermesHome = path.join(homeDir, '.hermes');
+    await fse.ensureDir(hermesHome);
+    vi.stubEnv('HERMES_HOME', hermesHome);
+    const outside = path.join(tmpDir, 'outside.md');
+    await fse.writeFile(outside, 'outside');
+    await fse.symlink(outside, path.join(sourcePath, 'linked.md'));
+    vi.mocked(log.warn).mockClear();
+
+    await handler.pullItem(item(), teamConfig, localConfig);
+
+    const dest = path.join(hermesHome, 'skills', 'team-skill');
+    expect(await fse.pathExists(path.join(dest, 'SKILL.md'))).toBe(true);
+    expect(await fse.lstat(path.join(dest, 'linked.md')).catch(() => null)).toBeNull();
+    expect(vi.mocked(log.warn).mock.calls.map(([message]) => String(message))).toContain(
+      'Skipped linked.md in skills/team-skill: teamai does not deliver links.',
+    );
+  });
+
+  it('keeps a member\'s link at or inside the skill directory when installed without a delivery record (#993)', async () => {
+    const hermesHome = path.join(homeDir, '.hermes');
+    vi.stubEnv('HERMES_HOME', hermesHome);
+    const dest = path.join(hermesHome, 'skills', 'team-skill');
+    const external = path.join(tmpDir, 'my-skill');
+    await fse.outputFile(path.join(external, 'SKILL.md'), 'mine');
+    await fse.ensureDir(path.dirname(dest));
+    await fse.symlink(external, dest, 'dir');
+
+    await handler.pullItem(item(), teamConfig, localConfig);
+
+    expect((await fse.lstat(dest)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(path.join(external, 'SKILL.md'), 'utf8')).toBe('mine');
+
+    await fse.unlink(dest);
+    await fse.ensureDir(dest);
+    await fse.symlink(path.join(external, 'SKILL.md'), path.join(dest, 'SKILL.md'));
+
+    await handler.pullItem(item(), teamConfig, localConfig);
+
+    expect((await fse.lstat(path.join(dest, 'SKILL.md'))).isSymbolicLink()).toBe(true);
+  });
+});
+
+describe('SkillsHandler.pullItem Codex shared skills', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skills-pull-codex-'));
+    vi.stubEnv('HOME', path.join(tmpDir, 'home'));
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it('updates an existing .agents skill and removes an identical TeamAI .codex copy', async () => {
+    const homeDir = path.join(tmpDir, 'home');
+    const sourcePath = path.join(tmpDir, 'team-repo', 'skills', 'team-skill');
+    const sharedSkillPath = path.join(homeDir, '.agents', 'skills', 'team-skill');
+    const codexSkillPath = path.join(homeDir, '.codex', 'skills', 'team-skill');
+    await fse.ensureDir(codexSkillPath);
+    await fse.ensureDir(sharedSkillPath);
+    await fse.ensureDir(sourcePath);
+    const managedContent = '---\nname: team-skill\ndescription: Updated\n---\n';
+    await fse.writeFile(path.join(sharedSkillPath, 'SKILL.md'), managedContent);
+    await fse.writeFile(path.join(codexSkillPath, 'SKILL.md'), managedContent);
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), managedContent);
+    // With no record, the shared copy is teamai's on the team history's proof (#993).
+    commitTeamRepo(path.join(tmpDir, 'team-repo'));
+
+    const teamConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://example.test/team.git',
+      provider: 'git' as const,
+      reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: { codex: { skills: '.codex/skills' } },
+    };
+    const localConfig = {
+      repo: { localPath: path.join(tmpDir, 'team-repo'), remote: 'https://example.test/team.git' },
+      username: 'testuser',
+      updatePolicy: 'auto' as const,
+      additionalRoles: [],
+      scope: 'user' as const,
+    };
+
+    await new SkillsHandler().pullItem({
+      name: 'team-skill',
+      type: 'skills',
+      sourcePath,
+      relativePath: 'skills/team-skill',
+    }, teamConfig, localConfig);
+
+    expect(await fse.readFile(path.join(sharedSkillPath, 'SKILL.md'), 'utf8')).toContain('description: Updated');
+    expect(await fse.pathExists(codexSkillPath)).toBe(false);
+
+    await new SkillsHandler().removeItem('team-skill', teamConfig, localConfig);
+    expect(await fse.pathExists(sharedSkillPath)).toBe(false);
+  });
+
+  it('preserves and reports a different .codex copy beside teamai\'s shared copy', async () => {
+    const homeDir = path.join(tmpDir, 'home');
+    const sourcePath = path.join(tmpDir, 'team-repo', 'skills', 'team-skill');
+    const sharedSkillPath = path.join(homeDir, '.agents', 'skills', 'team-skill');
+    const codexSkillPath = path.join(homeDir, '.codex', 'skills', 'team-skill');
+    await fse.ensureDir(sharedSkillPath);
+    await fse.ensureDir(codexSkillPath);
+    await fse.ensureDir(sourcePath);
+    // The shared copy is an older team version, so teamai's (#993).
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), 'shared copy');
+    commitTeamRepo(path.join(tmpDir, 'team-repo'), 'v1');
+    await fse.writeFile(path.join(sharedSkillPath, 'SKILL.md'), 'shared copy');
+    await fse.writeFile(path.join(codexSkillPath, 'SKILL.md'), 'different copy');
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), '---\nname: team-skill\ndescription: Updated\n---\n');
+    commitTeamRepo(path.join(tmpDir, 'team-repo'), 'v2');
+
+    await new SkillsHandler().pullItem({
+      name: 'team-skill', type: 'skills', sourcePath, relativePath: 'skills/team-skill',
+    }, {
+      team: 'test', description: '', repo: 'https://example.test/team.git', provider: 'git', reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: { codex: { skills: '.codex/skills' } },
+    }, {
+      repo: { localPath: path.join(tmpDir, 'team-repo'), remote: 'https://example.test/team.git' },
+      username: 'testuser', updatePolicy: 'auto', additionalRoles: [], scope: 'user',
+    });
+
+    expect(await fse.readFile(path.join(codexSkillPath, 'SKILL.md'), 'utf8')).toBe('different copy');
+    expect(await fse.readFile(path.join(sharedSkillPath, 'SKILL.md'), 'utf8')).toContain('description: Updated');
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Codex skill conflict for team-skill: keeping different copies'));
+  });
+
+  // Muse Code receives project skills in .agents/skills, so Codex's copy moves there.
+  it.each([
+    { copy: 'an older team version', content: 'v1', kept: false },
+    { copy: 'a member edit', content: 'edited', kept: true },
+  ])('moves Codex to the .agents copy Muse Code shares when its .codex copy is $copy', async ({ content, kept }) => {
+    const homeDir = path.join(tmpDir, 'home');
+    const projectRoot = path.join(tmpDir, 'project');
+    const repoPath = path.join(tmpDir, 'team-repo');
+    const sourcePath = path.join(repoPath, 'skills', 'team-skill');
+    const codexSkillPath = path.join(projectRoot, '.codex', 'skills', 'team-skill');
+    const sharedSkillPath = path.join(projectRoot, '.agents', 'skills', 'team-skill');
+    await fse.ensureDir(path.join(homeDir, '.config', 'muse'));
+    await fse.ensureDir(sourcePath);
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), 'v1');
+    commitTeamRepo(repoPath, 'v1');
+    await fse.ensureDir(codexSkillPath);
+    await fse.writeFile(path.join(codexSkillPath, 'SKILL.md'), content);
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), '---\nname: team-skill\ndescription: v2\n---\n');
+    commitTeamRepo(repoPath, 'v2');
+
+    const teamConfig: TeamaiConfig = {
+      team: 'test', description: '', repo: 'https://example.test/team.git', provider: 'git', reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: { codex: { skills: '.codex/skills' }, muse: { skills: '.agents/skills' } },
+    };
+    const localConfig: LocalConfig = {
+      repo: { localPath: repoPath, remote: 'https://example.test/team.git' },
+      username: 'testuser', updatePolicy: 'auto', additionalRoles: [], scope: 'project', projectRoot,
+      enabledAgents: ['codex', 'muse'],
+    };
+
+    await new SkillsHandler().pullItem({
+      name: 'team-skill', type: 'skills', sourcePath, relativePath: 'skills/team-skill',
+    }, teamConfig, localConfig);
+
+    expect(await fse.readFile(path.join(sharedSkillPath, 'SKILL.md'), 'utf8')).toContain('description: v2');
+    expect(await fse.pathExists(codexSkillPath)).toBe(kept);
+    if (kept) expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Codex skill conflict for team-skill: keeping different copies'));
+  });
+
+  it('keeps Codex in .codex/skills when the .agents directory Muse Code shares links outside the checkout', async () => {
+    const homeDir = path.join(tmpDir, 'home');
+    const projectRoot = path.join(tmpDir, 'project');
+    const outside = path.join(tmpDir, 'outside');
+    const repoPath = path.join(tmpDir, 'team-repo');
+    const sourcePath = path.join(repoPath, 'skills', 'team-skill');
+    await fse.ensureDir(path.join(homeDir, '.config', 'muse'));
+    await fse.ensureDir(path.join(projectRoot, '.codex'));
+    await fse.ensureDir(path.join(outside, 'skills'));
+    await fse.ensureDir(projectRoot);
+    await fse.symlink(outside, path.join(projectRoot, '.agents'));
+    await fse.ensureDir(sourcePath);
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), '---\nname: team-skill\ndescription: v1\n---\n');
+
+    await new SkillsHandler().pullItem({
+      name: 'team-skill', type: 'skills', sourcePath, relativePath: 'skills/team-skill',
+    }, {
+      team: 'test', description: '', repo: 'https://example.test/team.git', provider: 'git', reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: { codex: { skills: '.codex/skills' }, muse: { skills: '.agents/skills' } },
+    }, {
+      repo: { localPath: repoPath, remote: 'https://example.test/team.git' },
+      username: 'testuser', updatePolicy: 'auto', additionalRoles: [], scope: 'project', projectRoot,
+      enabledAgents: ['codex', 'muse'],
+    });
+
+    expect(await fse.pathExists(path.join(outside, 'skills', 'team-skill'))).toBe(false);
+    expect(await fse.pathExists(path.join(projectRoot, '.codex', 'skills', 'team-skill', 'SKILL.md'))).toBe(true);
+  });
+});

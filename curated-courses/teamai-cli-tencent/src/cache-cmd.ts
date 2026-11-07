@@ -1,0 +1,209 @@
+import chalk from 'chalk';
+
+import type { GlobalOptions } from './types.js';
+import { getCacheStatus, gcCache, parsePositiveInteger, type GcOptions } from './utils/cache-index.js';
+import { log } from './utils/logger.js';
+
+// ─── Types ───────────────────────────────────────────────
+
+export interface CacheCmdOptions extends GlobalOptions {
+    status?: boolean;
+    gc?: boolean;
+    maxBytes?: string;
+    staleDays?: string;
+    dryRun?: boolean;
+    json?: boolean;
+}
+
+// ─── Helpers ────────────────────────────────────────────
+
+/**
+ * 将字节数格式化为人类可读字符串（B / KB / MB / GB）。
+ *
+ * @param bytes  字节数
+ */
+function formatBytes(bytes: number): string {
+    if (bytes >= 1024 * 1024 * 1024) {
+        return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    }
+
+    if (bytes >= 1024 * 1024) {
+        return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    if (bytes >= 1024) {
+        return `${(bytes / 1024).toFixed(2)} KB`;
+    }
+
+    return `${bytes} B`;
+}
+
+/**
+ * 截断 SHA 到 8 位短格式。
+ *
+ * @param sha  完整 SHA 或 undefined
+ */
+function shortSha(sha?: string): string {
+    if (!sha) return '-';
+
+    return sha.slice(0, 8);
+}
+
+function parseGcOption(value: string, option: string): number | undefined {
+    const parsed = parsePositiveInteger(value);
+
+    if (parsed !== undefined) return parsed;
+
+    log.error(`${option} must be a positive integer; received "${value}"`);
+    process.exitCode = 2;
+
+    return undefined;
+}
+
+// ─── Command ──────────────────────────────────────────────
+
+/**
+ * teamai cache 命令入口。
+ *
+ * 支持 --status（默认）和 --gc 两种操作模式，配合 --json 输出机器可读格式。
+ *
+ * @param opts  命令行选项
+ */
+export async function cacheCmd(opts: CacheCmdOptions): Promise<void> {
+    const isGc = opts.gc === true;
+
+    if (isGc) {
+        await runGc(opts);
+    } else {
+        await runStatus(opts);
+    }
+}
+
+async function runStatus(opts: CacheCmdOptions): Promise<void> {
+    const result = await getCacheStatus();
+
+    if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+
+        return;
+    }
+
+    console.log('');
+    console.log(chalk.bold('Cache root:'), result.root);
+    console.log('');
+
+    if (result.entryCount === 0) {
+        console.log(chalk.gray('(no cache entries)'));
+
+        return;
+    }
+
+    // 表头
+    const colKey = 50;
+    const colSize = 12;
+    const colUsed = 26;
+
+    const header = [
+        'KEY'.padEnd(colKey),
+        'SIZE'.padStart(colSize),
+        'LAST_USED'.padEnd(colUsed),
+        'SHA',
+    ].join('  ');
+
+    console.log(chalk.underline(header));
+
+    for (const entry of result.entries) {
+        const keyTrunc = entry.key.length > colKey ? `…${entry.key.slice(-(colKey - 1))}` : entry.key;
+
+        const row = [
+            keyTrunc.padEnd(colKey),
+            formatBytes(entry.size_bytes).padStart(colSize),
+            entry.last_used.padEnd(colUsed),
+            shortSha(entry.last_synced_sha),
+        ].join('  ');
+
+        console.log(row);
+    }
+
+    console.log('');
+    console.log(
+        chalk.bold(`Total: ${result.entryCount} repo(s), ${formatBytes(result.totalBytes)}`),
+    );
+    console.log('');
+}
+
+async function runGc(opts: CacheCmdOptions): Promise<void> {
+    let maxBytes: number | undefined;
+
+    if (opts.maxBytes !== undefined) {
+        maxBytes = parseGcOption(opts.maxBytes, '--max-bytes');
+
+        if (maxBytes === undefined) return;
+    }
+
+    let staleDays: number | undefined;
+
+    if (opts.staleDays !== undefined) {
+        staleDays = parseGcOption(opts.staleDays, '--stale-days');
+
+        if (staleDays === undefined) return;
+    }
+
+    const gcOpts: GcOptions = {};
+
+    if (maxBytes !== undefined) gcOpts.maxBytes = maxBytes;
+
+    if (staleDays !== undefined) gcOpts.staleDays = staleDays;
+    gcOpts.dryRun = opts.dryRun;
+
+    const result = await gcCache(gcOpts);
+
+    if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+
+        if (result.skipped.length > 0) {
+            process.exit(1);
+        }
+
+        return;
+    }
+
+    const dryRunTag = opts.dryRun ? chalk.yellow('[dry-run] ') : '';
+
+    console.log('');
+    console.log(chalk.bold(`${dryRunTag}GC result`));
+    console.log('');
+    console.log(
+        `Before: ${result.before.entryCount} repo(s), ${formatBytes(result.before.totalBytes)}`,
+    );
+    console.log(
+        `After: ${result.after.entryCount} repo(s), ${formatBytes(result.after.totalBytes)}`,
+    );
+    console.log('');
+
+    if (result.removed.length === 0) {
+        console.log(chalk.green('Nothing to clean up'));
+    } else {
+        const removedLabel = opts.dryRun ? 'Would remove' : 'Removed';
+        console.log(chalk.bold(`${removedLabel} (${result.removed.length}):`));
+
+        for (const item of result.removed) {
+            const tag = item.reason === 'stale' ? chalk.yellow('[stale]') : chalk.red('[over-cap]');
+            console.log(`  ${tag} ${item.key}  (${formatBytes(item.size_bytes)})`);
+        }
+    }
+
+    if (result.skipped.length > 0) {
+        console.log('');
+        console.log(chalk.bold(chalk.red(`Skipped (${result.skipped.length}, needs manual review):`)));
+
+        for (const item of result.skipped) {
+            console.log(`  ${chalk.red('[skip]')} ${item.key}: ${item.reason}`);
+        }
+
+        console.log('');
+        process.exit(1);
+    }
+
+    console.log('');
+}

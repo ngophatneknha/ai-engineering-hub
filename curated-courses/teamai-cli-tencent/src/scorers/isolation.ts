@@ -1,0 +1,44 @@
+/**
+ * How isolated a judge must be. The team (`scorers/scoring.yaml` `isolation`), a scorer (`isolation`), this scope
+ * (`config.yaml` `scoring.isolation`) and this machine (~/.teamai/config.yaml `scoring.isolation`) may each ask; the
+ * strictest wins, and nobody asking means `best-effort`.
+ */
+import { CONFINED_LEVELS, type ConfinedLevel } from '../tool-launch/confined-level.js';
+
+export function scorerIsolationSource(scorer: string, relativePath = `scorers/${scorer}.md`): string {
+  return `${relativePath} isolation`;
+}
+
+/** One place that may ask for an isolation, such as `scorers/scoring.yaml isolation`, and what it says there. */
+export interface IsolationSetting {
+  source: string;
+  value: string | undefined;
+}
+
+export interface RequiredIsolation {
+  level: ConfinedLevel;
+  /** The sources that ask for `level`; none when it is the default. */
+  setBy: string[];
+  /** Settings whose value is not an isolation teamai knows. Each counts as `verified`. */
+  unknown: Array<{ source: string; value: string }>;
+}
+
+function levelOf(value: string): ConfinedLevel {
+  return CONFINED_LEVELS.find((isolation) => isolation === value) ?? 'verified';
+}
+
+export function requiredIsolation(settings: readonly IsolationSetting[]): RequiredIsolation {
+  const given = settings.flatMap(({ source, value }) => (value === undefined ? [] : [{ source, value, level: levelOf(value) }]));
+  const level: ConfinedLevel = given.some((setting) => setting.level === 'verified') ? 'verified' : 'best-effort';
+
+  return {
+    level,
+    setBy: given.flatMap((setting) => (setting.level === level ? [setting.source] : [])),
+    unknown: given.flatMap(({ source, value }) => (CONFINED_LEVELS.some((isolation) => isolation === value) ? [] : [{ source, value }])),
+  };
+}
+
+/** Why an unknown setting raised the level, for a warning or a doctor note. */
+export function unknownIsolationText({ source, value }: { source: string; value: string }): string {
+  return `${source} is "${value}", which is not verified or best-effort, so it counts as verified`;
+}

@@ -1,0 +1,362 @@
+import { createHash } from 'node:crypto';
+import type { Dirent } from 'node:fs';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { z } from 'zod';
+import { getBusinessRoot, getDataHome, getKnowledgeDir, isSelfMode, managedMcpWorkspaceId, type LocalConfig } from '../types.js';
+import { readFileSafe, remove, writeJsonAtomic } from '../utils/fs.js';
+import { log } from '../utils/logger.js';
+import { isToolId } from '../tools.js';
+import { isSafeNamespaceSegment, NAMESPACE_RULE } from '../manifest-schema.js';
+import { resolveNamespacedItems, type NamespaceCandidate } from '../namespace-resolver.js';
+import { isNamespaceDir, resolveResourceNamespaces, type NamespaceDeclarations } from '../resource-namespaces.js';
+import { remotelyReachableRevision, revisionHoldsSources, withoutStaleTeamRevision, type ReachableRevision } from '../utils/team-revision.js';
+import { formatScorerDiagnostic, parseScorer, type ScorerDefinition, type ScorerDiagnostic } from './definition.js';
+import type { PinnedScorer } from './pin.js';
+import { DefaultScorers, type DefaultScorerName } from '../default-scorers.js';
+
+export type SyncScorerOptions = { scopeLabel?: string } & (
+  | { dryRun?: boolean; everyNamespace?: undefined }
+  /** `review --branch` has no member to resolve namespaces for: every file of every namespace is checked on its own. */
+  | { dryRun: true; everyNamespace: true }
+);
+
+export interface SyncScorerResult {
+  /** The names of the valid scorers, which steps may list. */
+  cached: string[];
+  invalid: ScorerDiagnostic[];
+  /** The files of the valid scorers that ask for a `verified` judge, sorted. */
+  verified: string[];
+}
+
+/** A scorer file's `rubric.sourceHash`: sha256 of its text, so an edit to its rubric is a new rubric. */
+export function scorerSourceHash(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+/** The cache stores the file's text and parses it again on load, so a cached definition is always one this teamai reads. */
+const CacheEntrySchema = z.object({
+  relativePath: z.string(),
+  sourceHash: z.string(),
+  teamRevision: z.string().optional(),
+  content: z.string(),
+  validatedAt: z.string(),
+});
+
+type CacheEntry = z.infer<typeof CacheEntrySchema>;
+
+export type CachedScorer = Omit<CacheEntry, 'content'> & { definition: ScorerDefinition };
+
+/** The team's scoring settings beside the scorers (`scorers/settings.ts`): not a scorer. */
+export const SCORING_FILE = 'scoring.yaml';
+
+export const NOT_A_SCORER = 'not a scorer file; scorers/ holds <name>.md and <namespace>/<name>.md scorers, scoring.yaml settings and an optional README.md';
+
+function cacheDir(config: LocalConfig): string {
+  const home = getDataHome(config);
+
+  // Self mode shares one data home across checkouts, and each checkout has its own scorers/.
+  if (isSelfMode(config)) {
+    return path.join(home, 'workspaces', managedMcpWorkspaceId(getBusinessRoot(config)), 'scorers', 'cache');
+  }
+
+  return path.join(home, 'scorers', 'cache');
+}
+
+function cachePath(config: LocalConfig, name: string): string {
+  return path.join(cacheDir(config), `${name}.json`);
+}
+
+/** Where pull keeps a team file that replaces teamai's default scorer `name`, apart from the scorers steps may list. */
+function overridePath(config: LocalConfig, name: DefaultScorerName): string {
+  return path.join(path.dirname(cacheDir(config)), 'defaults', `${name}.json`);
+}
+
+/**
+ * The rubric default scorer `name` fills in here, with the file it reads as: the team's file of that name when the
+ * last pull let it replace the default, else the one teamai ships.
+ */
+export async function defaultScorerRubric(config: LocalConfig, name: DefaultScorerName): Promise<{ file: string; content: string; overridden: boolean }> {
+  const raw = await readFileSafe(overridePath(config, name));
+  let entry: CacheEntry | undefined;
+
+  try {
+    const parsed = raw === null ? undefined : CacheEntrySchema.safeParse(JSON.parse(raw));
+    entry = parsed?.success ? parsed.data : undefined;
+  } catch {
+    entry = undefined;
+  }
+
+  // Checked again, so a file an older teamai let through runs only while this one would too.
+  if (entry && DefaultScorers.problems(name, entry.relativePath, entry.content).length === 0) return { file: entry.relativePath, content: entry.content, overridden: true };
+
+  return { file: `scorers/${name}.md`, content: DefaultScorers.shipped(name), overridden: false };
+}
+
+async function readCache(config: LocalConfig, name: string): Promise<CacheEntry | null> {
+  const raw = await readFileSafe(cachePath(config, name));
+
+  if (raw === null) return null;
+
+  try {
+    const entry = CacheEntrySchema.safeParse(JSON.parse(raw));
+
+    return entry.success ? entry.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The scorer `name` as the last sync cached it, or null when it has no valid version. */
+export async function loadCachedScorer(config: LocalConfig, name: string): Promise<CachedScorer | null> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return null;
+  const entry = await readCache(config, name);
+  const parsed = entry ? parseScorer(entry.relativePath, entry.content) : undefined;
+
+  if (!entry || !parsed?.ok || parsed.definition.name !== name) return null;
+  const { content: _content, ...rest } = entry;
+
+  return { ...rest, definition: parsed.definition };
+}
+
+/** Whether one of the scorers `names`, as cached here, runs a check on what a pass delivered. */
+export async function anyScorerChecks(config: LocalConfig, names: readonly string[]): Promise<boolean> {
+  for (const name of names) {
+    if ((await loadCachedScorer(config, name))?.definition.check) return true;
+  }
+
+  return false;
+}
+
+/** The names of the scorers with a valid cached version, sorted. */
+export async function cachedScorerNames(config: LocalConfig): Promise<string[]> {
+  const files = await fs.readdir(cacheDir(config)).catch(() => []);
+  const names = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -'.json'.length)).sort();
+  const valid = await Promise.all(names.map(async (name) => (await loadCachedScorer(config, name)) !== null));
+
+  return names.filter((_, index) => valid[index]);
+}
+
+/**
+ * The scorers among `names` that have a valid cached version, pinned as they are cached now. A name without one is left
+ * out (D19), and so is a generated name, which holds a colon.
+ */
+export async function pinScorers(config: LocalConfig, names: Iterable<string>): Promise<Record<string, PinnedScorer>> {
+  const pins: Record<string, PinnedScorer> = {};
+
+  for (const name of new Set(names)) {
+    // A generated scorer, such as teamai:correctness:<task>, comes with the run that lists it; no scorer file has its name.
+    if (name.includes(':')) continue;
+    const entry = await readCache(config, name);
+
+    if (!entry || !(await loadCachedScorer(config, name))) continue;
+    const pin: PinnedScorer = { sourceHash: entry.sourceHash, relativePath: entry.relativePath, content: entry.content };
+
+    if (entry.teamRevision) pin.teamRevision = entry.teamRevision;
+    pins[name] = pin;
+  }
+
+  return pins;
+}
+
+/** What a directory of `scorers/` holds, or nothing when it is missing, a symlink, or cannot be listed. */
+async function scorerEntries(dir: string): Promise<Dirent[]> {
+  try {
+    const stat = await fs.lstat(dir);
+
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return [];
+
+    return (await fs.readdir(dir, { withFileTypes: true })).sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+  } catch {
+    return [];
+  }
+}
+
+/** The `<name>.md` files of `scorers/` and of each `scorers/<ns>/`, and every other entry as a diagnostic. */
+async function scorerCandidates(dir: string): Promise<{ candidates: NamespaceCandidate<string>[]; invalid: ScorerDiagnostic[] }> {
+  const candidates: NamespaceCandidate<string>[] = [];
+  const invalid: ScorerDiagnostic[] = [];
+
+  const walk = async (at: string, namespace: string | null): Promise<void> => {
+    for (const entry of await scorerEntries(at)) {
+      if (entry.name === 'README.md' || (entry.isFile() && entry.name === SCORING_FILE)) continue;
+      const source = `scorers/${namespace === null ? '' : `${namespace}/`}${entry.name}`;
+
+      if (entry.isFile() && entry.name.endsWith('.md')) {
+        candidates.push({ name: entry.name.slice(0, -'.md'.length), source, namespace, value: path.join(at, entry.name) });
+      } else if (namespace === null && entry.isDirectory() && isSafeNamespaceSegment(entry.name)) {
+        await walk(path.join(at, entry.name), entry.name);
+      } else if (namespace === null && entry.isDirectory()) {
+        invalid.push({ file: source, message: `not a scorer namespace; ${NAMESPACE_RULE}` });
+      } else {
+        invalid.push({ file: source, message: NOT_A_SCORER });
+      }
+    }
+  };
+
+  await walk(dir, null);
+
+  return { candidates, invalid };
+}
+
+function namespacesOf(candidates: readonly NamespaceCandidate<string>[]): string[] {
+  return [...new Set(candidates.flatMap((candidate) => candidate.namespace ?? []))];
+}
+
+/**
+ * How each of `dirs` under `scorers/` reaches this member: a namespace (`isNamespaceDir`) is `active` when this member
+ * has it and withheld otherwise, and any other dir is `shared` like `scorers/` itself. With no role and no project to
+ * filter by, every dir is active; when the manifest cannot be read, none is, as for prompts.
+ */
+export async function scorerNamespaces(config: LocalConfig, dirs: readonly string[]): Promise<{ active: string[]; shared: string[] }> {
+  if (dirs.length === 0) return { active: [], shared: [] };
+  const resolved = await resolveResourceNamespaces(config).catch(() => undefined);
+
+  if (resolved === undefined) return { active: [], shared: [] };
+
+  if (resolved === null) return { active: [...dirs], shared: [] };
+  const active = resolved.activeNamespaces.scorers ?? [];
+  const declared = new Set([...active, ...resolved.inactiveScorersNamespaces]);
+  const declarations: NamespaceDeclarations = { manifestFree: false, declares: (_axis, dir) => declared.has(dir) };
+
+  return {
+    active: dirs.filter((dir) => active.includes(dir)),
+    shared: dirs.filter((dir) => !isNamespaceDir('scorers', dir, declarations)),
+  };
+}
+
+async function dropUnsettled(config: LocalConfig, settled: Set<string>): Promise<void> {
+  let names: string[];
+
+  try {
+    names = await fs.readdir(cacheDir(config));
+  } catch {
+    return;
+  }
+
+  for (const name of names) {
+    const stem = name.replace(/\.json$/, '');
+
+    if (stem !== name && !settled.has(stem)) await remove(cachePath(config, stem));
+  }
+}
+
+/**
+ * Validate each `scorers/<name>.md` and `scorers/<dir>/<name>.md` this member receives, and cache only the files that
+ * pass. A namespace scorer replaces the root scorer of its name; one name in two active namespaces, or twice among the
+ * shared scorers, caches neither.
+ * `README.md` is not a scorer and is skipped; any other file is reported. The cache then holds only the scorers this
+ * sync found valid. With `everyNamespace`, no file replaces or conflicts with another. Nothing here fails the caller.
+ */
+export async function syncScorerDefinitions(config: LocalConfig, options: SyncScorerOptions = {}): Promise<SyncScorerResult> {
+  const knowledgeRoot = getKnowledgeDir(config);
+  const { candidates, invalid } = await scorerCandidates(path.join(knowledgeRoot, 'scorers'));
+  const result: SyncScorerResult = { cached: [], invalid, verified: [] };
+  const { active, shared } = options.everyNamespace ? { active: namespacesOf(candidates), shared: [] } : await scorerNamespaces(config, namespacesOf(candidates));
+  const files: Array<{ relativePath: string; full: string }> = [];
+  const byName = new Map<string, NamespaceCandidate<string>[]>();
+
+  for (const candidate of candidates) {
+    const key = options.everyNamespace ? candidate.source : candidate.name;
+    const placed = candidate.namespace !== null && shared.includes(candidate.namespace) ? { ...candidate, namespace: null } : candidate;
+    byName.set(key, [...byName.get(key) ?? [], placed]);
+  }
+
+  for (const group of byName.values()) {
+    const resolution = resolveNamespacedItems(group, active);
+
+    if (resolution.kind === 'conflict') {
+      const { name, first, second } = resolution;
+      result.invalid.push({
+        file: first.source,
+        message: resolution.reason === 'duplicate'
+          ? `scorer "${name}" is shared twice (${first.source} and ${second.source}), so neither is used`
+          : `scorer "${name}" is in two active namespaces (${first.source} and ${second.source}), so neither is used`,
+      });
+      continue;
+    }
+
+    files.push(...resolution.items.map((item) => ({ relativePath: item.source, full: item.value })));
+  }
+
+  // Asked on the first valid file: a team without scorers starts no git here.
+  let reachable: Promise<ReachableRevision | undefined> | undefined;
+  let wrote = 0;
+  const overrides = new Set<DefaultScorerName>();
+
+  for (const { relativePath, full } of files) {
+    const content = await readFileSafe(full);
+
+    if (content === null) {
+      result.invalid.push({ file: relativePath, message: 'could not be read' });
+      continue;
+    }
+
+    const stem = path.posix.basename(relativePath, '.md');
+
+    if (DefaultScorers.isName(stem)) {
+      const refused = DefaultScorers.problems(stem, relativePath, content);
+      result.invalid.push(...refused);
+
+      if (refused.length > 0) continue;
+      overrides.add(stem);
+
+      if (!options.dryRun) await writeJsonAtomic(overridePath(config, stem), { relativePath, sourceHash: scorerSourceHash(content), content, validatedAt: new Date().toISOString() } satisfies CacheEntry);
+      continue;
+    }
+
+    const parsed = parseScorer(relativePath, content);
+
+    if (!parsed.ok) {
+      result.invalid.push(...parsed.diagnostics);
+      continue;
+    }
+
+    const { name, tool } = parsed.definition;
+
+    if (tool !== undefined && !isToolId(tool)) {
+      log.warn(`[scorers] ${formatScorerDiagnostic({ file: relativePath, message: `tool "${tool}" is no tool this teamai knows. A driver that offers a judge tool of that name judges with it; any other judges with a tool it offers.` })}`);
+    }
+
+    if (parsed.definition.isolation === 'verified') result.verified.push(relativePath);
+    const sourceHash = scorerSourceHash(content);
+    const revision = await (reachable ??= remotelyReachableRevision(knowledgeRoot));
+    const holds = await revisionHoldsSources(knowledgeRoot, revision, [{ path: relativePath, content }]);
+    const previous = await withoutStaleTeamRevision(knowledgeRoot, await readCache(config, name));
+    const sameSource = previous?.sourceHash === sourceHash && previous.relativePath === relativePath;
+    const teamRevision = (holds ? revision?.revision : undefined) ?? (sameSource ? previous.teamRevision : undefined);
+
+    if (!result.cached.includes(name)) result.cached.push(name);
+
+    if (options.dryRun || (sameSource && previous.teamRevision === teamRevision)) continue;
+    await writeJsonAtomic(cachePath(config, name), {
+      relativePath,
+      sourceHash,
+      // Left undefined when absent, so the JSON leaves it out.
+      teamRevision: teamRevision || undefined,
+      content,
+      validatedAt: new Date().toISOString(),
+    } satisfies CacheEntry);
+    wrote += 1;
+  }
+
+  if (!options.dryRun) {
+    await dropUnsettled(config, new Set(result.cached));
+
+    for (const name of DefaultScorers.NAMES) if (!overrides.has(name)) await remove(overridePath(config, name));
+  }
+
+  result.invalid.sort((left, right) => (left.file < right.file ? -1 : left.file > right.file ? 1 : 0));
+  result.verified.sort();
+
+  for (const diagnostic of result.invalid) log.warn(`[scorers] ${formatScorerDiagnostic(diagnostic)}`);
+  const scope = options.scopeLabel ?? config.scope;
+
+  if (options.dryRun && result.cached.length > 0) {
+    log.info(`[${scope}] [dry-run] Would cache ${result.cached.length} scorer${result.cached.length === 1 ? '' : 's'}`);
+  } else if (wrote > 0) {
+    log.success(`[${scope}] Synced ${wrote} scorer${wrote === 1 ? '' : 's'}`);
+  }
+
+  return result;
+}

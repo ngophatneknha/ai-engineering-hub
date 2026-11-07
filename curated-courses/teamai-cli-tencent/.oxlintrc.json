@@ -1,0 +1,171 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "jsPlugins": ["./oxlint-plugin-teamai/index.js"],
+  "ignorePatterns": [
+    // Agent tooling a member's tools install into the checkout: their skills and hooks, not this repository's source.
+    ".agent/**",
+    ".agents/**",
+    ".claude/**",
+    ".codex/**",
+    ".continue/**",
+    ".cursor/**",
+    ".gemini/**",
+    ".opencode/**",
+    ".pi/**",
+    ".roo/**",
+    ".windsurf/**",
+    // Vendored unchanged from anti-slop, and linted there.
+    "oxlint-plugin-teamai/anti-slop/rules/**",
+    "oxlint-plugin-teamai/anti-slop/shared/**",
+    "oxlint-plugin-teamai/anti-slop/vendor/**"
+  ],
+  "categories": {
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "rules": {
+    "no-unused-vars": [
+      "warn",
+      {
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_",
+        "ignoreRestSiblings": true
+      }
+    ],
+    "typescript/no-floating-promises": "warn",
+    "typescript/no-misused-promises": "warn",
+    // Prefer includes() when checking for a collection member.
+    "unicorn/prefer-includes": "warn",
+    // Prefer a predicate search when only the existence of a match matters.
+    "unicorn/prefer-array-some": "warn",
+    // These Unicorn rules are not covered by the pinned categories; keep
+    // their policy explicit even while the current tree is clean.
+    "unicorn/prefer-array-flat": "warn",
+    "unicorn/prefer-array-flat-map": "warn",
+    "unicorn/prefer-string-trim-start-end": "warn",
+    // A switch default already handles the generic JSON webhook; a duplicate
+    // `case 'json'` obscures that there is no separate JSON branch.
+    "unicorn/no-useless-switch-case": "warn",
+    // Exact string lookups should use indexOf() rather than allocating a
+    // predicate for findIndex().
+    "unicorn/prefer-array-index-of": "warn",
+    "typescript/no-base-to-string": "off",
+    "typescript/no-duplicate-type-constituents": "off",
+    "typescript/no-implied-eval": "off",
+    "typescript/no-meaningless-void-operator": "off",
+    "typescript/no-redundant-type-constituents": "off",
+    "typescript/await-thenable": "off",
+    "typescript/require-array-sort-compare": "off",
+    "typescript/restrict-template-expressions": "off",
+    "typescript/unbound-method": "off",
+    // The suspicious/perf categories also reach these type-aware rules; only
+    // no-floating-promises and no-misused-promises (#863) are on.
+    "typescript/no-unsafe-type-assertion": "off",
+    "typescript/no-unnecessary-type-assertion": "off",
+    "typescript/no-unnecessary-type-conversion": "off",
+    "typescript/consistent-return": "off",
+    "typescript/no-unnecessary-boolean-literal-compare": "warn",
+    "typescript/no-unnecessary-template-expression": "off",
+    "typescript/no-unnecessary-type-arguments": "off",
+    "typescript/no-unnecessary-type-parameters": "off",
+    // Sequential awaits are deliberate in a CLI (git, prompts, ordered
+    // writes); the rule can't tell an intentional ordering dependency from
+    // a parallelizable loop.
+    "no-await-in-loop": "off",
+    // All prod sort sites sort a local array built in the same function;
+    // none mutates a caller's array, so the in-place warning doesn't apply.
+    "unicorn/no-array-sort": "off",
+    // Unlike sorting, reversal is required to stay non-mutating so future
+    // callers cannot observe an incidental in-place change to a local copy.
+    "unicorn/no-array-reverse": "warn",
+    // Moves closures to outer scope; a style preference, not a bug class.
+    "unicorn/consistent-function-scoping": "off",
+    // Conflicts with this repo's own `_` convention (`_setLogFilePath`,
+    // `_resetState`).
+    "no-underscore-dangle": "off",
+    // Micro-optimization, not worth the churn.
+    "oxc/no-map-spread": "off",
+    // Pull deletes a delivered copy and its record entry together (#1577).
+    "teamai/remove-delivered": "error",
+    // An attempt's result file is written masked, through AttemptResult.write.
+    "teamai/attempt-result-writes": "error",
+    // getUserHome owns the HOME / USERPROFILE fallback that keeps Windows paths safe.
+    "teamai/home-env": "error",
+    "teamai/learnings-root": "error",
+    "teamai/configured-tool-paths": "error",
+    "teamai/config-load-options": "error",
+    "teamai/launch-env": "error",
+    "teamai/launch-through-workflows": "error",
+    "teamai/workflow-boundaries": "error",
+    "teamai/no-provider-merge": "error",
+    "teamai/windows-tests": "error",
+    "teamai/rules-locate": "error",
+    "teamai/workflow-failure-codes": "error",
+    "teamai/tool-facts": "error",
+    // parseYaml returns JSON values; yaml's own parse can return a Set, Buffer or Date.
+    "teamai/yaml-parse": "error",
+    // A reducer that copies its accumulator each step is quadratic.
+    "oxc/no-accumulating-spread": "error",
+    // The generic rules of anti-slop (#828), vendored in
+    // oxlint-plugin-teamai/anti-slop. Production code only: see overrides.
+    "teamai/no-array-filter-map": "error",
+    "teamai/no-chained-type-assertions": "error",
+    "teamai/no-conditional-empty-object-spread": "error",
+    "teamai/no-known-value-widening": "error",
+    "teamai/no-module-mocking": "error",
+    "teamai/no-object-parameters": "error",
+    "teamai/no-reduce-accumulator-copy": "error",
+    "teamai/no-reflect-apply": "error",
+    "teamai/no-reflect-get": "error",
+    "teamai/no-runtime-typeof": "error",
+    "teamai/no-shape-in-symbol-names": "error",
+    "teamai/no-unknown-parameters": "error",
+    "teamai/no-unknown-returns": "error",
+    "teamai/no-unknown-type-aliases": "error",
+    "teamai/no-unsafe-dictionary-type": "error",
+    "teamai/no-widen-then-assert": "error",
+    "teamai/require-readable-spacing": "error",
+    "teamai/require-safety-comment-for-type-assertion": "error",
+    // CONTRIBUTING: comments explain why, not what.
+    "teamai/no-low-value-comments": "error",
+    // A suppression with no reason can't be reviewed or removed later.
+    "teamai/suppression-reason": "error"
+  },
+  "overrides": [
+    {
+      // The anti-slop rules hold production code. Tests build partial and
+      // malformed values on purpose, and CONTRIBUTING asks them to mock
+      // external I/O (git, fetch, child_process) at the module boundary.
+      "files": ["src/__tests__/**", "**/*.test.ts", "oxlint-plugin-teamai/test/**"],
+      "rules": {
+        "teamai/no-array-filter-map": "off",
+        "teamai/no-chained-type-assertions": "off",
+        "teamai/no-conditional-empty-object-spread": "off",
+        "teamai/no-known-value-widening": "off",
+        "teamai/no-module-mocking": "off",
+        "teamai/no-object-parameters": "off",
+        "teamai/no-reduce-accumulator-copy": "off",
+        "teamai/no-reflect-apply": "off",
+        "teamai/no-reflect-get": "off",
+        "teamai/no-runtime-typeof": "off",
+        "teamai/no-shape-in-symbol-names": "off",
+        "teamai/no-unknown-parameters": "off",
+        "teamai/no-unknown-returns": "off",
+        "teamai/no-unknown-type-aliases": "off",
+        "teamai/no-unsafe-dictionary-type": "off",
+        "teamai/no-widen-then-assert": "off",
+        "teamai/require-readable-spacing": "off",
+        "teamai/require-safety-comment-for-type-assertion": "off"
+      }
+    },
+    {
+      "files": ["src/__tests__/**"],
+      "rules": {
+        "typescript/no-misused-promises": [
+          "warn",
+          { "checksVoidReturn": { "arguments": false } }
+        ]
+      }
+    }
+  ]
+}

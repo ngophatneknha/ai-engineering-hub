@@ -1,0 +1,125 @@
+use std::sync::atomic::AtomicBool;
+
+use common::types::{PointOffsetType, ScoredPointOffset};
+use common::universal_io::{UniversalRead, UserData};
+
+use super::super::super::full_text_index_read::FullTextIndexRead;
+use super::super::super::inverted_index::{ParsedQuery, TokenId};
+use super::super::super::tokenizers::Tokenizer;
+use super::ReadOnlyAppendableFullTextIndex;
+use crate::common::operation_error::OperationResult;
+use crate::index::field_index::full_text_index::inverted_index::bm25::{Bm25Accept, Bm25Query};
+use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
+use crate::index::payload_config::StorageType;
+use crate::types::{FieldCondition, PayloadKeyType};
+
+impl<S: UniversalRead> FullTextIndexRead for ReadOnlyAppendableFullTextIndex<S> {
+    fn tokenizer(&self) -> &Tokenizer {
+        self.inner.tokenizer()
+    }
+
+    fn telemetry_index_type(&self) -> &'static str {
+        "read_only_appendable_full_text"
+    }
+
+    fn points_count(&self) -> usize {
+        self.inner.points_count()
+    }
+
+    fn document_count(&self) -> usize {
+        self.inner.document_count()
+    }
+
+    fn values_count(&self, point_id: PointOffsetType) -> usize {
+        self.inner.values_count(point_id)
+    }
+
+    fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
+        self.inner.values_is_empty(point_id)
+    }
+
+    fn doc_len_batch(
+        &self,
+        point_ids: &[PointOffsetType],
+        f: impl FnMut(usize, Option<u32>),
+    ) -> OperationResult<()> {
+        self.inner.doc_len_batch(point_ids, f)
+    }
+
+    fn posting_len(&self, token_id: TokenId) -> OperationResult<Option<usize>> {
+        self.inner.posting_len(token_id)
+    }
+
+    fn score_bm25(
+        &self,
+        query: &Bm25Query,
+        accept: &Bm25Accept<'_>,
+        limit: usize,
+        is_stopped: &AtomicBool,
+    ) -> OperationResult<Vec<ScoredPointOffset>> {
+        self.inner.score_bm25(query, accept, limit, is_stopped)
+    }
+
+    fn total_tokens(&self) -> Option<u64> {
+        self.inner.total_tokens()
+    }
+
+    fn for_each_token_id<'a, U: UserData>(
+        &self,
+        iter: impl Iterator<Item = (U, &'a str)>,
+        f: impl FnMut(U, Option<TokenId>),
+    ) -> OperationResult<()> {
+        self.inner.for_each_token_id(iter, f)
+    }
+
+    fn filter_query<'a>(
+        &'a self,
+        query: ParsedQuery,
+    ) -> OperationResult<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
+        self.inner.filter_query(query)
+    }
+
+    fn estimate_query_cardinality(
+        &self,
+        query: &ParsedQuery,
+        condition: &FieldCondition,
+    ) -> OperationResult<CardinalityEstimation> {
+        self.inner.estimate_query_cardinality(query, condition)
+    }
+
+    fn check_match(&self, query: &ParsedQuery, point_id: PointOffsetType) -> OperationResult<bool> {
+        self.inner.check_match(query, point_id)
+    }
+
+    fn check_match_batch<U: UserData>(
+        &self,
+        query: &ParsedQuery,
+        items: impl Iterator<Item = (U, PointOffsetType)>,
+        on_match: impl FnMut(U, bool),
+    ) -> OperationResult<()> {
+        self.inner.check_match_batch(query, items, on_match)
+    }
+
+    fn for_each_payload_block_inner(
+        &self,
+        threshold: usize,
+        key: PayloadKeyType,
+        f: &mut dyn FnMut(PayloadBlockCondition) -> OperationResult<()>,
+    ) -> OperationResult<()> {
+        self.inner.for_each_payload_block_inner(threshold, key, f)
+    }
+
+    fn get_storage_type(&self) -> StorageType {
+        // The on-disk format is Gridstore; the read-only-vs-mutable
+        // distinction is not yet reflected in [`StorageType`].
+        StorageType::Gridstore
+    }
+
+    fn ram_usage_bytes(&self) -> usize {
+        self.inner.ram_usage_bytes()
+    }
+
+    fn is_cold(&self) -> bool {
+        self.inner.is_cold()
+    }
+}

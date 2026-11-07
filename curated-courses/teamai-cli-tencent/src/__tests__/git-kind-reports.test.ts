@@ -1,0 +1,1077 @@
+/**
+ * Real-git coverage for independent clones writing reports to teamai-reports.
+ * No mocks of the units under test.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { simpleGit } from 'simple-git';
+
+import { getDataHome, getReportsDir, getVotesDir, REPORTS_WORKTREE_DIRNAME, type LocalConfig } from '../types.js';
+import { commitAndPushReports, ensureReportsWorktree, fetchReportsOriginFile, readReportsOriginFiles, refreshReportsWorktree, updateReports } from '../utils/reports-branch.js';
+import { isPublished } from '../utils/branch-worktree.js';
+import { pushRepoDirectly } from '../utils/git.js';
+import { reportUsage } from '../team-push.js';
+import { dataHomeKey, resolveHookConfig } from '../dashboard-collector.js';
+import { listMembers } from '../members.js';
+import { resolveProjectDataHome, saveLocalConfigForScope } from '../config.js';
+import { buildHandlerRegistry } from '../hook-handlers.js';
+import YAML from 'yaml';
+import { getUserHome } from '../utils/home.js';
+
+let tmp: string;
+let originalHome: string;
+
+beforeEach(() => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-git-reports-'));
+  originalHome = process.env.HOME ?? '';
+  process.env.HOME = path.join(tmp, 'home');
+  fs.mkdirSync(process.env.HOME, { recursive: true });
+});
+
+afterEach(() => {
+  process.env.HOME = originalHome;
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+async function configureGit(dir: string): Promise<void> {
+  const git = simpleGit(dir);
+  await git.addConfig('user.email', 't@t.com');
+  await git.addConfig('user.name', 't');
+}
+
+async function seedBareOrigin(base = tmp, skills: string[] = []): Promise<{ origin: string; clone: string }> {
+  const seed = path.join(base, 'seed');
+  fs.mkdirSync(seed, { recursive: true });
+  const seedGit = simpleGit(seed);
+  await seedGit.init(['--initial-branch=main']);
+  await configureGit(seed);
+  fs.writeFileSync(path.join(seed, 'teamai.yaml'), 'team: acme\n');
+  fs.mkdirSync(path.join(seed, 'skills'), { recursive: true });
+  fs.writeFileSync(path.join(seed, 'skills', '.gitkeep'), '');
+  // Skills the seeded team actually shares; #1055 filters published stats to
+  // catalog names, so tests that expect a skill to be reported must share it.
+  for (const skill of skills) {
+    fs.mkdirSync(path.join(seed, 'skills', skill), { recursive: true });
+    fs.writeFileSync(path.join(seed, 'skills', skill, 'SKILL.md'), `# ${skill}\n`);
+  }
+  await seedGit.add(['.']);
+  await seedGit.commit('init knowledge');
+
+  const origin = path.join(base, 'origin.git');
+  await simpleGit().clone(seed, origin, ['--bare']);
+  const hook = path.join(origin, 'hooks', 'update');
+  fs.writeFileSync(
+    hook,
+    `#!/bin/sh
+ref="$1"
+if [ "$ref" = "refs/heads/main" ] || [ "$ref" = "refs/heads/master" ]; then
+  echo "default branch is protected" >&2
+  exit 1
+fi
+exit 0
+`,
+  );
+  fs.chmodSync(hook, 0o755);
+
+  const clone = path.join(base, 'team-repo');
+  await simpleGit().clone(origin, clone);
+  await configureGit(clone);
+  return { origin, clone };
+}
+
+function gitConfig(clone: string, origin: string, username = 'alice'): LocalConfig {
+  return {
+    repo: { localPath: clone, remote: origin, kind: 'git' },
+    username,
+    scope: 'user',
+    additionalRoles: [],
+  };
+}
+
+describe('git-kind reports branch', () => {
+  it('places the reports dir as a sibling of the clone', () => {
+    const clone = '/home/alice/.teamai/team-repo';
+    const cfg = gitConfig(clone, 'https://example.com/team.git');
+    expect(getReportsDir(cfg)).toBe(path.join('/home/alice/.teamai', REPORTS_WORKTREE_DIRNAME));
+    expect(getReportsDir(cfg)).not.toContain(`${path.sep}team-repo${path.sep}`);
+  });
+
+  it('publishes member + stats files on origin/teamai-reports, not on main', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+
+    const wt = await ensureReportsWorktree(cfg);
+    expect(wt).toBe(path.join(tmp, REPORTS_WORKTREE_DIRNAME));
+    expect(path.dirname(wt)).toBe(path.dirname(clone));
+
+    const memberDir = path.join(wt, 'members');
+    fs.mkdirSync(memberDir, { recursive: true });
+    fs.writeFileSync(path.join(memberDir, 'alice.yaml'), 'username: alice\n');
+    const pushed = await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/']);
+    expect(pushed).toBe(true);
+
+    const ts = new Date().toISOString();
+    const eventsDir = path.join(process.env.HOME!, '.teamai', 'dashboard');
+    // A session the user scope recorded.
+    const key = await dataHomeKey(getDataHome(cfg));
+    fs.mkdirSync(eventsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(eventsDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'session_start', timestamp: ts, sessionId: 's1', tool: 'claude', cwd: '/p', dataHomeKey: key })}\n` +
+      `${JSON.stringify({ type: 'stop', timestamp: ts, sessionId: 's1', tool: 'claude', dataHomeKey: key, interventions: { interrupt: 1, toolReject: 0 } })}\n`,
+    );
+    await reportUsage(clone, 'alice', { skipTruncate: true, selfConfig: cfg });
+
+    const originGit = simpleGit(origin);
+    const reportsTree = await originGit.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
+    expect(reportsTree).toContain('members/alice.yaml');
+    expect(reportsTree).toContain('stats/alice.yaml');
+
+    const mainTree = await originGit.raw(['ls-tree', '-r', '--name-only', 'main']);
+    expect(mainTree).not.toContain('members/alice.yaml');
+    expect(mainTree).not.toContain('stats/alice.yaml');
+    expect(mainTree).toContain('teamai.yaml');
+
+    expect(fs.existsSync(path.join(clone, 'members', 'alice.yaml'))).toBe(false);
+    expect(fs.existsSync(path.join(clone, 'stats', 'alice.yaml'))).toBe(false);
+  });
+
+  it('pushes an earlier unpushed report commit when the retry has no new files', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    const wt = await ensureReportsWorktree(cfg);
+    const memberPath = path.join(wt, 'members', 'alice.yaml');
+    fs.mkdirSync(path.dirname(memberPath), { recursive: true });
+    fs.writeFileSync(memberPath, 'username: alice\n');
+
+    const rejectFlag = path.join(origin, 'reject-reports');
+    const hook = path.join(origin, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, `#!/bin/sh
+if [ -f "$(dirname "$0")/../reject-reports" ]; then
+  echo "reports push rejected" >&2
+  exit 1
+fi
+exit 0
+`);
+    fs.writeFileSync(rejectFlag, '');
+    fs.chmodSync(hook, 0o755);
+
+    expect(await updateReports(cfg, async () => ({
+      files: ['members/alice.yaml'],
+      message: '[teamai] Register member: alice',
+    }))).toMatchObject({ status: 'failed' });
+    const originGit = simpleGit(origin);
+    const reportsTreeBeforeRetry = await originGit.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
+    expect(reportsTreeBeforeRetry).not.toContain('members/alice.yaml');
+
+    fs.rmSync(rejectFlag);
+    expect(await updateReports(cfg, async () => ({
+      files: [],
+      message: '[teamai] Register member: alice',
+    }))).toEqual({ status: 'published' });
+    expect(await originGit.raw(['show', 'teamai-reports:members/alice.yaml'])).toBe('username: alice\n');
+  }, 30_000);
+
+  it('does not copy or delete leftover default-branch members when writing reports', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const leftover = path.join(clone, 'members', 'stale.yaml');
+    fs.mkdirSync(path.dirname(leftover), { recursive: true });
+    fs.writeFileSync(leftover, 'username: stale\n');
+
+    const cfg = gitConfig(clone, origin);
+    const wt = await ensureReportsWorktree(cfg);
+    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'members', 'alice.yaml'), 'username: alice\n');
+    await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/']);
+
+    expect(fs.readFileSync(leftover, 'utf-8')).toContain('username: stale');
+    expect(fs.existsSync(path.join(wt, 'members', 'stale.yaml'))).toBe(false);
+    expect(fs.readFileSync(path.join(wt, 'members', 'alice.yaml'), 'utf-8')).toContain('username: alice');
+
+    const originGit = simpleGit(origin);
+    const reportsTree = await originGit.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
+    expect(reportsTree).toContain('members/alice.yaml');
+    expect(reportsTree).not.toContain('members/stale.yaml');
+  });
+
+  it('still allows an empty-repo skeleton push to the default branch, separate from members', async () => {
+    const origin = path.join(tmp, 'empty.git');
+    await simpleGit().init(['--bare', '--initial-branch=main', origin]);
+
+    const clone = path.join(tmp, 'team-repo');
+    fs.mkdirSync(clone, { recursive: true });
+    const git = simpleGit(clone);
+    await git.init(['--initial-branch=main']);
+    await configureGit(clone);
+    await git.addRemote('origin', origin);
+
+    fs.writeFileSync(path.join(clone, 'teamai.yaml'), 'team: acme\n');
+    for (const dir of ['skills', 'rules', 'docs', 'env', 'members']) {
+      fs.mkdirSync(path.join(clone, dir), { recursive: true });
+      fs.writeFileSync(path.join(clone, dir, '.gitkeep'), '');
+    }
+    await pushRepoDirectly(clone, '[teamai] Initialize team repo skeleton', [
+      'teamai.yaml',
+      'skills/.gitkeep',
+      'rules/.gitkeep',
+      'docs/.gitkeep',
+      'env/.gitkeep',
+      'members/.gitkeep',
+    ]);
+
+    const cfg = gitConfig(clone, origin);
+    const wt = await ensureReportsWorktree(cfg);
+    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'members', 'alice.yaml'), 'username: alice\n');
+    const pushed = await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/']);
+    expect(pushed).toBe(true);
+
+    const originGit = simpleGit(origin);
+    const mainTree = await originGit.raw(['ls-tree', '-r', '--name-only', 'main']);
+    expect(mainTree).toContain('teamai.yaml');
+    expect(mainTree).toContain('skills/.gitkeep');
+    expect(mainTree).not.toContain('members/alice.yaml');
+
+    const reportsTree = await originGit.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
+    expect(reportsTree).toContain('members/alice.yaml');
+  });
+
+  it('refuses to create a reports worktree on a non-clone path inside a business repo', async () => {
+    const business = path.join(tmp, 'business');
+    fs.mkdirSync(business, { recursive: true });
+    const git = simpleGit(business);
+    await git.init(['--initial-branch=main']);
+    await configureGit(business);
+    fs.writeFileSync(path.join(business, 'app.js'), 'console.log(1)\n');
+    await git.add('.');
+    await git.commit('init');
+
+    const nested = path.join(business, '.teamai', 'team-repo');
+    fs.mkdirSync(nested, { recursive: true });
+    const cfg = gitConfig(nested, 'https://example.com/team.git');
+
+    await expect(ensureReportsWorktree(cfg)).rejects.toThrow(/not a dedicated team-repo clone root/);
+    const logBefore = await git.log();
+    expect(fs.existsSync(path.join(path.dirname(nested), REPORTS_WORKTREE_DIRNAME))).toBe(false);
+    const logAfter = await git.log();
+    expect(logAfter.total).toBe(logBefore.total);
+  });
+
+  it('refuses and keeps a dangling sibling reports worktree after the clone is removed and re-cloned, and rebuilds it once moved aside', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+
+    const wt = await ensureReportsWorktree(cfg);
+    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'members', 'alice.yaml'), 'username: alice\n');
+    expect(await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/'])).toBe(true);
+    fs.writeFileSync(path.join(wt, 'draft.txt'), 'uncommitted\n');
+
+    fs.rmSync(clone, { recursive: true, force: true });
+    await simpleGit().clone(origin, clone);
+    await configureGit(clone);
+
+    // The sibling husk is still on disk; isGitRepo would return true, but the
+    // gitdir under the old clone is gone, and a clone at the same path cannot
+    // show the husk is its own (init reclones another team repo there too).
+    expect(fs.existsSync(wt)).toBe(true);
+    await expect(ensureReportsWorktree(cfg)).rejects.toThrow(`${wt} is a teamai-reports checkout teamai cannot show to be`);
+    expect(fs.readFileSync(path.join(wt, 'draft.txt'), 'utf-8')).toBe('uncommitted\n');
+
+    fs.renameSync(wt, `${wt}.aside`);
+    const rebuilt = await ensureReportsWorktree(cfg);
+    expect(rebuilt).toBe(wt);
+
+    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'members', 'bob.yaml'), 'username: bob\n');
+    expect(await commitAndPushReports(cfg, '[teamai] Register member: bob', ['members/'])).toBe(true);
+
+    const originGit = simpleGit(origin);
+    const reportsTree = await originGit.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
+    expect(reportsTree).toContain('members/alice.yaml');
+    expect(reportsTree).toContain('members/bob.yaml');
+  });
+});
+
+const READ_ONLY = { pushIfCreated: false } as const;
+
+/** Another independent checkout of the same team repo (a second member or machine). */
+async function cloneCheckout(origin: string, name: string, username = 'alice'): Promise<LocalConfig> {
+  const clone = path.join(tmp, name, 'team-repo');
+  fs.mkdirSync(path.dirname(clone), { recursive: true });
+  await simpleGit().clone(origin, clone);
+  await configureGit(clone);
+  return gitConfig(clone, origin, username);
+}
+
+/** Write one report file into the reports worktree and publish it. */
+async function publish(cfg: LocalConfig, relPath: string, content: string): Promise<boolean> {
+  const wt = await ensureReportsWorktree(cfg);
+  fs.mkdirSync(path.dirname(path.join(wt, relPath)), { recursive: true });
+  fs.writeFileSync(path.join(wt, relPath), content);
+  return commitAndPushReports(cfg, `[teamai] Update ${relPath}`, [relPath]);
+}
+
+async function originReportsFile(origin: string, relPath: string): Promise<string> {
+  return simpleGit(origin).show([`teamai-reports:${relPath}`]);
+}
+
+async function originHasReportsBranch(origin: string): Promise<boolean> {
+  const heads = await simpleGit(origin).raw(['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
+  return heads.split('\n').includes('teamai-reports');
+}
+
+describe('git-kind reports: commit identity', () => {
+  async function reportsCommitIdentity(origin: string): Promise<string> {
+    return (await simpleGit(origin).raw(['log', '-1', '--format=%an <%ae> / %cn <%ce>', 'teamai-reports'])).trim();
+  }
+
+  it('commits as TeamAI where git can resolve no identity', async () => {
+    const { origin } = await seedBareOrigin();
+    const clone = path.join(tmp, 'ci', 'team-repo');
+    fs.mkdirSync(path.dirname(clone), { recursive: true });
+    await simpleGit().clone(origin, clone);
+    // Stands in for a CI runner with no user.email whose hostname gives git no usable one.
+    await simpleGit(clone).addConfig('user.useConfigOnly', 'true');
+
+    expect(await publish(gitConfig(clone, origin), 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await reportsCommitIdentity(origin)).toBe('TeamAI <teamai@localhost> / TeamAI <teamai@localhost>');
+  });
+
+  it('keeps the identity the member configured', async () => {
+    const { origin } = await seedBareOrigin();
+    const cfg = await cloneCheckout(origin, 'member');
+
+    expect(await publish(cfg, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await reportsCommitIdentity(origin)).toBe('t <t@t.com> / t <t@t.com>');
+  });
+});
+
+describe('git-kind reports: read-only cold start (#558)', () => {
+  it('materializes a local reports view without publishing the branch', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+
+    await refreshReportsWorktree(cfg, READ_ONLY);
+    const wt = await ensureReportsWorktree(cfg, READ_ONLY);
+
+    expect(fs.existsSync(path.join(wt, '.gitignore'))).toBe(true);
+    expect(await originHasReportsBranch(origin)).toBe(false);
+  });
+
+  it('reuses the unpublished local branch after its worktree is removed, and a writer publishes it', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+
+    const wt = await ensureReportsWorktree(cfg, READ_ONLY);
+    fs.rmSync(wt, { recursive: true, force: true });
+
+    await expect(ensureReportsWorktree(cfg, READ_ONLY)).resolves.toBe(wt);
+    expect(await originHasReportsBranch(origin)).toBe(false);
+
+    expect(await publish(cfg, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await originReportsFile(origin, 'members/alice.yaml')).toBe('username: alice\n');
+  });
+});
+
+describe('git-kind reports: reading what origin holds', () => {
+  it('reads several files as origin holds them, and null for one origin does not have', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const alice = gitConfig(clone, origin);
+    expect(await publish(alice, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await publish(alice, 'stats/Alice Smith.yaml', 'name: Zoë\n')).toBe(true);
+    const wt = await ensureReportsWorktree(alice);
+    // Committed here but never pushed: not what origin holds.
+    fs.mkdirSync(path.join(wt, 'votes'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'votes', 'alice.yaml'), 'version: 2\n');
+    await simpleGit(wt).add(['votes/alice.yaml']);
+    await simpleGit(wt).commit('local only');
+
+    const read = await readReportsOriginFiles(wt, ['stats/Alice Smith.yaml', 'votes/alice.yaml', 'members/alice.yaml', 'members/nobody.yaml']);
+
+    expect(Object.fromEntries(read)).toEqual({
+      'stats/Alice Smith.yaml': 'name: Zoë\n',
+      'votes/alice.yaml': null,
+      'members/alice.yaml': 'username: alice\n',
+      'members/nobody.yaml': null,
+    });
+  });
+
+  it('reads a file as absent inside an update once origin deleted the branch, though the clone still tracks it', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const alice = gitConfig(clone, origin);
+    expect(await publish(alice, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    const wt = await ensureReportsWorktree(alice);
+    await simpleGit(origin).raw(['branch', '-D', 'teamai-reports']);
+    fs.rmSync(wt, { recursive: true, force: true });
+
+    const result = await updateReports(
+      alice,
+      async (worktree, update) => ({ value: await fetchReportsOriginFile(worktree, 'members/alice.yaml', update), write: null }),
+      READ_ONLY,
+    );
+
+    expect(await simpleGit(clone).raw(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/teamai-reports'])).not.toBe('');
+    expect(result.value).toEqual({ status: 'absent' });
+  });
+});
+
+describe('git-kind reports: refresh before reading (#557)', () => {
+  it('picks up report data another member pushed', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const alice = gitConfig(clone, origin);
+    expect(await publish(alice, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+
+    const bob = await cloneCheckout(origin, 'bob', 'bob');
+    expect(await publish(bob, 'votes/bob.yaml', 'version: 2\n')).toBe(true);
+
+    const wt = await ensureReportsWorktree(alice, READ_ONLY);
+    expect(fs.existsSync(path.join(wt, 'votes', 'bob.yaml'))).toBe(false);
+
+    await refreshReportsWorktree(alice, READ_ONLY);
+    expect(fs.readFileSync(path.join(wt, 'votes', 'bob.yaml'), 'utf-8')).toBe('version: 2\n');
+  });
+
+  it('keeps an unpushed report commit that rebases cleanly, so the next push delivers it', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const alice = gitConfig(clone, origin);
+    const wt = await ensureReportsWorktree(alice);
+
+    // A report committed while the push failed (e.g. offline).
+    fs.mkdirSync(path.join(wt, 'stats'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'stats', 'alice.yaml'), 'n: 1\n');
+    const wtGit = simpleGit(wt);
+    await wtGit.add(['stats/alice.yaml']);
+    await wtGit.commit('offline stats');
+
+    const bob = await cloneCheckout(origin, 'bob', 'bob');
+    expect(await publish(bob, 'votes/bob.yaml', 'version: 2\n')).toBe(true);
+
+    await refreshReportsWorktree(alice, READ_ONLY);
+    expect(fs.existsSync(path.join(wt, 'votes', 'bob.yaml'))).toBe(true);
+    expect(fs.readFileSync(path.join(wt, 'stats', 'alice.yaml'), 'utf-8')).toBe('n: 1\n');
+
+    expect(await publish(alice, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('n: 1\n');
+    expect(await originReportsFile(origin, 'votes/bob.yaml')).toBe('version: 2\n');
+  });
+
+  it('delivers a report whose first push lost the race to another member, on top of theirs', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const alice = gitConfig(clone, origin);
+    expect(await publish(alice, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+
+    const bob = await cloneCheckout(origin, 'bob', 'bob');
+    expect(await publish(bob, 'votes/bob.yaml', 'version: 2\n')).toBe(true);
+
+    // Alice's checkout has not seen Bob's push, so origin rejects her first push.
+    expect(await publish(alice, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('n: 1\n');
+    expect(await originReportsFile(origin, 'votes/bob.yaml')).toBe('version: 2\n');
+  });
+
+  it('keeps uncommitted report files while updating to origin', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const alice = gitConfig(clone, origin);
+    const wt = await ensureReportsWorktree(alice);
+
+    // A writer has written its file but not committed it yet.
+    fs.mkdirSync(path.join(wt, 'stats'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'stats', 'alice.yaml'), 'n: 1\n');
+
+    const bob = await cloneCheckout(origin, 'bob', 'bob');
+    expect(await publish(bob, 'votes/bob.yaml', 'version: 2\n')).toBe(true);
+
+    await refreshReportsWorktree(alice, READ_ONLY);
+    expect(fs.existsSync(path.join(wt, 'votes', 'bob.yaml'))).toBe(true);
+    expect(fs.readFileSync(path.join(wt, 'stats', 'alice.yaml'), 'utf-8')).toBe('n: 1\n');
+
+    expect(await commitAndPushReports(alice, '[teamai] Update usage stats for alice', ['stats/alice.yaml'])).toBe(true);
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('n: 1\n');
+  });
+
+  it('does not leave autostash conflict markers when an unpushed commit, a dirty report, and origin all touch the same file', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const machineA = gitConfig(clone, origin);
+    const machineB = await cloneCheckout(origin, 'machine-b');
+
+    expect(await publish(machineA, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
+    const wtA = await ensureReportsWorktree(machineA);
+
+    // Unpushed local commit (e.g. a session report written while offline).
+    fs.mkdirSync(path.join(wtA, 'sessions'), { recursive: true });
+    fs.writeFileSync(path.join(wtA, 'sessions', 'alice.yaml'), 'session: a1\n');
+    const wtGit = simpleGit(wtA);
+    await wtGit.add(['sessions/alice.yaml']);
+    await wtGit.commit('offline session');
+
+    // Dirty tracked stats, plus a newer copy of the same file on origin.
+    fs.writeFileSync(path.join(wtA, 'stats', 'alice.yaml'), 'n: 3\n');
+    expect(await publish(machineB, 'stats/alice.yaml', 'n: 2\n')).toBe(true);
+
+    await refreshReportsWorktree(machineA, READ_ONLY);
+
+    const stats = fs.readFileSync(path.join(wtA, 'stats', 'alice.yaml'), 'utf-8');
+    expect(stats).not.toMatch(/^(<<<<<<<|=======|>>>>>>>)/m);
+    expect(stats).toBe('n: 3\n');
+    expect(fs.readFileSync(path.join(wtA, 'sessions', 'alice.yaml'), 'utf-8')).toBe('session: a1\n');
+
+    const status = await wtGit.status();
+    expect(status.conflicted).toEqual([]);
+    expect((await wtGit.raw(['stash', 'list'])).trim()).toBe('');
+  });
+
+  it('drops an unpushed commit that conflicts with newer origin data so the checkout never stays diverged', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const machineA = gitConfig(clone, origin);
+    const machineB = await cloneCheckout(origin, 'machine-b');
+
+    expect(await publish(machineA, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
+    const wtB = await ensureReportsWorktree(machineB);
+
+    // Machine B commits a merge from its stale copy but never pushes it...
+    fs.writeFileSync(path.join(wtB, 'stats', 'alice.yaml'), 'n: 100\n');
+    const wtGit = simpleGit(wtB);
+    await wtGit.add(['stats/alice.yaml']);
+    await wtGit.commit('stale stats');
+    // ...while machine A publishes a newer copy of the same file.
+    expect(await publish(machineA, 'stats/alice.yaml', 'n: 2\n')).toBe(true);
+
+    await refreshReportsWorktree(machineB, READ_ONLY);
+    expect(fs.readFileSync(path.join(wtB, 'stats', 'alice.yaml'), 'utf-8')).toBe('n: 2\n');
+    const ahead = await wtGit.raw(['rev-list', '--count', 'origin/teamai-reports..HEAD']);
+    expect(ahead.trim()).toBe('0');
+
+    expect(await publish(machineB, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await originReportsFile(origin, 'members/alice.yaml')).toBe('username: alice\n');
+  });
+
+  it('merges a stale checkout of the same member onto origin instead of diverging', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const machineA = gitConfig(clone, origin);
+    const machineB = await cloneCheckout(origin, 'machine-b');
+
+    expect(await publish(machineA, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
+    await ensureReportsWorktree(machineB);
+    expect(await publish(machineA, 'stats/alice.yaml', 'n: 2\n')).toBe(true);
+
+    const pushed = isPublished(await updateReports(machineB, async (wt) => {
+      const statsPath = path.join(wt, 'stats', 'alice.yaml');
+      const current = Number(/n: (\d+)/.exec(fs.readFileSync(statsPath, 'utf-8'))![1]);
+      fs.writeFileSync(statsPath, `n: ${current + 10}\n`);
+      return { files: ['stats/alice.yaml'], message: '[teamai] Update usage stats for alice' };
+    }));
+
+    expect(pushed).toBe(true);
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('n: 12\n');
+  });
+});
+
+describe('git-kind reports: inherited member root (#735)', () => {
+  let consoleSpy: MockInstance<typeof console.log>;
+
+  beforeEach(() => {
+    consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  /** The machine-local config a `teamai init` wrote; the roster predates the switch. */
+  function writeLocalConfig(clone: string, origin: string, username: string): void {
+    // The seed's bare `team:` line lacks the required `repo` key; give the
+    // clone a teamai.yaml the config loader accepts.
+    fs.writeFileSync(path.join(clone, 'teamai.yaml'), `team: acme\nrepo: ${origin}\nprovider: git\n`);
+    const home = process.env.HOME!;
+    fs.mkdirSync(path.join(home, '.teamai'), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, '.teamai', 'config.yaml'),
+      `repo:\n  localPath: ${clone}\n  remote: ${origin}\n  kind: git\nusername: ${username}\nscope: user\nupdatePolicy: skip\nenabledAgents: [claude]\nadditionalRoles: []\n`,
+    );
+  }
+
+  /** Commit a pre-switch roster file on the clone's default branch. */
+  async function commitLegacyRoster(clone: string, username: string): Promise<void> {
+    const cloneGit = simpleGit(clone);
+    fs.mkdirSync(path.join(clone, 'members'), { recursive: true });
+    fs.writeFileSync(
+      path.join(clone, 'members', `${username}.yaml`),
+      `username: ${username}\nregisteredAt: 2025-01-01T00:00:00.000Z\n`,
+    );
+    await cloneGit.add([`members/${username}.yaml`]);
+    await cloneGit.commit('pre-switch roster');
+  }
+
+  it('lists pre-switch members from the clone without copying or publishing anything', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    await commitLegacyRoster(clone, 'carol');
+    writeLocalConfig(clone, origin, 'carol');
+
+    await listMembers({});
+
+    const allOutput = consoleSpy.mock.calls.map((c) => c[0]).join('\n');
+    expect(allOutput).toContain('Team members (1)');
+    expect(allOutput).toContain('carol');
+    // Read-only cold start: the reports branch is not published, the legacy
+    // file is not copied into the worktree, and the clone copy is untouched.
+    expect(await originHasReportsBranch(origin)).toBe(false);
+    const wt = path.join(tmp, REPORTS_WORKTREE_DIRNAME);
+    expect(fs.existsSync(path.join(wt, 'members', 'carol.yaml'))).toBe(false);
+    expect(
+      fs.readFileSync(path.join(clone, 'members', 'carol.yaml'), 'utf-8'),
+    ).toContain('username: carol');
+  });
+
+  it('lists the union of pre-switch and post-switch members', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    await commitLegacyRoster(clone, 'carol');
+    writeLocalConfig(clone, origin, 'carol');
+
+    const cfg = gitConfig(clone, origin);
+    const wt = await ensureReportsWorktree(cfg);
+    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
+    fs.writeFileSync(
+      path.join(wt, 'members', 'alice.yaml'),
+      'username: alice\nregisteredAt: 2025-06-01T00:00:00.000Z\n',
+    );
+    await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/']);
+
+    await listMembers({});
+
+    const allOutput = consoleSpy.mock.calls.map((c) => c[0]).join('\n');
+    expect(allOutput).toContain('Team members (2)');
+    expect(allOutput).toContain('carol');
+    expect(allOutput).toContain('alice');
+    // Same member on both roots: the reports-branch copy wins.
+    fs.writeFileSync(
+      path.join(wt, 'members', 'carol.yaml'),
+      'username: carol\ndisplayName: Carol (branch)\nregisteredAt: 2025-06-02T00:00:00.000Z\n',
+    );
+    await commitAndPushReports(cfg, '[teamai] Update member roster: carol', ['members/carol.yaml']);
+
+    await listMembers({});
+    const output2 = consoleSpy.mock.calls.map((c) => c[0]).join('\n');
+    expect(output2).toContain('Team members (2)');
+    expect(output2).toContain('Carol (branch)');
+  });
+});
+
+describe('self-mode reports: shared stash', () => {
+  it('does not drop a pre-existing business-worktree stash whose message contains autostash', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const teamaiDir = path.join(clone, '.teamai');
+    fs.mkdirSync(teamaiDir, { recursive: true });
+    const alice: LocalConfig = {
+      repo: { localPath: teamaiDir, remote: origin, kind: 'self', businessRepoRoot: clone },
+      username: 'alice',
+      scope: 'user',
+      additionalRoles: [],
+    };
+    const machineB = await cloneCheckout(origin, 'machine-b');
+
+    expect(await publish(alice, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
+    const wtA = await ensureReportsWorktree(alice);
+
+    fs.mkdirSync(path.join(wtA, 'sessions'), { recursive: true });
+    fs.writeFileSync(path.join(wtA, 'sessions', 'alice.yaml'), 'session: a1\n');
+    const wtGit = simpleGit(wtA);
+    await wtGit.add(['sessions/alice.yaml']);
+    await wtGit.commit('offline session');
+
+    const businessGit = simpleGit(clone);
+    fs.writeFileSync(path.join(clone, 'app.txt'), 'committed\n');
+    await businessGit.add(['app.txt']);
+    await businessGit.commit('app');
+    fs.writeFileSync(path.join(clone, 'app.txt'), 'wip\n');
+    await businessGit.stash(['push', '-m', 'autostash']);
+    const stashBefore = (await businessGit.raw(['stash', 'list'])).trim();
+    expect(stashBefore).toMatch(/autostash/);
+
+    fs.writeFileSync(path.join(wtA, 'stats', 'alice.yaml'), 'n: 3\n');
+    expect(await publish(machineB, 'stats/alice.yaml', 'n: 2\n')).toBe(true);
+
+    await refreshReportsWorktree(alice, READ_ONLY);
+
+    const stats = fs.readFileSync(path.join(wtA, 'stats', 'alice.yaml'), 'utf-8');
+    expect(stats).not.toMatch(/^(<<<<<<<|=======|>>>>>>>)/m);
+    expect(stats).toBe('n: 3\n');
+    expect((await wtGit.status()).conflicted).toEqual([]);
+
+    const stashAfter = (await businessGit.raw(['stash', 'list'])).trim();
+    expect(stashAfter).toBe(stashBefore);
+    expect(fs.readFileSync(path.join(clone, 'app.txt'), 'utf-8')).toBe('committed\n');
+  });
+
+  it('does not drop a business-worktree stash created while reports rebase is running', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const teamaiDir = path.join(clone, '.teamai');
+    fs.mkdirSync(teamaiDir, { recursive: true });
+    const alice: LocalConfig = {
+      repo: { localPath: teamaiDir, remote: origin, kind: 'self', businessRepoRoot: clone },
+      username: 'alice',
+      scope: 'user',
+      additionalRoles: [],
+    };
+    const machineB = await cloneCheckout(origin, 'machine-b');
+
+    expect(await publish(alice, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
+    const wtA = await ensureReportsWorktree(alice);
+
+    fs.mkdirSync(path.join(wtA, 'sessions'), { recursive: true });
+    fs.writeFileSync(path.join(wtA, 'sessions', 'alice.yaml'), 'session: a1\n');
+    const wtGit = simpleGit(wtA);
+    await wtGit.add(['sessions/alice.yaml']);
+    await wtGit.commit('offline session');
+
+    const businessGit = simpleGit(clone);
+    fs.writeFileSync(path.join(clone, 'app.txt'), 'committed\n');
+    await businessGit.add(['app.txt']);
+    await businessGit.commit('app');
+
+    const marker = path.join(tmp, 'rebase-started');
+    const release = path.join(tmp, 'rebase-continue');
+    const hookDir = path.join(clone, '.git', 'hooks');
+    fs.mkdirSync(hookDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(hookDir, 'pre-rebase'),
+      `#!/bin/sh\nprintf 'ready\\n' > ${JSON.stringify(marker)}\nwhile [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done\n`,
+    );
+    fs.chmodSync(path.join(hookDir, 'pre-rebase'), 0o755);
+
+    fs.writeFileSync(path.join(wtA, 'stats', 'alice.yaml'), 'n: 3\n');
+    expect(await publish(machineB, 'stats/alice.yaml', 'n: 2\n')).toBe(true);
+
+    const refreshing = refreshReportsWorktree(alice, READ_ONLY);
+    const deadline = Date.now() + 8000;
+    while (!fs.existsSync(marker) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(fs.existsSync(marker)).toBe(true);
+
+    fs.writeFileSync(path.join(clone, 'app.txt'), 'wip-during-rebase\n');
+    await businessGit.stash(['push', '-m', 'business-wip']);
+    const stashDuring = (await businessGit.raw(['stash', 'list'])).trim();
+    expect(stashDuring).toMatch(/business-wip/);
+
+    fs.writeFileSync(release, 'go\n');
+    await refreshing;
+
+    const stats = fs.readFileSync(path.join(wtA, 'stats', 'alice.yaml'), 'utf-8');
+    expect(stats).not.toMatch(/^(<<<<<<<|=======|>>>>>>>)/m);
+    expect(stats).toBe('n: 3\n');
+    expect((await wtGit.status()).conflicted).toEqual([]);
+    expect((await businessGit.raw(['stash', 'list'])).trim()).toBe(stashDuring);
+    expect(fs.readFileSync(path.join(clone, 'app.txt'), 'utf-8')).toBe('committed\n');
+  });
+});
+
+describe('skill usage stays in the scope that recorded it (#748)', () => {
+  /** A project initialized in project scope against its own team repo. */
+  async function initProject(name: string, skill: string): Promise<{ root: string; origin: string; config: LocalConfig }> {
+    const base = path.join(tmp, name);
+    const { origin, clone } = await seedBareOrigin(base, [skill]);
+    fs.mkdirSync(path.join(base, 'project'));
+    const root = fs.realpathSync.native(path.join(base, 'project'));
+    const git = simpleGit(root);
+    await git.init(['--initial-branch=main']);
+    await configureGit(root);
+    await git.commit('init', { '--allow-empty': null });
+    const config: LocalConfig = {
+      ...gitConfig(clone, origin),
+      scope: 'project',
+      projectRoot: root,
+      dataHome: await resolveProjectDataHome(root),
+    };
+    await saveLocalConfigForScope(config);
+    return { root, origin, config };
+  }
+
+  async function useSkill(cwd: string, skill: string): Promise<void> {
+    const track = buildHandlerRegistry().find((r) => r.handler.name === 'skill-use');
+    if (!track) throw new Error('skill-use handler is not registered');
+    // Only an installed skill counts (#1221).
+    const skillDir = path.join(getUserHome(), '.claude', 'skills', skill);
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), `# ${skill}\n`);
+    // The handler records under the scope the dispatcher resolved for the hook (#810).
+    const payload = { session_id: `s-${skill}`, cwd, tool_name: 'Skill', tool_input: { skill } };
+    await track.handler.execute(payload, 'claude', await resolveHookConfig(payload, 'claude'));
+  }
+
+  async function reportedSkills(origin: string): Promise<string[]> {
+    const stats: unknown = YAML.parse(await simpleGit(origin).raw(['show', 'teamai-reports:stats/alice.yaml']));
+    const skills = stats && typeof stats === 'object' && 'skills' in stats ? stats.skills : undefined;
+    return skills && typeof skills === 'object' ? Object.keys(skills).sort() : [];
+  }
+
+  it("each project's report carries only its own skills, and one report does not consume the other's", async () => {
+    const a = await initProject('team-a', 'skill-a');
+    const c = await initProject('team-c', 'skill-c');
+    await useSkill(a.root, 'skill-a');
+    await useSkill(c.root, 'skill-c');
+
+    await reportUsage(a.config.repo.localPath, 'alice', { selfConfig: a.config });
+    expect(await reportedSkills(a.origin)).toEqual(['skill-a']);
+
+    await reportUsage(c.config.repo.localPath, 'alice', { selfConfig: c.config });
+    expect(await reportedSkills(c.origin)).toEqual(['skill-c']);
+  });
+});
+
+/**
+ * The exact write shape of the votes-sync Stop handler: stage the deltas
+ * onto origin's confirmed snapshot, confirm only on delivery. Real git, real
+ * locks, real worktree — only the hook dispatch around it is left out.
+ */
+async function syncLikeTheHandler(cfg: LocalConfig, votesDir: string, votePath: string): Promise<boolean> {
+  const { updateReports: updateReportsForVotes, readReportsOriginFile } = await import('../utils/reports-branch.js');
+  const { isDelivered } = await import('../utils/branch-worktree.js');
+  const { stageVotesMerge, confirmVotesSynced, readUserVotesFromContent } = await import('../votes.js');
+  const result = await updateReportsForVotes(cfg, async (wt, { onDelivered }) => {
+    const originContent = await readReportsOriginFile(wt, `votes/${cfg.username}.yaml`);
+    const staged = await stageVotesMerge(
+      wt,
+      cfg.username,
+      votesDir,
+      originContent === null ? null : readUserVotesFromContent(originContent),
+    );
+    if (!staged) return null;
+    onDelivered(() => confirmVotesSynced(votePath, staged.syncedDeltas));
+    return {
+      files: [`votes/${cfg.username}.yaml`],
+      message: `[teamai] Update votes for ${cfg.username}`,
+    };
+  });
+  return isDelivered(result);
+}
+
+describe('git-kind reports: votes deltas survive a failed push (#1027)', () => {
+  it('keeps the deltas pending while origin rejects the push and delivers them exactly once on retry', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+
+    const votesDir = getVotesDir(cfg);
+    fs.mkdirSync(votesDir, { recursive: true });
+    const votePath = path.join(votesDir, 'alice.yaml');
+    const { incrementRecalled, incrementUpvoted, hasPendingVoteDeltas, readUserVotesFromContent } = await import('../votes.js');
+    await incrementRecalled(votePath, ['doc-a']);
+    await incrementUpvoted(votePath, ['doc-a']);
+    expect(await hasPendingVoteDeltas(votesDir, 'alice')).toBe(true);
+
+    // Reject reports-branch pushes while this flag exists (an offline or
+    // refusing host across two Stops).
+    const rejectFlag = path.join(origin, 'reject-reports');
+    const hook = path.join(origin, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, `#!/bin/sh
+if [ -f "$(dirname "$0")/../reject-reports" ]; then
+  echo "reports push rejected" >&2
+  exit 1
+fi
+exit 0
+`);
+    fs.writeFileSync(rejectFlag, '');
+    fs.chmodSync(hook, 0o755);
+
+    // Attempt 1: every push attempt is rejected. The old code had already
+    // cleared the deltas at this point, so votes never auto-pushed again.
+    expect(await syncLikeTheHandler(cfg, votesDir, votePath)).toBe(false);
+    expect(await hasPendingVoteDeltas(votesDir, 'alice')).toBe(true);
+
+    // Attempt 2: still rejected. The retry re-merges onto the same origin
+    // snapshot, so the worktree content does not double-count either.
+    expect(await syncLikeTheHandler(cfg, votesDir, votePath)).toBe(false);
+    expect(await hasPendingVoteDeltas(votesDir, 'alice')).toBe(true);
+
+    // Origin accepts again: the retry delivers exactly one recall + one upvote.
+    fs.rmSync(rejectFlag);
+    expect(await syncLikeTheHandler(cfg, votesDir, votePath)).toBe(true);
+    expect(await hasPendingVoteDeltas(votesDir, 'alice')).toBe(false);
+
+    const votes = readUserVotesFromContent(await originReportsFile(origin, 'votes/alice.yaml'));
+    expect(votes.votes['doc-a']).toMatchObject({ recalled_count: 1, upvoted_count: 1 });
+  }, 60_000);
+});
+
+describe('git-kind reports: a retry that finds its content already committed', () => {
+  /** Makes `origin` refuse every push while it holds a `refuse-push` file, and returns that file. */
+  function refusePushes(origin: string): string {
+    const hook = path.join(origin, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, '#!/bin/sh\nif [ -f "$(dirname "$0")/../refuse-push" ]; then echo "push refused" >&2; exit 1; fi\nexit 0\n');
+    fs.chmodSync(hook, 0o755);
+    const flag = path.join(origin, 'refuse-push');
+    fs.writeFileSync(flag, '');
+    return flag;
+  }
+
+  /** Writes `stats/alice.yaml` unless the worktree already holds it, then names it, or no file when it was there. */
+  async function writeStats(wt: string): Promise<{ files: string[]; message: string }> {
+    const file = path.join(wt, 'stats', 'alice.yaml');
+    const there = fs.existsSync(file);
+    if (!there) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'runs: 1\n');
+    }
+    return { files: there ? [] : ['stats/alice.yaml'], message: '[teamai] Update stats' };
+  }
+
+  it('pushes the commit a refused push left behind when the retry writes no file', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    expect(await publish(cfg, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    const flag = refusePushes(origin);
+    expect(await updateReports(cfg, writeStats)).toMatchObject({ status: 'failed' });
+    fs.rmSync(flag);
+
+    expect(await updateReports(cfg, writeStats)).toEqual({ status: 'published' });
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('runs: 1\n');
+  }, 60_000);
+
+  it('pushes nothing for a write that returns null, and leaves the commit for the next writer', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    expect(await publish(cfg, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    const flag = refusePushes(origin);
+    expect(await updateReports(cfg, writeStats)).toMatchObject({ status: 'failed' });
+    fs.rmSync(flag);
+
+    expect(await updateReports(cfg, async () => null)).toEqual({ status: 'already-present' });
+    await expect(originReportsFile(origin, 'stats/alice.yaml')).rejects.toThrow();
+    expect(await updateReports(cfg, writeStats)).toEqual({ status: 'published' });
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('runs: 1\n');
+  }, 60_000);
+});
+
+describe('git-kind reports: a delivered push without its confirmation (#1027)', () => {
+  it('recognizes the landed counts on the next sync instead of replaying them', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+
+    const votesDir = getVotesDir(cfg);
+    fs.mkdirSync(votesDir, { recursive: true });
+    const votePath = path.join(votesDir, 'alice.yaml');
+    const { incrementRecalled, incrementUpvoted, hasPendingVoteDeltas, stageVotesMerge, readUserVotesFromContent } = await import('../votes.js');
+    const { readReportsOriginFile } = await import('../utils/reports-branch.js');
+    await incrementRecalled(votePath, ['doc-a']);
+    await incrementUpvoted(votePath, ['doc-a']);
+
+    // Stage into the worktree (this persists the delivery watermark locally)…
+    const wt = await ensureReportsWorktree(cfg);
+    const originContent = await readReportsOriginFile(wt, 'votes/alice.yaml');
+    expect(await stageVotesMerge(
+      wt, 'alice', votesDir,
+      originContent === null ? null : readUserVotesFromContent(originContent),
+    )).not.toBeNull();
+
+    // …then emulate the crash window: the push lands — straight through git,
+    // exactly what the CLI's own push did — but confirmVotesSynced never runs.
+    expect(await commitAndPushReports(cfg, '[teamai] Update votes for alice', ['votes/alice.yaml'])).toBe(true);
+    expect(await hasPendingVoteDeltas(votesDir, 'alice')).toBe(true);
+
+    // The next sync recognizes delivery: nothing is re-added, no second
+    // commit is needed, and the deltas clear.
+    expect(await syncLikeTheHandler(cfg, votesDir, votePath)).toBe(true);
+    expect(await hasPendingVoteDeltas(votesDir, 'alice')).toBe(false);
+    const votes = readUserVotesFromContent(await originReportsFile(origin, 'votes/alice.yaml'));
+    expect(votes.votes['doc-a']).toMatchObject({ recalled_count: 1, upvoted_count: 1 });
+  }, 60_000);
+});
+
+describe('git-kind reports: a stalled origin', () => {
+  let server: http.Server;
+  let stalledUrl: string;
+
+  beforeEach(async () => {
+    server = http.createServer((_req, res) => {
+      res.write('HTTP/1.1 200 OK\r\n');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('failed to bind test server');
+    stalledUrl = `http://127.0.0.1:${addr.port}/team.git`;
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('fails the write within the block timeout and releases the reports lock', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    await ensureReportsWorktree(cfg);
+    await simpleGit(clone).remote(['set-url', 'origin', stalledUrl]);
+    vi.stubEnv('TEAMAI_INIT_PUSH_TIMEOUT_MS', '1000');
+
+    const start = Date.now();
+    const result = await updateReports(cfg, async (wt) => {
+      fs.mkdirSync(path.join(wt, 'stats'), { recursive: true });
+      fs.writeFileSync(path.join(wt, 'stats', 'alice.yaml'), 'sessions: 1\n');
+      return { files: ['stats/alice.yaml'], message: '[teamai] Update stats for alice' };
+    });
+
+    expect(result).toMatchObject({ status: 'failed', reason: expect.stringMatching(/^git push --progress origin teamai-reports .*stalled: no output for 1s/) });
+    // One stalled fetch and one stalled push; retrying the push would add a
+    // stalled fetch and push per attempt, 10s or more.
+    expect(Date.now() - start).toBeLessThan(6_000);
+    expect((await updateReports(cfg, async () => null)).status).toBe('already-present');
+  }, 30_000);
+
+  it('drops every connection to the stalled origin once the write fails, so the CLI can exit', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    await ensureReportsWorktree(cfg);
+    await simpleGit(clone).remote(['set-url', 'origin', stalledUrl]);
+    vi.stubEnv('TEAMAI_INIT_PUSH_TIMEOUT_MS', '1000');
+
+    const result = await updateReports(cfg, async (wt) => {
+      fs.mkdirSync(path.join(wt, 'stats'), { recursive: true });
+      fs.writeFileSync(path.join(wt, 'stats', 'alice.yaml'), 'sessions: 1\n');
+      return { files: ['stats/alice.yaml'], message: '[teamai] Update stats for alice' };
+    });
+
+    expect(result).toMatchObject({ status: 'failed' });
+    const openConnections = () => new Promise<number>((resolve, reject) => {
+      server.getConnections((err, count) => (err ? reject(err) : resolve(count)));
+    });
+    // curl averages the speed over about six seconds, and this origin sent a
+    // body chunk, so its stall limit lands that long after the kill.
+    await vi.waitFor(async () => expect(await openConnections()).toBe(0), { timeout: 20_000, interval: 100 });
+  }, 30_000);
+});
+
+describe('git-kind reports: an origin that answers every request with an error', () => {
+  let server: http.Server;
+  let failingUrl: string;
+  const requests: string[] = [];
+
+  beforeEach(async () => {
+    requests.length = 0;
+    server = http.createServer((req, res) => {
+      requests.push(req.url ?? '');
+      res.writeHead(503).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('failed to bind test server');
+    failingUrl = `http://127.0.0.1:${addr.port}/team.git`;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('asks origin once per write, since no fetch or rebase makes it answer', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    await ensureReportsWorktree(cfg);
+    await simpleGit(clone).remote(['set-url', 'origin', failingUrl]);
+
+    expect(await publish(cfg, 'stats/alice.yaml', 'n: 1\n')).toBe(false);
+    expect(requests).toEqual(['/team.git/info/refs?service=git-receive-pack']);
+  });
+});

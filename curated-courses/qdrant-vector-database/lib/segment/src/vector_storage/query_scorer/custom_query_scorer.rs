@@ -1,0 +1,112 @@
+use std::borrow::Cow;
+use std::marker::PhantomData;
+
+use common::ambient::hw::HwScale;
+use common::typelevel::True;
+use common::types::{PointOffsetType, ScoreType};
+use zerocopy::FromBytes;
+
+use crate::common::operation_error::OperationResult;
+use crate::data_types::primitive::PrimitiveVectorElement;
+use crate::data_types::vectors::{DenseVector, TypedDenseVector};
+use crate::spaces::metric::Metric;
+use crate::vector_storage::DenseVectorStorageRead;
+use crate::vector_storage::query::{Query, TransformInto};
+use crate::vector_storage::query_scorer::QueryScorer;
+
+pub struct CustomQueryScorer<
+    'a,
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
+    TVectorStorage: DenseVectorStorageRead<TElement>,
+    TStoredQuery: Query<TypedDenseVector<TElement>>,
+> {
+    hw: HwScale,
+    vector_storage: &'a TVectorStorage,
+    query: TStoredQuery,
+    metric: PhantomData<TMetric>,
+    _element: PhantomData<TElement>,
+}
+
+impl<
+    'a,
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
+    TVectorStorage: DenseVectorStorageRead<TElement>,
+    TStoredQuery: Query<TypedDenseVector<TElement>>,
+> CustomQueryScorer<'a, TElement, TMetric, TVectorStorage, TStoredQuery>
+{
+    pub fn new<TInputQuery>(query: TInputQuery, vector_storage: &'a TVectorStorage) -> Self
+    where
+        TInputQuery: Query<DenseVector>
+            + TransformInto<TStoredQuery, DenseVector, TypedDenseVector<TElement>>,
+    {
+        let query = query
+            .transform(&|vector| {
+                let preprocessed_vector = TMetric::preprocess(vector);
+                Ok(TypedDenseVector::from(TElement::slice_from_float_cow(
+                    Cow::from(preprocessed_vector),
+                )))
+            })
+            .unwrap();
+
+        let dim = vector_storage.vector_dim();
+
+        Self {
+            hw: HwScale {
+                cpu: dim * size_of::<TElement>(),
+                vector_io_read: if vector_storage.is_cold() {
+                    dim * size_of::<TElement>()
+                } else {
+                    0
+                },
+            },
+            query,
+            vector_storage,
+            metric: PhantomData,
+            _element: PhantomData,
+        }
+    }
+
+    /// Score the query against an explicit vector (not one stored in the
+    /// storage). Used internally by `score_stored_batch` and
+    /// [`QueryScorer::score_bytes`].
+    #[inline]
+    fn score(&self, against: &[TElement]) -> ScoreType {
+        self.query.score_by(|example| {
+            self.hw.cpu(1);
+            TMetric::similarity(example, against)
+        })
+    }
+}
+
+impl<
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
+    TVectorStorage: DenseVectorStorageRead<TElement>,
+    TStoredQuery: Query<TypedDenseVector<TElement>>,
+> QueryScorer for CustomQueryScorer<'_, TElement, TMetric, TVectorStorage, TStoredQuery>
+{
+    #[inline]
+    fn score_stored_batch(
+        &self,
+        ids: &[PointOffsetType],
+        scores: &mut [ScoreType],
+    ) -> OperationResult<()> {
+        debug_assert_eq!(ids.len(), scores.len());
+
+        self.hw.vector_io_read(ids.len());
+
+        self.vector_storage
+            .for_each_in_dense_batch(ids, |idx, vector| scores[idx] = self.score(vector))
+    }
+
+    fn score_internal(&self, _point_a: PointOffsetType, _point_b: PointOffsetType) -> ScoreType {
+        unimplemented!("Custom scorer can compare against multiple vectors, not just one")
+    }
+
+    type SupportsBytes = True;
+    fn score_bytes(&self, _enabled: Self::SupportsBytes, bytes: &[u8]) -> ScoreType {
+        self.score(<[TElement]>::ref_from_bytes(bytes).unwrap())
+    }
+}

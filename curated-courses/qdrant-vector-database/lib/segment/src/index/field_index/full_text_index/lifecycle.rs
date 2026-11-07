@@ -1,0 +1,414 @@
+use std::borrow::Cow;
+use std::path::PathBuf;
+
+use common::bitvec::BitSlice;
+use common::types::PointOffsetType;
+use common::universal_io::{MmapFs, Populate};
+use itertools::Itertools as _;
+use serde::Serialize;
+use serde_json::Value;
+
+use super::immutable_text_index::ImmutableFullTextIndex;
+use super::inverted_index::ARRAY_BOUNDARY_SENTINEL;
+use super::inverted_index::on_disk_inverted_index::has_doc_len_sidecar;
+use super::mutable_text_index::MutableFullTextIndex;
+use super::on_disk_text_index::{FullTextMmapIndexBuilder, OnDiskFullTextIndex};
+use super::tokenizers::Tokenizer;
+use super::{FullTextGridstoreIndexBuilder, FullTextIndex, StoredDocument};
+use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult};
+use crate::data_types::index::TextIndexParams;
+use crate::index::field_index::{FieldIndexBuilderTrait, PayloadFieldIndex, ValueIndexer};
+use crate::index::payload_config::IndexMutability;
+use crate::types::Memory;
+
+/// A point's tokens, as [`FullTextIndex::tokenize_document`] produces them.
+pub(super) struct DocumentTokens<'a> {
+    pub tokens: Vec<Cow<'a, str>>,
+    /// How many of `tokens` are sentinels that were inserted, rather than found in the text.
+    sentinels: usize,
+}
+
+impl DocumentTokens<'_> {
+    /// Number of tokens in the document, for BM25 length normalization.
+    ///
+    /// Discounts the inserted sentinels by count rather than by value:
+    /// `tokenize_doc` does not strip the sentinel from user text the way
+    /// `tokenize_query` does, so a payload containing it has those tokens
+    /// indexed, and they must be counted. This also keeps the length the same
+    /// with phrase matching on or off.
+    pub fn length(&self) -> u32 {
+        self.tokens.len().saturating_sub(self.sentinels) as u32
+    }
+}
+
+impl FullTextIndex {
+    pub fn new_mmap(
+        path: PathBuf,
+        config: TextIndexParams,
+        memory: Memory,
+        deleted_points: &BitSlice,
+    ) -> OperationResult<Option<Self>> {
+        // Low-memory mode degrades the placement at load time (pinned falls back to the
+        // pure-mmap variant). Files are shared between variants; the persisted
+        // configuration is untouched.
+        let memory = memory.clamp_to_low_memory();
+
+        let populate = Populate::from(memory.populate_on_open());
+        let scoring = config.scoring();
+
+        // Checked before the open, not after: opening populates the whole file
+        // set, and on the first start after scoring is enabled every existing
+        // segment would fault in its postings only to be discarded here.
+        if scoring && !has_doc_len_sidecar(&MmapFs, &path)? {
+            log::info!(
+                "Text index at {path} records no document lengths, rebuilding it from payload",
+                path = path.display(),
+            );
+            return Ok(None);
+        }
+
+        let opened = if memory.is_heap() {
+            ImmutableFullTextIndex::open(&MmapFs, path, config, populate, deleted_points)?
+                .map(|index| (index.can_score(), Self::Immutable(index)))
+        } else {
+            OnDiskFullTextIndex::open(&MmapFs, path, config, populate, deleted_points)?
+                .map(|index| (index.can_score(), Self::OnDisk(index)))
+        };
+        let Some((can_score, index)) = opened else {
+            return Ok(None);
+        };
+
+        // Lengths and term frequencies cannot be recovered from anything else
+        // on disk, so report the
+        // index absent and let the caller rebuild it from payload. The decision
+        // belongs here rather than in `OnDiskInvertedIndex::open`: the read-only
+        // stack never builds, and would drop the field instead.
+        //
+        // Reachable past the probe above when the sidecar exists but `open`
+        // rejected it, or when scoring has no term frequencies, so the log says
+        // which of the two happened.
+        if scoring && !can_score {
+            log::info!(
+                "Text index rejected its document lengths or has no term frequencies, \
+                 rebuilding from payload"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(index))
+    }
+
+    pub fn new_gridstore(
+        dir: PathBuf,
+        config: TextIndexParams,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
+        let scoring = config.scoring();
+        let index = MutableFullTextIndex::open_gridstore(dir, config, create_if_missing, scoring)?;
+        Ok(index.map(Self::Mutable))
+    }
+
+    pub fn init(&mut self) -> OperationResult<()> {
+        match self {
+            Self::Mutable(index) => index.init(),
+            Self::Immutable(_) => {
+                debug_assert!(false, "Immutable index should be initialized before use");
+                Ok(())
+            }
+            Self::OnDisk(_) => {
+                debug_assert!(false, "On-disk index should be initialized before use");
+                Ok(())
+            }
+        }
+    }
+
+    pub fn builder_mmap(
+        path: PathBuf,
+        config: TextIndexParams,
+        memory: Memory,
+        deleted_points: &BitSlice,
+        scoring: bool,
+    ) -> FullTextMmapIndexBuilder {
+        FullTextMmapIndexBuilder::new(path, config, memory, deleted_points, scoring)
+    }
+
+    pub fn builder_gridstore(
+        dir: PathBuf,
+        config: TextIndexParams,
+        scoring: bool,
+    ) -> FullTextGridstoreIndexBuilder {
+        FullTextGridstoreIndexBuilder::new(dir, config, scoring)
+    }
+
+    /// Tokenize a point's text values into the token stream the index is built
+    /// from, in document order.
+    ///
+    /// With phrase matching on, a sentinel separates the values of an array, so
+    /// that no phrase matches across two of them. Another one goes before each
+    /// detached token (see [`Tokenizer::tokenize_doc_detached`]), so that it is
+    /// next to no other token, and only matches a phrase of itself alone.
+    ///
+    /// A stream made only of those sentinels is returned empty, so that an
+    /// array whose values all tokenize to nothing is not a document, the same
+    /// as a single value that tokenizes to nothing.
+    pub(super) fn tokenize_document<'a>(
+        tokenizer: &'a Tokenizer,
+        phrase_matching: bool,
+        values: &'a [String],
+    ) -> DocumentTokens<'a> {
+        let insert_boundaries = phrase_matching && values.len() > 1;
+
+        let mut tokens: Vec<Cow<str>> = Vec::with_capacity((values.len() * 2).saturating_sub(1));
+        let mut sentinels = 0;
+        for (i, value) in values.iter().enumerate() {
+            if insert_boundaries && i > 0 {
+                tokens.push(Cow::Borrowed(ARRAY_BOUNDARY_SENTINEL));
+                sentinels += 1;
+            }
+            tokenizer.tokenize_doc_detached(value, |token, detached| {
+                if phrase_matching && detached {
+                    tokens.push(Cow::Borrowed(ARRAY_BOUNDARY_SENTINEL));
+                    sentinels += 1;
+                }
+                tokens.push(token);
+            });
+        }
+
+        let mut document = DocumentTokens { tokens, sentinels };
+        if document.length() == 0 {
+            document.tokens.clear();
+            document.sentinels = 0;
+        }
+        document
+    }
+
+    /// Encode a point's tokens as the document the storage holds.
+    ///
+    /// Phrase matching needs them in the order they were written, and an
+    /// index that scores (records lengths) needs their repeats, so both keep
+    /// them as written. Otherwise only membership matters, and they are stored
+    /// sorted and deduplicated.
+    pub(super) fn serialize_stored_document(
+        str_tokens: Vec<Cow<str>>,
+        phrase_matching: bool,
+        doc_len: Option<u32>,
+    ) -> OperationResult<Vec<u8>> {
+        let tokens = if phrase_matching || doc_len.is_some() {
+            str_tokens
+        } else {
+            str_tokens.into_iter().sorted().dedup().collect()
+        };
+
+        Self::serialize_document(tokens, doc_len)
+    }
+
+    pub(super) fn serialize_document(
+        tokens: Vec<Cow<str>>,
+        doc_len: Option<u32>,
+    ) -> OperationResult<Vec<u8>> {
+        #[derive(Serialize)]
+        struct StoredDocumentRef<'a> {
+            tokens: Vec<Cow<'a, str>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            doc_len: Option<u32>,
+        }
+        let doc = StoredDocumentRef { tokens, doc_len };
+        serde_cbor::to_vec(&doc).map_err(|e| {
+            OperationError::service_error(format!("Failed to serialize document: {e}"))
+        })
+    }
+
+    pub(super) fn deserialize_document(data: &[u8]) -> OperationResult<StoredDocument> {
+        serde_cbor::from_slice::<StoredDocument>(data).map_err(|e| {
+            OperationError::service_error(format!("Failed to deserialize document: {e}"))
+        })
+    }
+
+    pub fn get_mutability_type(&self) -> IndexMutability {
+        match self {
+            FullTextIndex::Mutable(_) => IndexMutability::Mutable,
+            FullTextIndex::Immutable(_) => IndexMutability::Immutable,
+            FullTextIndex::OnDisk(_) => IndexMutability::Immutable,
+        }
+    }
+
+    pub fn populate(&self) -> OperationResult<()> {
+        match self {
+            // Mutable / Immutable keep their inverted index fully in RAM —
+            // there is nothing to populate.
+            Self::Mutable(_) | Self::Immutable(_) => Ok(()),
+            Self::OnDisk(index) => index.populate(),
+        }
+    }
+
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        match self {
+            Self::Mutable(index) => index.clear_cache(),
+            // Nothing to drop: no file is open, and the load cleared their cache.
+            Self::Immutable(_) => Ok(()),
+            Self::OnDisk(index) => index.clear_cache(),
+        }
+    }
+
+    pub fn files(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Mutable(index) => index.files(),
+            Self::Immutable(index) => index.files(),
+            Self::OnDisk(index) => index.files(),
+        }
+    }
+
+    pub fn immutable_files(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Mutable(_) => Vec::new(),
+            Self::Immutable(index) => index.immutable_files(),
+            Self::OnDisk(index) => index.immutable_files(),
+        }
+    }
+}
+
+impl ValueIndexer for FullTextIndex {
+    type ValueType = String;
+
+    fn add_many(&mut self, idx: PointOffsetType, values: Vec<String>) -> OperationResult<()> {
+        match self {
+            Self::Mutable(index) => index.add_many(idx, values),
+            Self::Immutable(_) => Err(OperationError::service_error(
+                "Cannot add values to immutable text index",
+            )),
+            Self::OnDisk(_) => Err(OperationError::service_error(
+                "Cannot add values to on-disk text index",
+            )),
+        }
+    }
+
+    fn get_value(value: &Value) -> Option<String> {
+        value.as_str().map(ToOwned::to_owned)
+    }
+
+    fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
+        match self {
+            FullTextIndex::Mutable(index) => index.remove_point(id)?,
+            FullTextIndex::Immutable(index) => index.remove_point(id),
+            FullTextIndex::OnDisk(index) => index.remove_point(id),
+        }
+        Ok(())
+    }
+}
+
+impl PayloadFieldIndex for FullTextIndex {
+    fn wipe(self) -> OperationResult<()> {
+        match self {
+            Self::Mutable(index) => index.wipe(),
+            Self::Immutable(index) => index.wipe(),
+            Self::OnDisk(index) => index.wipe(),
+        }
+    }
+
+    fn flusher(&self) -> Flusher {
+        match self {
+            Self::Mutable(index) => index.flusher(),
+            Self::Immutable(index) => index.flusher(),
+            Self::OnDisk(index) => index.flusher(),
+        }
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        FullTextIndex::files(self)
+    }
+
+    fn immutable_files(&self) -> Vec<PathBuf> {
+        FullTextIndex::immutable_files(self)
+    }
+}
+
+impl FullTextGridstoreIndexBuilder {
+    pub fn new(dir: PathBuf, config: TextIndexParams, scoring: bool) -> Self {
+        Self {
+            dir,
+            config,
+            scoring,
+            index: None,
+        }
+    }
+
+    /// Don't journal the value mappings of the built index, see
+    /// [`Blobstore::disable_journal`](blobstore::Blobstore::disable_journal). Call after `init`.
+    pub(crate) fn disable_journal(&mut self) {
+        if let Some(FullTextIndex::Mutable(index)) = &mut self.index {
+            index.storage.disable_journal();
+        }
+    }
+}
+
+impl ValueIndexer for FullTextGridstoreIndexBuilder {
+    type ValueType = String;
+
+    fn get_value(value: &Value) -> Option<String> {
+        FullTextIndex::get_value(value)
+    }
+
+    fn add_many(
+        &mut self,
+        id: PointOffsetType,
+        values: Vec<Self::ValueType>,
+    ) -> OperationResult<()> {
+        let values: Vec<Value> = values.into_iter().map(Value::String).collect();
+        let values: Vec<&Value> = values.iter().collect();
+        FieldIndexBuilderTrait::add_point(self, id, &values)?;
+        Ok(())
+    }
+
+    fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
+        let Some(index) = &mut self.index else {
+            return Err(OperationError::service_error(
+                "FullTextIndexGridstoreBuilder: index must be initialized before adding points",
+            ));
+        };
+        index.remove_point(id)
+    }
+}
+
+impl FieldIndexBuilderTrait for FullTextGridstoreIndexBuilder {
+    type FieldIndexType = FullTextIndex;
+
+    fn init(&mut self) -> OperationResult<()> {
+        assert!(
+            self.index.is_none(),
+            "index must be initialized exactly once",
+        );
+        let index = MutableFullTextIndex::open_gridstore(
+            self.dir.clone(),
+            self.config.clone(),
+            true,
+            self.scoring,
+        )?
+        .ok_or_else(|| {
+            OperationError::service_error(
+                "Failed to create and open mutable full text index on gridstore",
+            )
+        })?;
+        self.index.replace(FullTextIndex::Mutable(index));
+        Ok(())
+    }
+
+    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<bool> {
+        let Some(index) = &mut self.index else {
+            return Err(OperationError::service_error(
+                "FullTextIndexGridstoreBuilder: index must be initialized before adding points",
+            ));
+        };
+        index.add_point(id, payload)
+    }
+
+    fn finalize(mut self) -> OperationResult<Self::FieldIndexType> {
+        let Some(index) = self.index.take() else {
+            return Err(OperationError::service_error(
+                "FullTextIndexGridstoreBuilder: index must be initialized to finalize",
+            ));
+        };
+        index.flusher()()?;
+        Ok(index)
+    }
+}

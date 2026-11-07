@@ -1,0 +1,311 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    branches:
+      - master
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# OpenCode 2 for the session migrate and OpenCode hooks E2Es. `opencode-ai` on
+# npm is OpenCode 1; OpenCode 2 ships as `@opencode/cli`, one npm package per
+# platform. Bump both values together.
+env:
+  OPENCODE2_VERSION: 2.0.29
+  OPENCODE2_LINUX_X64_SHA256: 14b5a6638a1a093ac9d484599c844b10c29b445d04844b682ccc668ce26530a2
+
+jobs:
+  lint-and-test:
+    name: Lint & Test (Node ${{ matrix.node-version }} on ubuntu-latest)
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npx vitest run
+
+  # The full suite. A git repo under os.tmpdir() resolves /var through
+  # /private/var here and not on Linux (branch-worktree-retire, run
+  # 39965490386). Outside build.needs, as coverage is: a red shard is a
+  # failed check on the PR, and Build does not wait. The provider PATH
+  # file is under e2e/, which the unit run excludes, so one shard runs it.
+  macos:
+    name: Unit tests (Node 22 on macos-latest, shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/2', '2/2']
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Unit tests
+        run: npx vitest run --shard=${{ matrix.shard }}
+
+      - name: Provider CLI path
+        if: matrix.shard == '1/2'
+        run: npx vitest run --config vitest.e2e.config.ts src/__tests__/e2e/providers-cli-path.test.ts
+
+  # Coverage made the Node 20 leg the slowest unit job (17 min against 10).
+  # It runs on its own, outside Build's needs, so nothing waits for it.
+  coverage:
+    name: Unit test coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Unit tests with coverage
+        run: npx vitest run --coverage
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
+  prepare-build:
+    name: Prepare build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: OpenCode recall E2E
+        run: npx vitest run --config vitest.e2e.config.ts src/__tests__/e2e/opencode-recall.test.ts
+
+      # Needs no network or secrets: a fake `gh` on PATH. Guards #711.
+      - name: Unattended init E2E
+        run: npx vitest run --config vitest.e2e.config.ts src/__tests__/e2e/init-unattended.test.ts
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # Keep the existing Build check gated on the unit matrix while E2E can
+  # consume the prepared artifact as soon as it is available.
+  build:
+    name: Build
+    needs: [lint-and-test, prepare-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm build and unit matrix passed
+        run: echo "Build and unit test matrix passed."
+
+  # Three shards of the suite at once, each on its own 4-vCPU runner: vitest's
+  # hash splits the files into thirds of about the same running time. Runs on
+  # every event; the remote fixture cases skip here and run in `e2e` below.
+  fork-e2e-shard:
+    name: E2E (fork-safe, no credentials, shard ${{ matrix.shard }}/3)
+    needs: prepare-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # A pinned tarball checked against its sha256, never a piped install script.
+      - name: Install OpenCode 2
+        run: |
+          dir="$RUNNER_TEMP/opencode2"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/cli.tgz" "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-$OPENCODE2_VERSION.tgz"
+          echo "$OPENCODE2_LINUX_X64_SHA256  $dir/cli.tgz" | sha256sum -c -
+          tar -xzf "$dir/cli.tgz" -C "$dir"
+          "$dir/package/bin/opencode" --version
+          echo "$dir/package/bin" >> "$GITHUB_PATH"
+          echo "TEAMAI_OPENCODE_V2_BIN=$dir/package/bin/opencode" >> "$GITHUB_ENV"
+
+      # Fork code is untrusted. Never expose repository secrets to this job.
+      # Remote-provider cases skip themselves when credentials are absent.
+      # The e2e setup file (src/__tests__/helpers/isolate-e2e-env.ts) gives each
+      # test file a sandbox HOME with its own git identity.
+      - name: Run E2E (no remote credentials)
+        run: npx vitest run --config vitest.e2e.config.ts --shard=${{ matrix.shard }}/3
+
+  # Keeps the check name branch protection requires. Runs whatever the shards
+  # did: a job that only needed them would be skipped when one fails, and a
+  # skipped required check passes.
+  fork-e2e:
+    name: E2E (fork-safe, no credentials)
+    needs: fork-e2e-shard
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm every E2E shard passed
+        run: test "${{ needs.fork-e2e-shard.result }}" = success
+
+  # Only the file that touches the shared fixture repo; the shards above run
+  # the rest of the suite.
+  e2e:
+    name: E2E (GitHub provider, remote fixture)
+    needs: prepare-build
+    if: ${{ vars.TEAMAI_TEST_REPO_URL != '' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    # E2E shares one fixture repo. Serialize across all branches/PRs so
+    # concurrent runs don't trample each other's state. Don't cancel
+    # in-progress jobs — let them finish to leave the fixture clean.
+    concurrency:
+      group: e2e-fixture-repo
+      cancel-in-progress: false
+    # Fork PRs run the credential-free job above. Never expose the fixture
+    # token to code from a fork.
+    env:
+      TEAMAI_TEST_PROVIDER: github
+      TEAMAI_TEST_REPO_URL: ${{ vars.TEAMAI_TEST_REPO_URL }}
+      TEAMAI_TEST_TOKEN: ${{ secrets.TEAMAI_TEST_TOKEN }}
+      # The CLI's GitHub provider auto-picks up GITHUB_TOKEN for auth.
+      GITHUB_TOKEN: ${{ secrets.TEAMAI_TEST_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # Each test file runs in a sandbox HOME with its own git identity
+      # (src/__tests__/helpers/isolate-e2e-env.ts); the remote cases clone the
+      # fixture repo into it themselves (prepareRemoteTeamHome in e2e.test.ts).
+      - name: Run E2E (remote fixture)
+        run: npx vitest run --config vitest.e2e.config.ts --reporter=verbose src/__tests__/e2e/e2e.test.ts
+
+  # Not required: not in `build.needs` nor in branch protection, and no
+  # `continue-on-error`, which would paint a failure green. Add it to
+  # `build.needs` once it stays green.
+  windows:
+    name: Windows (paths, hook rendering, hook shells)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      # The list lives in src/__tests__/helpers/windows-tests.ts;
+      # windows-test-list.test.ts checks its entries exist, and the
+      # teamai/windows-tests lint rule keeps POSIX-only code out of them.
+      - name: Windows-safe unit tests
+        run: npx vitest run --config vitest.windows.config.ts
+
+      # One real `teamai hook-dispatch session-start` per hook shell: Git Bash,
+      # Windows PowerShell, node. The e2e setup puts the built CLI on PATH as
+      # teamai.cmd. The file skips itself off Windows.
+      - name: Hook shells
+        run: npx vitest run --config vitest.e2e.config.ts src/__tests__/e2e/hook-shells-windows.test.ts
+
+      - name: Long-path team-repo pull
+        run: npx vitest run --config vitest.e2e.config.ts src/__tests__/e2e/windows-longpaths.test.ts
+
+      # The CodeBuddy project gate (#1494): cmd.exe and Git Bash run the same
+      # gate, and only Windows shows that. The unit list above runs Windows-safe
+      # files only, so the gate's e2e cases run here.
+      - name: CodeBuddy project gate
+        run: npx vitest run --config vitest.e2e.config.ts src/__tests__/e2e/hooks-project-isolation-issue373.test.ts
+
+      # CreateProcess launches the .cmd sibling. The rest of the provider PATH
+      # file compares directory strings, which disagree on this runner: temp
+      # is the 8.3 form and `where` returns the long form.
+      - name: Provider CLI .cmd shim
+        run: npx vitest run src/__tests__/providers-cli-cmd.test.ts

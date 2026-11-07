@@ -1,0 +1,697 @@
+import fse from 'fs-extra';
+import crypto from 'node:crypto';
+import path from 'node:path';
+import { z } from 'zod';
+import { isJsonObject } from '../types.js';
+import { log } from './logger.js';
+import { expandHome } from './home.js';
+import { editJsonText, isPlainJson, parseJson, parseJsonAs, type JsonSyntax } from './json.js';
+
+const IGNORED_NAMES = new Set([
+  '__pycache__',
+  '.pyc',
+  '.DS_Store',
+  'node_modules',
+  '.git',
+]);
+
+export function isIgnored(name: string): boolean {
+  return IGNORED_NAMES.has(name) || name.endsWith('.pyc');
+}
+
+/**
+ * The suffix of a draft `recall maintenance --update-quality` writes beside a team doc, rule or skill file for a person
+ * to review. It is no team knowledge until renamed, so pull delivers none and recall reads none.
+ */
+export const DRAFT_SUFFIX = '.draft.md';
+
+/** Whether a team file is a draft (`DRAFT_SUFFIX`). Read on the team's side only, so pull still sweeps a copy it delivered before. */
+export function isDraft(file: string): boolean {
+  return file.endsWith(DRAFT_SUFFIX);
+}
+
+export { expandHome } from './home.js';
+
+const ErrnoErrorSchema = z.object({ code: z.string() });
+
+/**
+ * The error code (`ENOENT`, `EACCES`, ...) a failed fs or child-process call
+ * carries, or undefined when the thrown value has none.
+ */
+export function errnoCode(cause: unknown): string | undefined {
+  const parsed = ErrnoErrorSchema.safeParse(cause);
+
+  return parsed.success ? parsed.data.code : undefined;
+}
+
+/**
+ * Ensure a directory exists
+ */
+export async function ensureDir(dir: string): Promise<void> {
+  await fse.ensureDir(expandHome(dir));
+}
+
+/**
+ * Read a file, return null if not found
+ */
+export async function readFileSafe(filePath: string): Promise<string | null> {
+  try {
+    return await fse.readFile(expandHome(filePath), 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read a file that is allowed to be absent. `null` means the file does not
+ * exist; any other failure (permissions, I/O) is thrown, unlike `readFileSafe`,
+ * which folds every error into `null`. Use this where a caller must tell
+ * "the team has no such file" apart from "the file could not be read".
+ */
+export async function readFileIfExists(filePath: string): Promise<string | null> {
+  try {
+    return await fse.readFile(expandHome(filePath), 'utf-8');
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
+ * Write a file, creating parent dirs as needed. Bytes are written as they are.
+ */
+export async function writeFile(filePath: string, content: string | Uint8Array): Promise<void> {
+  const expanded = expandHome(filePath);
+  await fse.ensureDir(path.dirname(expanded));
+  await fse.writeFile(expanded, content, 'utf-8');
+}
+
+const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * The path a link chain starting at `filePath` ends at, whether or not a file
+ * exists there yet; `filePath` itself when it is not a link. Each hop resolves
+ * against the real directory of the link, as the kernel does.
+ */
+export async function symlinkTarget(filePath: string): Promise<string> {
+  let target = filePath;
+
+  for (let hops = 0; hops < MAX_SYMLINK_HOPS; hops++) {
+    try {
+      if (!(await fse.lstat(target)).isSymbolicLink()) return target;
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') return target;
+      throw error;
+    }
+
+    target = path.resolve(await fse.realpath(path.dirname(target)), await fse.readlink(target));
+  }
+
+  throw new Error(
+    `Cannot write ${filePath}: it is part of a symbolic link loop. Point the link at a regular file, then retry.`,
+  );
+}
+
+/**
+ * Write a text file atomically (same-dir temp file + rename), preserving the
+ * target's existing permission bits (or defaulting to 0o600 for a new file).
+ *
+ * rename(2) within a filesystem is atomic, so a failed or interrupted write
+ * (ENOSPC, EFBIG, a crash mid-write) can NEVER truncate or corrupt an existing
+ * target — the original file is untouched until the fully-written temp file
+ * replaces it in one step, and on any error the temp file is removed and the
+ * original left in place. Use this for a single-copy, must-not-be-lost file
+ * such as a partition's config.yaml; `writeFile` (a plain overwrite) is fine
+ * for regenerable files. Pass options.mode to force restrictive permissions
+ * for a file that newly contains credentials.
+ *
+ * A symlinked target is written at the file its link chain ends at, so the
+ * links stay; for a dangling link that file (and its directory) is created.
+ */
+export async function writeFileAtomic(
+  filePath: string,
+  content: string,
+  options?: { mode?: number },
+): Promise<void> {
+  const expanded = await symlinkTarget(expandHome(filePath));
+  await fse.ensureDir(path.dirname(expanded));
+  let mode = options?.mode ?? 0o600;
+
+  try {
+    if (options?.mode === undefined) mode = (await fse.stat(expanded)).mode & 0o777;
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT') throw error;
+  }
+
+  const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+
+  try {
+    // Created with the mode, so it is never readable wider than the target; chmod undoes the umask.
+    await fse.writeFile(tmp, content, { encoding: 'utf-8', mode, flag: 'wx' });
+    await fse.chmod(tmp, mode);
+    await fse.rename(tmp, expanded);
+  } catch (error) {
+    await fse.remove(tmp).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Read JSON file, return null if not found
+ */
+export async function readJson<T = unknown>(filePath: string): Promise<T | null> {
+  const content = await readFileSafe(filePath);
+
+  if (content === null) return null;
+
+  try {
+    // SAFETY: not checked. A caller names T only for a file that teamai alone writes (a manifest, stamp, or cache) and
+    // trusts it as written. A file another tool or a person may edit, even one teamai also writes, is read as
+    // `JsonValue` (or `unknown`) and narrowed with a schema before use.
+    return JSON.parse(content) as T;
+  } catch {
+    log.warn(`Failed to parse JSON: ${filePath}`);
+
+    return null;
+  }
+}
+
+/** A JSON file read as an object: missing, not a JSON object (and why), or its value. */
+export type JsonObjectRead =
+  | { kind: 'missing' }
+  | { kind: 'invalid'; error: string }
+  // oxlint-disable-next-line teamai/no-unsafe-dictionary-type -- callers merge their own typed entries into the object and write it back
+  | { kind: 'ok'; value: Record<string, unknown> };
+
+/**
+ * Read a file that should hold a JSON object, parsed as the tool that reads it does (`syntax`), saying why when it
+ * does not. Never throws, never logs.
+ */
+export async function readJsonObject(filePath: string, syntax: JsonSyntax = 'json'): Promise<JsonObjectRead> {
+  const raw = await readFileSafe(filePath);
+
+  if (raw === null) return { kind: 'missing' };
+
+  try {
+    const value = parseJsonAs(raw, syntax);
+
+    return isJsonObject(value)
+      ? { kind: 'ok', value }
+      : { kind: 'invalid', error: 'not a JSON object' };
+  } catch (e) {
+    return { kind: 'invalid', error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Write `data` over a JSON file a tool may read with comments. A file that is
+ * absent, blank or plain JSON is written by `writePlain`, as before; one that
+ * holds comments or trailing commas is edited key by key (`editJsonText`) and
+ * written atomically at its link's target, mode kept, so the comments stay.
+ */
+export async function writeJsonKeepingComments<T>(
+  filePath: string,
+  data: T,
+  writePlain: () => Promise<void>,
+  options?: { mode?: number },
+): Promise<void> {
+  const current = await readFileSafe(filePath);
+
+  if (current === null || isPlainJson(current)) {
+    await writePlain();
+
+    return;
+  }
+
+  await writeFileAtomic(filePath, editJsonText(current, parseJson(JSON.stringify(data))), options);
+}
+
+/**
+ * Write JSON file
+ */
+export async function writeJson<T>(filePath: string, data: T): Promise<void> {
+  await writeFile(filePath, JSON.stringify(data, null, 2) + '\n');
+}
+
+/**
+ * Write JSON atomically (temp file + rename), preserving the target's
+ * existing permission bits (or defaulting to 0o600 for a new file).
+ *
+ * rename(2) within a filesystem is atomic, so concurrent readers never see a
+ * half-written file and concurrent writers cannot interleave partial data.
+ * Intended for small, security-sensitive, concurrently-written files such as
+ * the local-agent config. Not for shell-profile / dotfile paths, which may be
+ * symlinks a caller expects writes to follow.
+ *
+ * @param filePath - Destination path (may use ~).
+ * @param data - JSON-serializable value.
+ * @param options.mode - Force permission bits instead of preserving the target.
+ * @param options.compact - Write without indentation, for a large file no one reads by hand.
+ */
+export async function writeJsonAtomic<T>(
+  filePath: string,
+  data: T,
+  options?: { mode?: number; compact?: boolean },
+): Promise<void> {
+  const expanded = expandHome(filePath);
+  await fse.ensureDir(path.dirname(expanded));
+  const content = JSON.stringify(data, null, options?.compact ? undefined : 2) + '\n';
+  let mode = options?.mode ?? 0o600;
+
+  if (options?.mode === undefined) {
+    try {
+      mode = (await fse.stat(expanded)).mode & 0o777;
+    } catch (error) {
+      if (errnoCode(error) !== 'ENOENT') throw error;
+    }
+  }
+
+  const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+
+  try {
+    // Created with the mode, so it is never readable wider than the target; chmod undoes the umask.
+    await fse.writeFile(tmp, content, { encoding: 'utf-8', mode, flag: 'wx' });
+    await fse.chmod(tmp, mode);
+    await fse.rename(tmp, expanded);
+  } catch (error) {
+    await fse.remove(tmp).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Copy a directory recursively.
+ * If `dest` is a symlink (e.g. left over from setup-links.sh), remove it first
+ * so fse.copy can create a real directory in its place.
+ * With `onLink`, a link in `src` is not copied (nor followed): `onLink` gets its
+ * path relative to `src`. Without it, links are copied as links.
+ */
+export async function copyDir(
+  src: string, dest: string, onLink?: (relativePath: string) => void, skip: readonly string[] = [],
+): Promise<void> {
+  const destExpanded = expandHome(dest);
+
+  try {
+    const stat = await fse.lstat(destExpanded);
+
+    if (stat.isSymbolicLink()) {
+      await fse.remove(destExpanded);
+    }
+  } catch {
+    // dest doesn't exist yet — that's fine
+  }
+
+  const srcExpanded = expandHome(src);
+  await fse.copy(srcExpanded, destExpanded, {
+    overwrite: true,
+    filter: async (srcPath: string) => {
+      if (isIgnored(path.basename(srcPath)) || isDraft(srcPath)) return false;
+      // An entry `skip` names, and everything under it, is left as the destination has it.
+      const rel = path.relative(srcExpanded, srcPath).split(path.sep).join('/');
+
+      if (skip.some((entry) => rel === entry || rel.startsWith(`${entry}/`))) return false;
+
+      if (onLink === undefined || srcPath === srcExpanded || !(await fse.lstat(srcPath)).isSymbolicLink()) return true;
+      onLink(path.relative(srcExpanded, srcPath).split(path.sep).join('/'));
+
+      return false;
+    },
+  });
+}
+
+/**
+ * Recursively delete directories under `target` that contain no files at any
+ * depth, and `target` itself when it ends up empty.
+ *
+ * Git tracks files, not directories: a copied skill whose source has an empty
+ * subdirectory (e.g. an unused `assets/`) leaves that subdirectory behind as an
+ * untracked shell when git switches back to the default branch after a push.
+ * Such a shell has no SKILL.md, which makes later scans mistake it for a skill
+ * namespace. Missing paths and files are left untouched.
+ */
+export async function pruneEmptyDirs(target: string): Promise<boolean> {
+  const expanded = expandHome(target);
+  let entries;
+
+  try {
+    const stat = await fse.lstat(expanded);
+
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+    entries = await fse.readdir(expanded, { withFileTypes: true });
+  } catch {
+    return false; // missing or unreadable — nothing to prune
+  }
+
+  let empty = true;
+
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (!await pruneEmptyDirs(path.join(expanded, entry.name))) empty = false;
+    } else {
+      empty = false;
+    }
+  }
+
+  if (!empty) return false;
+
+  try {
+    await fse.rmdir(expanded);
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function copyFile(src: string, dest: string): Promise<void> {
+  const destExpanded = expandHome(dest);
+  await fse.ensureDir(path.dirname(destExpanded));
+  await fse.copy(expandHome(src), destExpanded, { overwrite: true });
+}
+
+/**
+ * List directories in a path (non-recursive, only directories)
+ */
+export async function listDirs(dirPath: string): Promise<string[]> {
+  const expanded = expandHome(dirPath);
+
+  if (!await fse.pathExists(expanded)) return [];
+  const entries = await fse.readdir(expanded, { withFileTypes: true });
+
+  return entries.filter(e => e.isDirectory() && !isIgnored(e.name)).map(e => e.name);
+}
+
+/**
+ * List files in a path (non-recursive, only files)
+ */
+export async function listFiles(dirPath: string): Promise<string[]> {
+  const expanded = expandHome(dirPath);
+
+  if (!await fse.pathExists(expanded)) return [];
+  const entries = await fse.readdir(expanded, { withFileTypes: true });
+
+  return entries.filter(e => e.isFile()).map(e => e.name);
+}
+
+/**
+ * List files recursively, returning relative paths (e.g. "sub/file.md").
+ */
+export async function listFilesRecursive(dirPath: string): Promise<string[]> {
+  const expanded = expandHome(dirPath);
+
+  if (!await fse.pathExists(expanded)) return [];
+  const results: string[] = [];
+  await _walkFiles(expanded, '', results);
+
+  return results;
+}
+
+async function _walkFiles(base: string, prefix: string, results: string[]): Promise<void> {
+  const entries = await fse.readdir(path.join(base, prefix), { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (isIgnored(entry.name)) continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+
+    if (entry.isFile()) {
+      results.push(rel);
+    } else if (entry.isDirectory()) {
+      await _walkFiles(base, rel, results);
+    }
+  }
+}
+
+const VCS_METADATA_NAMES = new Set(['.git', '.hg', '.svn']);
+
+/**
+ * Recursively detect local version-control metadata (`.git`/`.hg`/`.svn`) at ANY
+ * depth under `dir`. Deliberately does NOT reuse the file-walk helpers above:
+ * they skip `.git` via IGNORED_NAMES, which is exactly what would hide a nested
+ * repo. `.git` is matched whether it is a directory or a file (submodule/worktree
+ * links store it as a file). `node_modules` is skipped — its VCS metadata is
+ * dependency noise, not the user's own unpushed work. Used to keep a deployed
+ * skill that embeds a git repo (root OR nested) from being auto-deleted, since
+ * such a repo can hide stashes / unpushed history a content compare cannot see.
+ */
+export async function hasVcsMetadataRecursive(dir: string): Promise<boolean> {
+  const expanded = expandHome(dir);
+
+  if (!await fse.pathExists(expanded)) return false;
+  let entries;
+
+  try {
+    entries = await fse.readdir(expanded, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  for (const entry of entries) {
+    if (VCS_METADATA_NAMES.has(entry.name)) return true; // dir or file (submodule link)
+
+    if (entry.isDirectory() && entry.name !== 'node_modules') {
+      if (await hasVcsMetadataRecursive(path.join(expanded, entry.name))) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Check if a path exists
+ */
+/** Whether `left` and `right` name the same place once symlinks resolve; a path that does not exist compares as resolved. */
+export async function isSameRealPath(left: string, right: string): Promise<boolean> {
+  const [one, other] = await Promise.all([left, right].map((each) => fse.realpath(each).catch(() => path.resolve(each))));
+
+  return one === other;
+}
+
+export async function pathExists(p: string): Promise<boolean> {
+  return fse.pathExists(expandHome(p));
+}
+
+/**
+ * Who wrote a file teamai generates into another tool's directory: nobody yet,
+ * teamai (its content carries `marker`), or someone else. teamai writes and
+ * removes only `absent` and `teamai` files, so a same-named file of the
+ * user's is never overwritten or deleted.
+ */
+export type GeneratedFileState = 'absent' | 'teamai' | 'foreign';
+
+export async function generatedFileState(file: string, marker: string): Promise<GeneratedFileState> {
+  const content = await readFileSafe(file);
+
+  if (content === null) return await pathExists(file) ? 'foreign' : 'absent';
+
+  return content.includes(marker) ? 'teamai' : 'foreign';
+}
+
+/**
+ * Remove a file or directory
+ */
+export async function remove(p: string): Promise<void> {
+  await fse.remove(expandHome(p));
+}
+
+/**
+ * Get the mtime (last modification time) of a file.
+ * Returns 0 if the file does not exist.
+ */
+export async function getFileMtime(filePath: string): Promise<number> {
+  try {
+    const stat = await fse.stat(expandHome(filePath));
+
+    return stat.mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Get the latest mtime across all files in a directory (recursive).
+ * Returns 0 if the directory does not exist or is empty.
+ */
+export async function getDirLatestMtime(dirPath: string): Promise<number> {
+  const expanded = expandHome(dirPath);
+
+  if (!await fse.pathExists(expanded)) return 0;
+
+  let latest = 0;
+  const entries = await fse.readdir(expanded, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (isIgnored(entry.name)) continue;
+    const fullPath = path.join(expanded, entry.name);
+
+    if (entry.isFile()) {
+      const stat = await fse.stat(fullPath);
+
+      if (stat.mtimeMs > latest) latest = stat.mtimeMs;
+    } else if (entry.isDirectory()) {
+      const sub = await getDirLatestMtime(fullPath);
+
+      if (sub > latest) latest = sub;
+    }
+  }
+
+  return latest;
+}
+
+/**
+ * Compute SHA-256 hash of a file's contents. Returns null if file does not exist.
+ */
+export async function fileHash(filePath: string): Promise<string | null> {
+  try {
+    const content = await fse.readFile(filePath);
+
+    return crypto.createHash('sha256').update(content).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compare a file's content against a Buffer by SHA-256 hash.
+ * Returns true if the file has identical content to the buffer.
+ * Returns false if the file does not exist.
+ */
+export async function fileContentEqualToBuffer(filePath: string, buffer: Buffer): Promise<boolean> {
+  const fileHashVal = await fileHash(expandHome(filePath));
+
+  if (fileHashVal === null) return false;
+  const bufHash = crypto.createHash('sha256').update(buffer).digest('hex');
+
+  return fileHashVal === bufHash;
+}
+
+/**
+ * Compare two files by content. Returns true if they have identical content.
+ * Returns false if either file does not exist or content differs.
+ */
+export async function fileContentEqual(fileA: string, fileB: string): Promise<boolean> {
+  const [hashA, hashB] = await Promise.all([
+    fileHash(expandHome(fileA)),
+    fileHash(expandHome(fileB)),
+  ]);
+
+  if (hashA === null || hashB === null) return false;
+
+  return hashA === hashB;
+}
+
+/**
+ * Recursively compare two directories by content.
+ * Returns true only if both directories have exactly the same files with identical content.
+ * Returns false if either directory does not exist.
+ */
+export async function dirContentEqual(dirA: string, dirB: string, ignore?: string[]): Promise<boolean> {
+  const expandedA = expandHome(dirA);
+  const expandedB = expandHome(dirB);
+
+  if (!await fse.pathExists(expandedA) || !await fse.pathExists(expandedB)) return false;
+
+  const ignoreSet = ignore ? new Set(ignore) : undefined;
+
+  // Collect all relative file paths from both directories
+  const filesA = await collectFiles(expandedA, '', ignoreSet);
+  const filesB = await collectFiles(expandedB, '', ignoreSet);
+
+  // Same set of files?
+  if (filesA.size !== filesB.size) return false;
+
+  for (const rel of filesA) {
+    if (!filesB.has(rel)) return false;
+  }
+
+  // Same content?
+  for (const rel of filesA) {
+    const equal = await fileContentEqual(
+      path.join(expandedA, rel),
+      path.join(expandedB, rel),
+    );
+
+    if (!equal) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Team-repo-centric directory comparison.
+ * Returns true if every file in `teamDir` exists in `localDir` with identical content.
+ * Extra files in `localDir` (e.g. scripts/, agents/, references/) are ignored.
+ * This prevents false-positive "modified" detection when the local copy has
+ * additional enhancement files that the team repo version does not.
+ *
+ * Returns false if `teamDir` does not exist (nothing to compare against).
+ * Returns false if `localDir` does not exist (local copy missing).
+ */
+export async function dirTeamSubsetEqual(
+  localDir: string,
+  teamDir: string,
+  ignore?: string[],
+): Promise<boolean> {
+  const expandedLocal = expandHome(localDir);
+  const expandedTeam = expandHome(teamDir);
+
+  if (!await fse.pathExists(expandedLocal) || !await fse.pathExists(expandedTeam)) return false;
+
+  const ignoreSet = ignore ? new Set(ignore) : undefined;
+
+  // Collect files from team repo only — this is the "source of truth" file set
+  const teamFiles = await collectFiles(expandedTeam, '', ignoreSet);
+
+  if (teamFiles.size === 0) return true; // Empty team dir matches anything
+
+  // Check that every team file exists in local with identical content
+  for (const rel of teamFiles) {
+    const equal = await fileContentEqual(
+      path.join(expandedLocal, rel),
+      path.join(expandedTeam, rel),
+    );
+
+    if (!equal) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Recursively collect all relative file paths under a directory.
+ */
+async function collectFiles(base: string, prefix: string, ignore?: Set<string>): Promise<Set<string>> {
+  const result = new Set<string>();
+  const entries = await fse.readdir(path.join(base, prefix), { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (isIgnored(entry.name)) continue;
+
+    if (ignore?.has(entry.name)) continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+
+    if (entry.isFile()) {
+      result.add(rel);
+    } else if (entry.isDirectory()) {
+      const sub = await collectFiles(base, rel, ignore);
+
+      for (const s of sub) result.add(s);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Write content only if it differs from existing file (by SHA-256 hash).
+ * Avoids mtime updates on unchanged files. Returns true if written.
+ */
+export async function writeIfChanged(filePath: string, content: string): Promise<boolean> {
+  const newHash = crypto.createHash('sha256').update(content, 'utf-8').digest('hex');
+  const existingHash = await fileHash(filePath);
+
+  if (existingHash === newHash) return false;
+  await fse.ensureDir(path.dirname(filePath));
+  await fse.writeFile(filePath, content, 'utf-8');
+
+  return true;
+}

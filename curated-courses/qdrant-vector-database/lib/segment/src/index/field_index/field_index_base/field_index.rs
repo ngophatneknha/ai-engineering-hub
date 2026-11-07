@@ -1,0 +1,337 @@
+use std::fmt::Formatter;
+use std::path::PathBuf;
+
+use common::types::PointOffsetType;
+use serde_json::Value;
+
+use super::payload_field_index::PayloadFieldIndex;
+use super::value_indexer::ValueIndexer;
+use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
+use crate::index::field_index::bool_index::{BoolIndex, BoolIndexRead};
+use crate::index::field_index::full_text_index::FullTextIndex;
+use crate::index::field_index::full_text_index::full_text_index_read::FullTextIndexRead;
+use crate::index::field_index::geo_index::{GeoIndex, GeoIndexRead};
+use crate::index::field_index::map_index::MapIndex;
+use crate::index::field_index::nested_index::NestedFieldIndex;
+use crate::index::field_index::null_index::{NullIndex, NullIndexRead};
+use crate::index::field_index::numeric_index::{NumericIndex, NumericIndexRead};
+use crate::index::payload_config::{
+    FullPayloadIndexType, IndexMutability, PayloadIndexType, StorageType,
+};
+use crate::json_path::JsonPath;
+use crate::types::{
+    DateTimePayloadType, FloatPayloadType, IntPayloadType, UuidIntType, UuidPayloadType,
+};
+
+/// Common interface for all possible types of field indexes
+/// Enables polymorphism on field indexes
+pub enum FieldIndex {
+    IntIndex(NumericIndex<IntPayloadType, IntPayloadType>),
+    DatetimeIndex(NumericIndex<IntPayloadType, DateTimePayloadType>),
+    IntMapIndex(MapIndex<IntPayloadType>),
+    KeywordIndex(MapIndex<str>),
+    FloatIndex(NumericIndex<FloatPayloadType, FloatPayloadType>),
+    GeoIndex(GeoIndex),
+    FullTextIndex(FullTextIndex),
+    BoolIndex(BoolIndex),
+    UuidIndex(NumericIndex<UuidIntType, UuidPayloadType>),
+    UuidMapIndex(MapIndex<UuidIntType>),
+    NullIndex(NullIndex),
+    /// Index of the elements of a nested array, see [`NestedFieldIndex`]
+    Nested(Box<NestedFieldIndex>),
+}
+
+impl std::fmt::Debug for FieldIndex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldIndex::IntIndex(_index) => write!(f, "IntIndex"),
+            FieldIndex::DatetimeIndex(_index) => write!(f, "DatetimeIndex"),
+            FieldIndex::IntMapIndex(_index) => write!(f, "IntMapIndex"),
+            FieldIndex::KeywordIndex(_index) => write!(f, "KeywordIndex"),
+            FieldIndex::FloatIndex(_index) => write!(f, "FloatIndex"),
+            FieldIndex::GeoIndex(_index) => write!(f, "GeoIndex"),
+            FieldIndex::BoolIndex(_index) => write!(f, "BoolIndex"),
+            FieldIndex::FullTextIndex(_index) => write!(f, "FullTextIndex"),
+            FieldIndex::UuidIndex(_index) => write!(f, "UuidIndex"),
+            FieldIndex::UuidMapIndex(_index) => write!(f, "UuidMapIndex"),
+            FieldIndex::NullIndex(_index) => write!(f, "NullIndex"),
+            FieldIndex::Nested(index) => write!(f, "Nested({:?})", index.inner()),
+        }
+    }
+}
+
+impl FieldIndex {
+    /// Borrow the underlying typed index as the full
+    /// [`PayloadFieldIndex`] trait object — used for write/lifecycle
+    /// methods (`flusher`, `files`, `immutable_files`).
+    fn get_payload_field_index(&self) -> &dyn PayloadFieldIndex {
+        match self {
+            FieldIndex::IntIndex(payload_field_index) => payload_field_index.inner(),
+            FieldIndex::DatetimeIndex(payload_field_index) => payload_field_index.inner(),
+            FieldIndex::IntMapIndex(payload_field_index) => payload_field_index,
+            FieldIndex::KeywordIndex(payload_field_index) => payload_field_index,
+            FieldIndex::FloatIndex(payload_field_index) => payload_field_index.inner(),
+            FieldIndex::GeoIndex(payload_field_index) => payload_field_index,
+            FieldIndex::BoolIndex(payload_field_index) => payload_field_index,
+            FieldIndex::FullTextIndex(payload_field_index) => payload_field_index,
+            FieldIndex::UuidIndex(payload_field_index) => payload_field_index.inner(),
+            FieldIndex::UuidMapIndex(payload_field_index) => payload_field_index,
+            FieldIndex::NullIndex(payload_field_index) => payload_field_index,
+            FieldIndex::Nested(payload_field_index) => payload_field_index.as_ref(),
+        }
+    }
+
+    /// The per-element index, if this is one.
+    pub fn as_nested(&self) -> Option<&NestedFieldIndex> {
+        match self {
+            FieldIndex::Nested(index) => Some(index),
+            FieldIndex::IntIndex(_)
+            | FieldIndex::DatetimeIndex(_)
+            | FieldIndex::IntMapIndex(_)
+            | FieldIndex::KeywordIndex(_)
+            | FieldIndex::FloatIndex(_)
+            | FieldIndex::GeoIndex(_)
+            | FieldIndex::FullTextIndex(_)
+            | FieldIndex::BoolIndex(_)
+            | FieldIndex::UuidIndex(_)
+            | FieldIndex::UuidMapIndex(_)
+            | FieldIndex::NullIndex(_) => None,
+        }
+    }
+
+    /// Payload path to extract for [`Self::add_point`] and watch for changes.
+    /// `field` is the registered field; a nested index consumes its array's elements.
+    pub fn input_path<'a>(&'a self, field: &'a JsonPath) -> &'a JsonPath {
+        match self {
+            FieldIndex::Nested(index) => index.array_key(),
+            FieldIndex::IntIndex(_)
+            | FieldIndex::DatetimeIndex(_)
+            | FieldIndex::IntMapIndex(_)
+            | FieldIndex::KeywordIndex(_)
+            | FieldIndex::FloatIndex(_)
+            | FieldIndex::GeoIndex(_)
+            | FieldIndex::FullTextIndex(_)
+            | FieldIndex::BoolIndex(_)
+            | FieldIndex::UuidIndex(_)
+            | FieldIndex::UuidMapIndex(_)
+            | FieldIndex::NullIndex(_) => field,
+        }
+    }
+
+    pub fn is_nested(&self) -> bool {
+        self.as_nested().is_some()
+    }
+
+    pub fn wipe(self) -> OperationResult<()> {
+        match self {
+            FieldIndex::IntIndex(index) => index.wipe(),
+            FieldIndex::DatetimeIndex(index) => index.wipe(),
+            FieldIndex::IntMapIndex(index) => index.wipe(),
+            FieldIndex::KeywordIndex(index) => index.wipe(),
+            FieldIndex::FloatIndex(index) => index.wipe(),
+            FieldIndex::GeoIndex(index) => index.wipe(),
+            FieldIndex::BoolIndex(index) => index.wipe(),
+            FieldIndex::FullTextIndex(index) => index.wipe(),
+            FieldIndex::UuidIndex(index) => index.wipe(),
+            FieldIndex::UuidMapIndex(index) => index.wipe(),
+            FieldIndex::NullIndex(index) => index.wipe(),
+            FieldIndex::Nested(index) => index.wipe(),
+        }
+    }
+
+    pub fn flusher(&self) -> Flusher {
+        self.get_payload_field_index().flusher()
+    }
+
+    pub fn files(&self) -> Vec<PathBuf> {
+        self.get_payload_field_index().files()
+    }
+
+    pub fn immutable_files(&self) -> Vec<PathBuf> {
+        self.get_payload_field_index().immutable_files()
+    }
+
+    /// Index values extracted at [`Self::input_path`].
+    pub fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<bool> {
+        match self {
+            FieldIndex::IntIndex(payload_field_index) => payload_field_index.add_point(id, payload),
+            FieldIndex::DatetimeIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::IntMapIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::KeywordIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::FloatIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::GeoIndex(payload_field_index) => payload_field_index.add_point(id, payload),
+            FieldIndex::BoolIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::FullTextIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::UuidIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::UuidMapIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::NullIndex(payload_field_index) => {
+                payload_field_index.add_point(id, payload)
+            }
+            FieldIndex::Nested(index) => index.add_point(id, payload),
+        }
+    }
+
+    pub fn remove_point(&mut self, point_id: PointOffsetType) -> OperationResult<()> {
+        match self {
+            FieldIndex::IntIndex(index) => index.mut_inner().remove_point(point_id),
+            FieldIndex::DatetimeIndex(index) => index.mut_inner().remove_point(point_id),
+            FieldIndex::IntMapIndex(index) => index.remove_point(point_id),
+            FieldIndex::KeywordIndex(index) => index.remove_point(point_id),
+            FieldIndex::FloatIndex(index) => index.mut_inner().remove_point(point_id),
+            FieldIndex::GeoIndex(index) => index.remove_point(point_id),
+            FieldIndex::BoolIndex(index) => index.remove_point(point_id),
+            FieldIndex::FullTextIndex(index) => index.remove_point(point_id),
+            FieldIndex::UuidIndex(index) => index.remove_point(point_id),
+            FieldIndex::UuidMapIndex(index) => index.remove_point(point_id),
+            FieldIndex::NullIndex(index) => index.remove_point(point_id),
+            FieldIndex::Nested(index) => index.remove_point(point_id),
+        }
+    }
+
+    /// Approximate RAM usage in bytes for in-memory index structures.
+    pub fn ram_usage_bytes(&self) -> usize {
+        match self {
+            FieldIndex::IntIndex(index) => index.inner().ram_usage_bytes(),
+            FieldIndex::DatetimeIndex(index) => index.inner().ram_usage_bytes(),
+            FieldIndex::IntMapIndex(index) => index.ram_usage_bytes(),
+            FieldIndex::KeywordIndex(index) => index.ram_usage_bytes(),
+            FieldIndex::FloatIndex(index) => index.inner().ram_usage_bytes(),
+            FieldIndex::GeoIndex(index) => index.ram_usage_bytes(),
+            FieldIndex::BoolIndex(index) => index.ram_usage_bytes(),
+            FieldIndex::FullTextIndex(index) => index.ram_usage_bytes(),
+            FieldIndex::UuidIndex(index) => index.inner().ram_usage_bytes(),
+            FieldIndex::UuidMapIndex(index) => index.ram_usage_bytes(),
+            FieldIndex::NullIndex(index) => index.ram_usage_bytes(),
+            FieldIndex::Nested(index) => index.ram_usage_bytes(),
+        }
+    }
+
+    pub fn is_cold(&self) -> bool {
+        match self {
+            FieldIndex::IntIndex(index) => index.is_cold(),
+            FieldIndex::DatetimeIndex(index) => index.is_cold(),
+            FieldIndex::IntMapIndex(index) => index.is_cold(),
+            FieldIndex::KeywordIndex(index) => index.is_cold(),
+            FieldIndex::FloatIndex(index) => index.is_cold(),
+            FieldIndex::GeoIndex(index) => index.is_cold(),
+            FieldIndex::BoolIndex(index) => index.is_cold(),
+            FieldIndex::FullTextIndex(index) => index.is_cold(),
+            FieldIndex::UuidIndex(index) => index.is_cold(),
+            FieldIndex::UuidMapIndex(index) => index.is_cold(),
+            FieldIndex::NullIndex(index) => index.is_cold(),
+            FieldIndex::Nested(index) => index.is_cold(),
+        }
+    }
+
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> OperationResult<()> {
+        match self {
+            FieldIndex::IntIndex(index) => index.populate(),
+            FieldIndex::DatetimeIndex(index) => index.populate(),
+            FieldIndex::IntMapIndex(index) => index.populate(),
+            FieldIndex::KeywordIndex(index) => index.populate(),
+            FieldIndex::FloatIndex(index) => index.populate(),
+            FieldIndex::GeoIndex(index) => index.populate(),
+            FieldIndex::BoolIndex(index) => index.populate(),
+            FieldIndex::FullTextIndex(index) => index.populate(),
+            FieldIndex::UuidIndex(index) => index.populate(),
+            FieldIndex::UuidMapIndex(index) => index.populate(),
+            FieldIndex::NullIndex(index) => index.populate(),
+            FieldIndex::Nested(index) => index.populate(),
+        }
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        match self {
+            FieldIndex::IntIndex(index) => index.clear_cache(),
+            FieldIndex::DatetimeIndex(index) => index.clear_cache(),
+            FieldIndex::IntMapIndex(index) => index.clear_cache(),
+            FieldIndex::KeywordIndex(index) => index.clear_cache(),
+            FieldIndex::FloatIndex(index) => index.clear_cache(),
+            FieldIndex::GeoIndex(index) => index.clear_cache(),
+            FieldIndex::BoolIndex(index) => index.clear_cache(),
+            FieldIndex::FullTextIndex(index) => index.clear_cache(),
+            FieldIndex::UuidIndex(index) => index.clear_cache(),
+            FieldIndex::UuidMapIndex(index) => index.clear_cache(),
+            FieldIndex::NullIndex(index) => index.clear_cache(),
+            FieldIndex::Nested(index) => index.clear_cache(),
+        }
+    }
+
+    pub fn get_full_index_type(&self) -> FullPayloadIndexType {
+        let index_type = match self {
+            FieldIndex::IntIndex(_) => PayloadIndexType::IntIndex,
+            FieldIndex::DatetimeIndex(_) => PayloadIndexType::DatetimeIndex,
+            FieldIndex::IntMapIndex(_) => PayloadIndexType::IntMapIndex,
+            FieldIndex::KeywordIndex(_) => PayloadIndexType::KeywordIndex,
+            FieldIndex::FloatIndex(_) => PayloadIndexType::FloatIndex,
+            FieldIndex::GeoIndex(_) => PayloadIndexType::GeoIndex,
+            FieldIndex::FullTextIndex(_) => PayloadIndexType::FullTextIndex,
+            FieldIndex::BoolIndex(_) => PayloadIndexType::BoolIndex,
+            FieldIndex::UuidIndex(_) => PayloadIndexType::UuidIndex,
+            FieldIndex::UuidMapIndex(_) => PayloadIndexType::UuidMapIndex,
+            FieldIndex::NullIndex(_) => PayloadIndexType::NullIndex,
+            // Persisted as the inner type, the schema says the index is per element
+            FieldIndex::Nested(index) => return index.get_full_index_type(),
+        };
+
+        FullPayloadIndexType {
+            index_type,
+            mutability: self.get_mutability_type(),
+            storage_type: self.get_storage_type(),
+        }
+    }
+
+    fn get_mutability_type(&self) -> IndexMutability {
+        match self {
+            FieldIndex::IntIndex(index) => index.get_mutability_type(),
+            FieldIndex::DatetimeIndex(index) => index.get_mutability_type(),
+            FieldIndex::IntMapIndex(index) => index.get_mutability_type(),
+            FieldIndex::KeywordIndex(index) => index.get_mutability_type(),
+            FieldIndex::FloatIndex(index) => index.get_mutability_type(),
+            FieldIndex::GeoIndex(index) => index.get_mutability_type(),
+            FieldIndex::FullTextIndex(index) => index.get_mutability_type(),
+            FieldIndex::BoolIndex(index) => index.get_mutability_type(),
+            FieldIndex::UuidIndex(index) => index.get_mutability_type(),
+            FieldIndex::UuidMapIndex(index) => index.get_mutability_type(),
+            FieldIndex::NullIndex(index) => index.get_mutability_type(),
+            FieldIndex::Nested(index) => index.get_full_index_type().mutability,
+        }
+    }
+
+    fn get_storage_type(&self) -> StorageType {
+        match self {
+            FieldIndex::IntIndex(index) => index.get_storage_type(),
+            FieldIndex::DatetimeIndex(index) => index.get_storage_type(),
+            FieldIndex::IntMapIndex(index) => index.get_storage_type(),
+            FieldIndex::KeywordIndex(index) => index.get_storage_type(),
+            FieldIndex::FloatIndex(index) => index.get_storage_type(),
+            FieldIndex::GeoIndex(index) => index.get_storage_type(),
+            FieldIndex::FullTextIndex(index) => index.get_storage_type(),
+            FieldIndex::BoolIndex(index) => index.get_storage_type(),
+            FieldIndex::UuidIndex(index) => index.get_storage_type(),
+            FieldIndex::UuidMapIndex(index) => index.get_storage_type(),
+            FieldIndex::NullIndex(index) => index.get_storage_type(),
+            FieldIndex::Nested(index) => index.get_full_index_type().storage_type,
+        }
+    }
+}

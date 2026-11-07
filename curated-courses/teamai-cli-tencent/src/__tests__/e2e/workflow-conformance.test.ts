@@ -1,0 +1,135 @@
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { resolveProjectDataHome } from '../../config.js';
+import { DRIVERS_UNDER_TEST, runConformanceScenario } from '../../workflow/conformance-interpreter.js';
+import { benchmarkConformanceScenarios } from '../../benchmark/conformance.js';
+import { workflowConformanceScenarios } from '../../workflow/conformance/run.js';
+import type { WorkflowRunRecord } from '../../workflow/records.js';
+import type { RunState, WorkflowEnvelope } from '../../workflow/types.js';
+import { cliConformanceClient, envelope, runCLI } from '../helpers/cli-conformance.js';
+import { inProcessConformanceRunner, normalized, recorded, UNREACHABLE_ORIGIN } from '../helpers/in-process-conformance.js';
+import { benchmarkFixture, driveCommands, startFixBenchmark } from '../helpers/benchmark-fixture.js';
+import type { BenchmarkScenario, DriverProfile } from '../../workflow/conformance-interpreter.js';
+import { isRunState } from '../../workflow/store.js';
+
+/** Every protocol scenario: the engine's, and the benchmark trials' over it. */
+const SCENARIOS = [...workflowConformanceScenarios, ...benchmarkConformanceScenarios];
+
+/** The driver that runs a benchmark run's plan step: it opens no clone, so it takes nothing else. */
+const PLANNER = { kind: 'local', machine: 'planner', workspace: '/plan', can: { workspace: ['read-only', 'new', 'continue'], env: true } };
+
+/**
+ * A benchmark scenario, on a member of a git team of its own: a `--self` install cannot pin the team a trial runs. The
+ * run is the benchmark workflow on suite `fix`, whose plan step a driver that takes nothing else ran.
+ */
+async function runBenchmarkScenario(scenario: BenchmarkScenario, profile: DriverProfile): Promise<void> {
+  const { suite, tasks } = scenario.benchmark;
+  const fixture = await benchmarkFixture({ tool: 'fixes', sandbox: false, suite, tasks });
+  try {
+    await runConformanceScenario(scenario, {
+      client: cliConformanceClient(async (args) => envelope((await fixture.teamai(['workflow', ...args])).stdout), async () => {
+        const run = await startFixBenchmark(fixture);
+        await driveCommands(fixture, run, { driver: PLANNER });
+        return { data: { run } };
+      }),
+      readRun: async (runId) => {
+        const run = fixture.runFile(runId);
+        if (!isRunState(run)) throw new Error(`run ${runId} is not a run file`);
+        return run;
+      },
+      readEndRecord: async (runId) => fixture.endRecord(runId) as WorkflowRunRecord,
+      advance: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+      expect,
+    }, profile);
+  } finally {
+    fixture.remove();
+  }
+}
+
+// The driver profile travels in the JSON body the CLI passes through, so one profile proves the CLI wiring;
+// src/__tests__/workflow-conformance.test.ts runs every scenario under every profile in process.
+describe.each([DRIVERS_UNDER_TEST[0]])('workflow protocol conformance through the CLI as %s', (profile) => {
+  let repo: string;
+
+  beforeAll(async () => {
+    repo = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-workflow-cli-conformance-'));
+    fs.writeFileSync(path.join(repo, 'README.md'), '# fixture\n');
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['add', 'README.md'], { cwd: repo });
+    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'initial'], { cwd: repo });
+    execFileSync('git', ['remote', 'add', 'origin', UNREACHABLE_ORIGIN], { cwd: repo });
+    const initialized = await runCLI(['init', '--self', '--agent', 'claude', '--force'], repo);
+    expect(initialized.code, `${initialized.stdout}\n${initialized.stderr}`).toBe(0);
+  });
+
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
+  afterAll(() => {
+    if (repo) fs.rmSync(repo, { recursive: true, force: true });
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  for (const scenario of SCENARIOS) {
+    it(scenario.name, async () => {
+      if ('benchmark' in scenario) {
+        await runBenchmarkScenario(scenario, profile);
+        return;
+      }
+      const workflows = path.join(repo, '.teamai', 'workflows');
+      fs.mkdirSync(workflows, { recursive: true });
+      fs.writeFileSync(path.join(workflows, `${scenario.workflowName}.yaml`), scenario.yaml);
+      for (const [name, yaml] of Object.entries(scenario.workflows ?? {})) {
+        fs.writeFileSync(path.join(workflows, `${name}.yaml`), yaml);
+      }
+      // Removed after the scenario, so no other scenario of this install reads them.
+      const teamFiles = Object.keys(scenario.teamFiles ?? {}).map((file) => path.join(repo, '.teamai', file));
+      for (const [file, text] of Object.entries(scenario.teamFiles ?? {})) {
+        fs.mkdirSync(path.dirname(path.join(repo, '.teamai', file)), { recursive: true });
+        fs.writeFileSync(path.join(repo, '.teamai', file), text);
+      }
+      onTestFinished(() => { for (const file of teamFiles) fs.rmSync(file, { force: true }); });
+      const pulled = await runCLI(['pull'], repo);
+      expect(pulled.code, `${pulled.stdout}\n${pulled.stderr}`).toBe(0);
+      const env = { ...process.env, ...scenario.env };
+      const call = async (args: string[], extra: Record<string, string> = {}): Promise<WorkflowEnvelope> => {
+        const { stdout } = await runCLI(['workflow', ...args], repo, { ...env, ...extra });
+        for (const [name, value] of Object.entries(scenario.env ?? {})) expect(stdout.includes(value), `workflow ${args[0]} printed the value of ${name}`).toBe(false);
+        return envelope(stdout);
+      };
+      const cli = recorded(cliConformanceClient(call));
+      await runConformanceScenario(scenario, {
+        client: cli.client,
+        readRun: async (runId) => {
+          const dataHome = await resolveProjectDataHome(repo);
+          return JSON.parse(fs.readFileSync(path.join(dataHome, 'workflows', 'runs', `${runId}.json`), 'utf8')) as RunState;
+        },
+        readEndRecord: async (runId) => {
+          const dataHome = await resolveProjectDataHome(repo);
+          const file = path.join(dataHome, 'workflows', 'pending', `${runId}.end.json`);
+          return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) as WorkflowRunRecord : undefined;
+        },
+        // Each CLI call reads the system clock, so the runner waits for real.
+        advance: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+        runDir: async (runId) => path.join(await resolveProjectDataHome(repo), 'workflows', 'runs', runId, 'scratch'),
+        expect,
+      }, profile);
+
+      // The in-process client answers the same scenario, started from a checkout as the CLI's is, with the envelopes the CLI prints.
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-workflow-conformance-'));
+      dirs.push(root);
+      const inProcess = await inProcessConformanceRunner(scenario, root, { checkout: true });
+      const local = recorded(inProcess.runner.client);
+      await runConformanceScenario(scenario, { ...inProcess.runner, client: local.client, expect }, profile);
+      const places = { knowledge: path.join(repo, '.teamai'), data: await resolveProjectDataHome(repo), project: repo };
+      expect(normalized(cli.envelopes, places), 'the CLI and the in-process client answer alike').toEqual(normalized(inProcess.printed(local.envelopes), inProcess.places));
+    });
+  }
+});

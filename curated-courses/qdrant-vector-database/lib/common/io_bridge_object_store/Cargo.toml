@@ -1,0 +1,24 @@
+[package]
+name = "io_bridge_object_store"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+common = { workspace = true }
+crc-fast = { workspace = true }
+data-encoding = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+io_bridge = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+common = { workspace = true, features = ["testing"] }
+tempfile = { workspace = true }

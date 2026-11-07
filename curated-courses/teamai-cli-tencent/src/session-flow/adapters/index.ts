@@ -1,0 +1,110 @@
+/**
+ * adapters/index.ts — Adapter registration.
+ *
+ * Register every platform adapter in ADAPTER_REGISTRY for the migration engine.
+ */
+
+import type { LocalConfig } from '../../types.js';
+import type { AgentAdapter } from './base.js';
+import { ClaudeCodeAdapter } from './claude-code.js';
+import { CodexAdapter } from './codex.js';
+import { CodeBuddyAdapter } from './codebuddy.js';
+import { CodeBuddyIdeAdapter } from './codebuddy-ide.js';
+import { WorkBuddyAdapter } from './workbuddy.js';
+import { CursorAdapter } from './cursor.js';
+import { OpencodeAdapter } from './opencode.js';
+import { AgyAdapter, agyStoreRoots } from './agy.js';
+import { PiAdapter } from './pi.js';
+import { MuseAdapter } from './muse.js';
+import { HermesAdapter } from './hermes.js';
+import type { SessionPlatform } from './platform-facts.js';
+import { sessionStoreDir } from '../../locate.js';
+
+/** Builds a platform's adapter on its store, which follows the member's recorded `toolRoots` (`sessionStoreDir`). */
+export type AdapterFactory = (toolRoots?: LocalConfig['toolRoots']) => AgentAdapter;
+
+/** Platform id → adapter factory. Open to any id so a test can register a stand-in platform. */
+export interface AdapterRegistry {
+  [platform: string]: AdapterFactory;
+}
+
+export const ADAPTER_REGISTRY: AdapterRegistry = {
+  // Base platforms
+  'claude-code': (toolRoots) => new ClaudeCodeAdapter('claude-code', sessionStoreDir('claude-code', toolRoots)),
+  codex: (toolRoots) => new CodexAdapter('codex', sessionStoreDir('codex', toolRoots)),
+  qoder: (toolRoots) => new ClaudeCodeAdapter('qoder', sessionStoreDir('qoder', toolRoots)),
+  'qoder-cn': (toolRoots) => new ClaudeCodeAdapter('qoder-cn', sessionStoreDir('qoder-cn', toolRoots)),
+  // CodeBuddy has two independent stores, split into two platforms:
+  //   codebuddy     = CLI (<CodeBuddy home>/projects/...)
+  //   codebuddy-ide = IDE GUI (CodeBuddyExtension/.../history)
+  codebuddy: (toolRoots) => new CodeBuddyAdapter(sessionStoreDir('codebuddy', toolRoots)),
+  'codebuddy-ide': () => new CodeBuddyIdeAdapter(),
+  workbuddy: (toolRoots) => new WorkBuddyAdapter(sessionStoreDir('workbuddy', toolRoots)),
+  cursor: (toolRoots) => new CursorAdapter('cursor', sessionStoreDir('cursor', toolRoots)),
+  opencode: (toolRoots) => new OpencodeAdapter(sessionStoreDir('opencode', toolRoots)),
+  agy: (toolRoots) => new AgyAdapter(agyStoreRoots(sessionStoreDir('agy', toolRoots))),
+  pi: (toolRoots) => new PiAdapter('pi', sessionStoreDir('pi', toolRoots), !process.env.PI_CODING_AGENT_SESSION_DIR),
+  omp: (toolRoots) => new PiAdapter('omp', sessionStoreDir('omp', toolRoots)),
+  muse: (toolRoots) => new MuseAdapter(sessionStoreDir('muse', toolRoots)),
+  hermes: (toolRoots) => new HermesAdapter(sessionStoreDir('hermes', toolRoots)),
+  // TeamAI variants (different path prefixes, identical format)
+  'claude-internal': (toolRoots) => new ClaudeCodeAdapter('claude-internal', sessionStoreDir('claude-internal', toolRoots)),
+  tclaude: (toolRoots) => new ClaudeCodeAdapter('tclaude', sessionStoreDir('tclaude', toolRoots)),
+  'codex-internal': (toolRoots) => new CodexAdapter('codex-internal', sessionStoreDir('codex-internal', toolRoots)),
+  tcodex: (toolRoots) => new CodexAdapter('tcodex', sessionStoreDir('tcodex', toolRoots)),
+  joycode: (toolRoots) => new CodexAdapter('joycode', sessionStoreDir('joycode', toolRoots)),
+} satisfies Record<SessionPlatform, AdapterFactory>;
+
+export function getAdapter(platform: string, toolRoots?: LocalConfig['toolRoots']): AgentAdapter {
+  const factory = ADAPTER_REGISTRY[platform];
+
+  if (!factory) {
+    throw new Error(`Unsupported platform: ${platform}. Registered: ${Object.keys(ADAPTER_REGISTRY).join(', ')}`);
+  }
+
+  return factory(toolRoots);
+}
+
+export function listAvailablePlatforms(): string[] {
+  return Object.keys(ADAPTER_REGISTRY);
+}
+
+export function listInstalledPlatforms(toolRoots?: LocalConfig['toolRoots'], projectPath = process.cwd()): string[] {
+  const installed: string[] = [];
+
+  for (const [platform, factory] of Object.entries(ADAPTER_REGISTRY)) {
+    try {
+      const adapter = factory(toolRoots);
+
+      if (adapter.isReady(projectPath)) installed.push(platform);
+    } catch {
+      // skip
+    }
+  }
+
+  return installed;
+}
+
+export { AgentAdapter, type SessionMeta } from './base.js';
+
+export { ClaudeCodeAdapter } from './claude-code.js';
+
+export { CodexAdapter } from './codex.js';
+
+export { CodeBuddyAdapter } from './codebuddy.js';
+
+export { CodeBuddyIdeAdapter } from './codebuddy-ide.js';
+
+export { WorkBuddyAdapter } from './workbuddy.js';
+
+export { CursorAdapter } from './cursor.js';
+
+export { OpencodeAdapter } from './opencode.js';
+
+export { AgyAdapter } from './agy.js';
+
+export { PiAdapter } from './pi.js';
+
+export { MuseAdapter } from './muse.js';
+
+export { HermesAdapter } from './hermes.js';

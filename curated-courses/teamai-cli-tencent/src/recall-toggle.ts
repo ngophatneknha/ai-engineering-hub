@@ -1,0 +1,219 @@
+import path from 'node:path';
+import { autoDetectInit, loadStateForScope, markMemberSettingsWritten, saveLocalConfigForScope, saveStateForScope } from './config.js';
+import { log } from './utils/logger.js';
+import { remove, pathExists } from './utils/fs.js';
+import { keepsTrackedCopy } from './resources/delivered-copies.js';
+import { applyInstructionPlan, planInstructionFiles, registerOpencodeContext, resolveInstructionTargets } from './instruction-targets.js';
+import { agentFileExtensionForTool } from './resources/agent-format.js';
+import { isAgentToolId } from './tools.js';
+import { cleanupOf, installOf, locate, ownOf } from './locate.js';
+import { ruleFileExtensionForTool } from './resources/rule-format.js';
+import { LEGACY_RECALL_SKILL_NAMES, builtinSkillsTarget, pruneLegacyBuiltinSkills } from './builtin-skills.js';
+import {
+  isRecallEnabled,
+  isAgentExcluded,
+  scopedToolPaths,
+  type GlobalOptions,
+  type TeamaiConfig,
+  type LocalConfig,
+} from './types.js';
+
+/**
+ * Remove the `teamai-recall` rule and agent by name, in every place teamai may
+ * have written them (including earlier tool homes and the `.md` copy older
+ * layouts left in a `.mdc` rules folder), keeping a copy the repository
+ * tracks (#915). Shared by `recall disable` and by a
+ * pull that finds recall off, so both leave the same files behind. Returns the
+ * number of files removed.
+ */
+export async function removeRecallAgentAndRule(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<number> {
+  const install = installOf(teamConfig, localConfig);
+  let removed = 0;
+
+  for (const tool of Object.keys(scopedToolPaths(teamConfig, localConfig))) {
+    // Remove recall rule file
+    const rulesDir = ownOf(await locate(tool, 'rules', install));
+
+    if (rulesDir?.kind === 'dir') {
+      // Cursor and JoyCode copies are `.mdc`; older layouts also left `.md` files.
+      const extensions = new Set<string>([ruleFileExtensionForTool(tool), '.md']);
+
+      for (const extension of extensions) {
+        const ruleFile = path.join(rulesDir.path, `teamai-recall${extension}`);
+
+        if (await pathExists(ruleFile)) {
+          if (await keepsTrackedCopy(ruleFile)) continue;
+          await remove(ruleFile);
+          removed++;
+          log.debug(`Removed recall rule from ${tool}`);
+        }
+      }
+    }
+
+    for (const { path: agentsDir } of cleanupOf(await locate(tool, 'agents', install))) {
+      const extensions = new Set<string>(['.md']);
+
+      if (isAgentToolId(tool)) {
+        extensions.add(agentFileExtensionForTool(tool));
+      }
+
+      for (const extension of extensions) {
+        const agentFile = path.join(agentsDir, `teamai-recall${extension}`);
+
+        if (await pathExists(agentFile)) {
+          if (await keepsTrackedCopy(agentFile)) continue;
+          await remove(agentFile);
+          removed++;
+          log.debug(`Removed recall agent from ${tool}`);
+        }
+      }
+    }
+  }
+
+  return removed;
+}
+
+async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+  await removeRecallAgentAndRule(teamConfig, localConfig);
+
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    // Remove the legacy recall skill an earlier release deployed. The served
+    // `share` workflow is gated at run time, but a member who upgrades and
+    // disables recall before pulling still has the old directory.
+    // Same resolver and gates as deployment: an uninstalled Codex must not have
+    // the shared .agents/skills root pruned on its behalf, and OpenClaw and
+    // Hermes are pruned where their skills actually live.
+    if (toolPath.skills && !isAgentExcluded(localConfig, tool)) {
+      const target = await builtinSkillsTarget(tool, teamConfig, localConfig);
+
+      if (target) await pruneLegacyBuiltinSkills(tool, target, LEGACY_RECALL_SKILL_NAMES);
+    }
+  }
+
+  // Remove the recall block from every file teamai may have written it to.
+  await writeRecallBlock(teamConfig, localConfig, null);
+}
+
+/** Set or remove (`null`) the recall blocks wherever teamai delivers instruction blocks. */
+async function writeRecallBlock(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  blocks: { recall: string; directRecall: string } | null,
+): Promise<void> {
+  const resolved = await resolveInstructionTargets(teamConfig, localConfig);
+  const { targets, stale } = resolved;
+  // Removal also reaches files no installed tool reads any more, but leaves
+  // their other blocks to the next pull's cleanup.
+  const files = blocks === null ? [...targets, ...stale] : targets;
+  const plan = await planInstructionFiles(files, blocks ?? { recall: null, directRecall: null });
+
+  for (const warning of plan.warnings) log.warn(warning);
+  const { report, failures, files: results } = await applyInstructionPlan(plan, { dryRun: false });
+
+  for (const line of report) log.debug(line);
+
+  for (const failure of failures) log.warn(failure);
+  await registerOpencodeContext(teamConfig, localConfig, resolved, false, results);
+}
+
+async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+  const { deployBuiltinRules } = await import('./builtin-rules.js');
+  const { RECALL_AGENT, builtinAgentsReplacedByTeam, deployBuiltinAgents } = await import('./builtin-agents.js');
+  const { deployBuiltinSkills } = await import('./builtin-skills.js');
+
+  const { deliveredHashes } = await import('./pull.js');
+
+  await deployBuiltinRules(teamConfig, localConfig, { skipRecall: false });
+  // A team copy on record, such as one the member edited, is pull's to judge.
+  await deployBuiltinAgents(teamConfig, localConfig, { skipRecall: false, record: { kind: 'fast-path', delivered: await deliveredHashes(localConfig) } });
+
+  // The next pull, a full sync, delivers the team's copy, which recall disable removed.
+  if (((await builtinAgentsReplacedByTeam(teamConfig, localConfig)).get(RECALL_AGENT)?.size ?? 0) > 0) {
+    log.info("Your team replaces the teamai-recall agent: run `teamai pull` to get the team's copy back.");
+  }
+
+  await deployBuiltinSkills(teamConfig, localConfig);
+
+  const { compileDirectRecallRulesBlock, compileRecallRulesBlock } = await import('./pull.js');
+  await writeRecallBlock(teamConfig, localConfig, { recall: compileRecallRulesBlock(teamConfig.language), directRecall: compileDirectRecallRulesBlock() });
+}
+
+export async function recallDisable(opts: GlobalOptions): Promise<void> {
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: opts.dryRun });
+
+  if (opts.dryRun) {
+    log.info('[dry-run] Would set recallEnabled=false and remove managed Recall artifacts.');
+
+    return;
+  }
+
+  const updated = markMemberSettingsWritten(localConfig, { recallEnabled: false });
+  await saveLocalConfigForScope(updated, localConfig.scope, localConfig.projectRoot);
+  await awaitFullSync(localConfig);
+
+  await removeRecallArtifacts(teamConfig, localConfig);
+  await redeployWorkflowSkills(teamConfig, updated);
+  log.success('Recall disabled. AI tools will no longer auto-search the knowledge base.');
+}
+
+/**
+ * Recall decides which agents pull delivers, so a toggle bypasses pull's
+ * unchanged-revision fast path, as a changed exclude list does: the next pull
+ * removes or restores what recall gates, the team's own recall agent included.
+ */
+async function awaitFullSync(localConfig: LocalConfig): Promise<void> {
+  try {
+    const state = await loadStateForScope(localConfig);
+    state.lastPullRev = null;
+    await saveStateForScope(state, localConfig);
+  } catch {
+    // Missing or corrupt state is non-critical: the next pull performs a full sync.
+  }
+}
+
+/** teamai-share-learnings runs `share`, which recall gates, so its skill follows the setting. */
+async function redeployWorkflowSkills(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+  const { deployWorkflowSkills } = await import('./workflow/discovery/workflow-skills.js');
+  await deployWorkflowSkills({ teamConfig, localConfig });
+}
+
+export async function recallEnable(opts: GlobalOptions): Promise<void> {
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: opts.dryRun });
+
+  if (opts.dryRun) {
+    log.info('[dry-run] Would set recallEnabled=true and deploy managed Recall artifacts.');
+
+    return;
+  }
+
+  const updated = markMemberSettingsWritten(localConfig, { recallEnabled: true });
+  await saveLocalConfigForScope(updated, localConfig.scope, localConfig.projectRoot);
+  await awaitFullSync(localConfig);
+
+  await deployRecallArtifacts(teamConfig, localConfig);
+  await redeployWorkflowSkills(teamConfig, updated);
+  log.success('Recall enabled. AI tools will auto-search the knowledge base before tasks.');
+}
+
+export async function recallStatus(_opts: GlobalOptions): Promise<void> {
+  // Read-only: the load never persists a migration (#893).
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
+
+  const effective = isRecallEnabled(localConfig, teamConfig);
+  const teamSetting = teamConfig.sharing?.recall?.enabled ?? false;
+  const userOverride = localConfig.recallEnabled;
+
+  console.log(`Recall: ${effective ? 'enabled' : 'disabled'}`);
+
+  if (process.env.TEAMAI_RECALL_DISABLED === '1') {
+    console.log('  Env override (TEAMAI_RECALL_DISABLED=1): disabled');
+  }
+
+  console.log(`  Team config (sharing.recall.enabled): ${teamSetting}`);
+
+  if (userOverride !== undefined) {
+    console.log(`  User override (recallEnabled): ${userOverride}`);
+  } else {
+    console.log(`  User override: not set (using team default)`);
+  }
+}

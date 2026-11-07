@@ -1,0 +1,101 @@
+/**
+ * E2E (real git, NO mocks): proves git-kind reports land on the sibling
+ * teamai-reports checkout instead of resetting the knowledge clone.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { simpleGit } from 'simple-git';
+
+import { reportUsage } from '../team-push.js';
+import { dataHomeKey } from '../dashboard-collector.js';
+import type { LocalConfig } from '../types.js';
+
+let tmp: string;
+let originalHome: string;
+
+beforeEach(() => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-e2e-'));
+  originalHome = process.env.HOME ?? '';
+  process.env.HOME = path.join(tmp, 'home');
+  fs.mkdirSync(process.env.HOME, { recursive: true });
+});
+
+afterEach(() => {
+  process.env.HOME = originalHome;
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+async function makeRepo(dir: string, branch = 'master'): Promise<void> {
+  fs.mkdirSync(dir, { recursive: true });
+  const git = simpleGit(dir);
+  await git.init();
+  await git.addConfig('user.email', 't@t.com');
+  await git.addConfig('user.name', 't');
+  await git.checkoutLocalBranch(branch); // default branch = master, like the bug report
+  fs.writeFileSync(path.join(dir, 'app.js'), 'console.log(1)\n');
+  await git.add('.');
+  await git.commit('init');
+}
+
+describe('E2E reports branch writes', () => {
+  it('git mode: writes stats to sibling teamai-reports and does not reset the clone', async () => {
+    const origin = path.join(tmp, 'origin.git');
+    await simpleGit().init(['--bare', '--initial-branch=main', origin]);
+
+    const cacheRoot = path.join(tmp, 'cache');
+    await makeRepo(cacheRoot, 'main');
+    const git = simpleGit(cacheRoot);
+    fs.writeFileSync(path.join(cacheRoot, 'teamai.yaml'), 'team: original\n');
+    await git.add('teamai.yaml');
+    await git.commit('add team config');
+    await git.addRemote('origin', origin);
+    await git.push(['-u', 'origin', 'main']);
+
+    fs.writeFileSync(path.join(cacheRoot, 'app.js'), 'garbage\n');
+    fs.writeFileSync(
+      path.join(cacheRoot, 'teamai.yaml'),
+      'team: original\nsources:\n  - name: beta-source\n    repo: https://source.test/root/beta-source.git\n',
+    );
+    fs.mkdirSync(path.join(cacheRoot, 'members'), { recursive: true });
+    fs.writeFileSync(path.join(cacheRoot, 'members', 'stale.yaml'), 'username: stale\n');
+
+    const ts = new Date().toISOString();
+    const eventsDir = path.join(process.env.HOME!, '.teamai', 'dashboard');
+    // A session the user scope recorded (#785).
+    const key = await dataHomeKey(path.join(tmp, 'home', '.teamai'));
+    fs.mkdirSync(eventsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(eventsDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'session_start', timestamp: ts, sessionId: 's1', tool: 'claude', cwd: '/p', dataHomeKey: key })}\n` +
+      `${JSON.stringify({ type: 'stop', timestamp: ts, sessionId: 's1', tool: 'claude', dataHomeKey: key, interventions: { interrupt: 1, toolReject: 0 } })}\n`,
+    );
+
+    const cfg: LocalConfig = {
+      repo: { localPath: cacheRoot, remote: origin, kind: 'git' },
+      username: 'me',
+      scope: 'user',
+      additionalRoles: [],
+    } as unknown as LocalConfig;
+
+    await reportUsage(cacheRoot, 'me', { skipTruncate: true, selfConfig: cfg });
+
+    // Knowledge clone is not reset — uncommitted clone edits survive.
+    expect(fs.readFileSync(path.join(cacheRoot, 'app.js'), 'utf-8')).toBe('garbage\n');
+    expect(fs.readFileSync(path.join(cacheRoot, 'teamai.yaml'), 'utf-8'))
+      .toContain('name: beta-source');
+    expect(fs.readFileSync(path.join(cacheRoot, 'members', 'stale.yaml'), 'utf-8'))
+      .toContain('username: stale');
+    expect(fs.existsSync(path.join(cacheRoot, 'stats', 'me.yaml'))).toBe(false);
+
+    const reportsWt = path.join(tmp, 'reports-wt');
+    expect(fs.existsSync(path.join(reportsWt, 'stats', 'me.yaml'))).toBe(true);
+    const originReports = simpleGit(origin);
+    const reportsTree = await originReports.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
+    expect(reportsTree).toContain('stats/me.yaml');
+    const mainTree = await originReports.raw(['ls-tree', '-r', '--name-only', 'main']);
+    expect(mainTree).not.toContain('stats/me.yaml');
+  });
+
+});

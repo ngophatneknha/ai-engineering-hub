@@ -1,0 +1,554 @@
+import { spawnSync } from 'node:child_process';
+import { z } from 'zod';
+import { GITLAB_HOST } from './repo-url.js';
+import { sanitizeGitUrl } from '../../utils/redact.js';
+import { endedRequest, mergedAs, type CiStatus, type CommitRef, type PullRequestRecord, type PullRequestRef } from '../types.js';
+
+/**
+ * GitLab REST API client (API v4).
+ *
+ * GitLab (including self-hosted / enterprise instances) has a clean REST API,
+ * so unlike the TGit/CNB providers this one needs no external CLI — only a
+ * Personal Access Token.
+ *
+ * Auth follows standard GitLab env-var conventions:
+ *   - `GITLAB_URL`: base URL of the instance (default https://gitlab.com)
+ *   - `GITLAB_TOKEN` (primary), `GITLAB_PRIVATE_TOKEN`, `GITLAB_PAT` (aliases)
+ *
+ * The token is sent via the `PRIVATE-TOKEN` header (GitLab PAT scheme).
+ */
+
+// ─── Config ──────────────────────────────────────────────
+
+/**
+ * Base URL of the GitLab instance, e.g. https://gitlab.com or a self-hosted host.
+ *
+ * Resolved lazily rather than at module load: an invalid GITLAB_URL must fail
+ * the GitLab operation that needs it, not crash every module that transitively
+ * imports this one (clone.ts, doctor.ts, …). Reading env at call time also
+ * keeps the value testable.
+ */
+export function gitlabBaseUrl(): string {
+  return resolveGitLabBaseUrl();
+}
+
+/**
+ * Base URL for REST API calls (GitLab mounts the API under /api/v4).
+ *
+ * The API prefix can be customized via GITLAB_API_PREFIX for instances behind
+ * gateways that mount the GitLab API at a non-standard path (e.g., `/api/gitlab`).
+ * Defaults to `api/v4` (standard GitLab).
+ */
+export function gitlabApiBase(): string {
+  const prefix = process.env.GITLAB_API_PREFIX?.trim().replace(/^\/+|\/+$/g, '') || 'api/v4';
+
+  return `${gitlabBaseUrl()}/${prefix}`;
+}
+
+function resolveGitLabBaseUrl(): string {
+  const gitlabUrl = process.env.GITLAB_URL?.trim();
+
+  if (gitlabUrl) {
+    // Reject a value `new URL()` cannot parse (most often a missing scheme).
+    // Without this the API base and GITLAB_HOST silently disagree: repo-url.ts
+    // falls back to gitlab.com while every fetch here throws "Failed to parse
+    // URL" from deep inside undici.
+    try {
+      const parsed = new URL(gitlabUrl);
+
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error('unsupported protocol');
+      }
+    } catch {
+      throw new Error(
+        `Invalid GITLAB_URL: "${gitlabUrl}". Expected a full base URL including the ` +
+          'scheme, e.g. https://gitlab.example.com',
+      );
+    }
+
+    assertSameGitLabHost(new URL(gitlabUrl));
+
+    return gitlabUrl.replace(/\/+$/, '');
+  }
+
+  return `https://${GITLAB_HOST}`;
+}
+
+/**
+ * Repo URLs on TEAMAI_GITLAB_HOST are routed to the GitLab provider, and its
+ * API calls go to GITLAB_URL. When the two name different hosts, the token for
+ * one instance would be sent to the other, so refuse instead of choosing.
+ */
+function assertSameGitLabHost(gitlabUrl: URL): void {
+  const override = process.env.TEAMAI_GITLAB_HOST?.trim().toLowerCase();
+
+  if (!override || override === gitlabUrl.host || override === gitlabUrl.hostname) return;
+  throw new Error(
+    `TEAMAI_GITLAB_HOST (${override}) and GITLAB_URL (${gitlabUrl.origin}) name different GitLab `
+      + 'hosts, so teamai cannot tell which one your token belongs to. Unset TEAMAI_GITLAB_HOST, '
+      + 'or set GITLAB_URL to the base URL of that host, then run the command again.',
+  );
+}
+
+/** Resolve the GitLab token from env, honouring the documented aliases. */
+export function getGitLabToken(): string | null {
+  // Trim and treat blank as absent: CI often declares GITLAB_TOKEN with an unset
+  // secret (empty string), and `$(cat token)` leaves a trailing newline that
+  // undici rejects as an invalid header value.
+  for (const raw of [
+    process.env.GITLAB_TOKEN,
+    process.env.GITLAB_PRIVATE_TOKEN,
+    process.env.GITLAB_PAT,
+  ]) {
+    const token = raw?.trim();
+
+    if (token) return token;
+  }
+
+  return null;
+}
+
+function requireToken(): string {
+  const token = getGitLabToken();
+
+  if (!token) {
+    throw new Error(
+      'GitLab authentication unavailable. Set the GITLAB_TOKEN environment variable ' +
+        '(a GitLab Personal Access Token with `api` scope). GITLAB_PRIVATE_TOKEN and ' +
+        'GITLAB_PAT are accepted as aliases.',
+    );
+  }
+
+  return token;
+}
+
+function authHeaders(token: string) {
+  return {
+    'PRIVATE-TOKEN': token,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  };
+}
+
+// ─── Auth ────────────────────────────────────────────────
+
+/** True when a GitLab token is configured (no network check). */
+export function gitlabIsAuthenticated(): boolean {
+  return getGitLabToken() !== null;
+}
+
+/** Fetch the authenticated GitLab username, or null when unavailable. */
+export async function gitlabWhoami(): Promise<string | null> {
+  const token = getGitLabToken();
+
+  if (!token) return null;
+  // Resolved outside the try: a GITLAB_URL configuration error must reach the
+  // user instead of reading as a failed login.
+  const url = `${gitlabApiBase()}/user`;
+
+  try {
+    const resp = await fetch(url, {
+      headers: authHeaders(token),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!resp.ok) return null;
+    const data = z.object({ username: z.string().optional().catch(undefined) }).safeParse(await resp.json());
+
+    return data.data?.username ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ensure GitLab is usable. Unlike TGit/CNB there is no CLI to install — only a
+ * token is needed, which `authenticate` verifies.
+ */
+export async function ensureGitLabAvailable(): Promise<void> {
+  const token = getGitLabToken();
+
+  if (token) return;
+  throw new Error(
+    'GitLab authentication unavailable. Set GITLAB_TOKEN (or GITLAB_PRIVATE_TOKEN / GITLAB_PAT).',
+  );
+}
+
+// ─── Repo operations ─────────────────────────────────────
+
+export class GitLabRepoNotFoundError extends Error {
+  constructor(repo: string) {
+    super(`Repo "${repo}" not found on GitLab.`);
+    this.name = 'GitLabRepoNotFoundError';
+  }
+}
+
+/**
+ * Build the git clone URL WITHOUT credentials.
+ *
+ * Derived from the instance base URL rather than re-assembled from GITLAB_HOST,
+ * so a self-hosted instance keeps its scheme (`http://` internal deployments),
+ * its port, and any relative-URL-root prefix (`https://example.com/gitlab`).
+ * The token is injected out-of-band via `http.extraHeader` (see gitlabRepoClone)
+ * so it never lands in the remote URL, and therefore is not persisted to the
+ * cloned repo's `.git/config` (where a URL-embedded credential would remain for
+ * every later fetch/push). This mirrors the http.extraHeader approach already
+ * used in clone.ts.
+ */
+function cloneUrl(repo: string): string {
+  const base = gitlabBaseUrl().replace(/\/+$/, '');
+
+  return `${base}/${repo}.git`;
+}
+
+/**
+ * HTTP Basic auth header for a GitLab PAT (username fixed to `oauth2`), passed
+ * to git via `-c http.extraHeader=...` so the token stays out of the URL.
+ */
+function gitlabAuthHeaderArg(token: string): string {
+  const encoded = Buffer.from(`oauth2:${token}`).toString('base64');
+
+  return `http.extraHeader=Authorization: Basic ${encoded}`;
+}
+
+/**
+ * Clone a GitLab repo to localPath. The token is injected via http.extraHeader
+ * rather than embedded in the remote URL, so it is not persisted to
+ * `.git/config` for subsequent git operations.
+ */
+export function gitlabRepoClone(repo: string, localPath: string): void {
+  const token = getGitLabToken();
+  // `-c <key>=<val>` is a git-level option and must precede the `clone`
+  // subcommand, matching the http.extraHeader pattern in clone.ts.
+  const args: string[] = [];
+
+  if (token) {
+    args.push('-c', gitlabAuthHeaderArg(token));
+  }
+
+  args.push('clone', cloneUrl(repo), localPath);
+
+  const result = spawnSync('git', args, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 120_000,
+    windowsHide: true,
+  });
+
+  const allOutput = `${result.stderr ?? ''} ${result.stdout ?? ''}`;
+
+  if (result.status === 0) return;
+
+  // "not found" / "could not be found" indicate the repo does not exist (or the
+  // token cannot see it). Auth failures are handled below as a generic error.
+  if (
+    allOutput.includes('not found')
+    || allOutput.includes('does not exist')
+    || allOutput.includes('Repository not found')
+    || allOutput.includes('could not be found')
+  ) {
+    throw new GitLabRepoNotFoundError(repo);
+  }
+
+  // Redact any credentials git may have echoed back, using the shared helper so
+  // coverage stays consistent with the rest of the codebase.
+  const sanitized = sanitizeGitUrl(allOutput);
+  throw new Error(`git clone failed: ${sanitized.trim()}`);
+}
+
+/**
+ * Resolve a namespace path (group or group/subgroup) to its GitLab id.
+ *
+ * Looks the group up by its URL-encoded full path rather than searching, so a
+ * common group name is not missed just because the exact match fell outside a
+ * paginated `search=` result.
+ */
+async function resolveNamespaceId(owner: string, token: string): Promise<number | null> {
+  const resp = await fetch(
+    `${gitlabApiBase()}/groups/${encodeURIComponent(owner)}`,
+    { headers: authHeaders(token), redirect: 'manual' },
+  );
+
+  if (!resp.ok) return null;
+  const group = z.object({ id: z.number().optional().catch(undefined) }).safeParse(await resp.json());
+
+  return group.data?.id ?? null;
+}
+
+/** The body of GitLab's create-project request. */
+interface GitLabCreateProjectBody {
+  name: string;
+  path: string;
+  visibility: 'private';
+  namespace_id?: number;
+}
+
+/**
+ * Create a private GitLab project. Uses the authenticated user's namespace when
+ * `owner` matches the current user, otherwise resolves a group namespace.
+ */
+export async function gitlabCreateRepo(owner: string, repo: string): Promise<void> {
+  const token = requireToken();
+  const login = await gitlabWhoami();
+  const body: GitLabCreateProjectBody = { name: repo, path: repo, visibility: 'private' };
+
+  if (!login || login.toLowerCase() !== owner.toLowerCase()) {
+    const namespaceId = await resolveNamespaceId(owner, token);
+
+    if (namespaceId === null) {
+      // Posting without namespace_id would create the project under the
+      // authenticated user instead, reporting success at the wrong location and
+      // leaving a stray project behind.
+      throw new Error(
+        `Cannot create GitLab project: namespace "${owner}" was not found, or the token ` +
+          'cannot see it. Check the group path and that the token has `api` scope.',
+      );
+    }
+
+    body.namespace_id = namespaceId;
+  }
+
+  const resp = await fetch(`${gitlabApiBase()}/projects`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+    redirect: 'manual',
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => '');
+    throw new Error(`Failed to create GitLab project: ${resp.status} ${errBody}`);
+  }
+}
+
+// ─── Merge requests ──────────────────────────────────────
+
+export interface GitLabMrCreateOptions {
+  /** Repository in "owner/repo" (or group/subgroup/repo) format */
+  repo: string;
+  /** Source branch name */
+  source: string;
+  /** Target branch name (usually 'main' or 'master') */
+  target: string;
+  /** MR title */
+  title: string;
+  /** MR description */
+  description?: string;
+  /** Reviewer usernames — resolved to GitLab user IDs (best-effort) */
+  reviewers?: string[];
+  /** Working directory (unused for the REST path, kept for interface parity) */
+  cwd?: string;
+  spawnTimeoutMs?: number;
+}
+
+const GitLabUsersSchema = z.array(z.object({ id: z.number(), username: z.string() }));
+
+/** The body of GitLab's create-merge-request request. */
+interface GitLabMrCreateBody {
+  source_branch: string;
+  target_branch: string;
+  title: string;
+  description?: string;
+  reviewer_ids?: number[];
+}
+
+/** Resolve reviewer usernames to GitLab user IDs (best-effort, skips misses). */
+async function resolveReviewerIds(
+  reviewers: string[] | undefined,
+  token: string,
+  signal: AbortSignal,
+): Promise<number[]> {
+  if (!reviewers?.length) return [];
+  const ids: number[] = [];
+
+  for (const username of reviewers) {
+    try {
+      const resp = await fetch(
+        `${gitlabApiBase()}/users?username=${encodeURIComponent(username)}`,
+        { headers: authHeaders(token), redirect: 'manual', signal },
+      );
+
+      if (!resp.ok) continue;
+      const users = GitLabUsersSchema.parse(await resp.json());
+      const exact = users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+
+      if (exact) ids.push(exact.id);
+    } catch {
+      signal.throwIfAborted();
+      // Non-fatal: an unresolvable reviewer should not block MR creation.
+    }
+  }
+
+  return ids;
+}
+
+/**
+ * Create a Merge Request via the GitLab REST API.
+ * Returns the MR web URL on success.
+ */
+export async function gitlabMrCreate(opts: GitLabMrCreateOptions): Promise<string> {
+  const token = requireToken();
+  const projectId = encodeURIComponent(opts.repo);
+  // Reviewer lookup and response bodies consume the same budget as creation.
+  // An expired lookup must not continue in the background and post a late MR.
+  const signal = AbortSignal.timeout(opts.spawnTimeoutMs ?? 30_000);
+
+  const body: GitLabMrCreateBody = {
+    source_branch: opts.source,
+    target_branch: opts.target,
+    title: opts.title,
+  };
+
+  if (opts.description) body.description = opts.description;
+
+  const reviewerIds = await resolveReviewerIds(opts.reviewers, token, signal);
+
+  if (reviewerIds.length > 0) body.reviewer_ids = reviewerIds;
+
+  const resp = await fetch(`${gitlabApiBase()}/projects/${projectId}/merge_requests`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+    redirect: 'manual',
+    signal,
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => '');
+    throw new Error(`Failed to create GitLab MR: ${resp.status} ${errBody}`);
+  }
+
+  // A field of another type, or a body that is no object, reads as absent.
+  const mr = z.object({
+    web_url: z.string().optional().catch(undefined),
+    iid: z.number().optional().catch(undefined),
+  }).catch({}).parse(await resp.json());
+
+  if (mr.web_url) return mr.web_url;
+
+  if (mr.iid) return `${gitlabBaseUrl()}/${opts.repo}/-/merge_requests/${mr.iid}`;
+  throw new Error('GitLab MR created but response did not include web_url.');
+}
+
+// ─── Open merge request lookup ───────────────────────────
+
+const LOOKUP_PAGE = 100;
+
+const GitLabOpenMrSchema = z.object({
+  web_url: z.string(),
+  state: z.string(),
+  source_branch: z.string(),
+  target_branch: z.string(),
+  source_project_id: z.number(),
+  target_project_id: z.number(),
+});
+
+/**
+ * The open merge request from `source` into `target` in project `repo`, asked of the GitLab API with the configured
+ * token. A request from a fork with the same branch name is not it. Never prompts, and throws, rather than answering
+ * none, when GitLab cannot be asked or answers in time, answers what this cannot read, fills a whole page without it,
+ * or names a request on another host.
+ */
+export async function gitlabFindOpenMr({ repo, source, target, timeoutMs }: PullRequestRef): Promise<string | undefined> {
+  const token = requireToken();
+  const query = new URLSearchParams({ state: 'opened', source_branch: source, target_branch: target, per_page: String(LOOKUP_PAGE) });
+
+  const response = await fetch(`${gitlabApiBase()}/projects/${encodeURIComponent(repo)}/merge_requests?${query}`, {
+    headers: authHeaders(token), redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) throw new Error(`GitLab answered the open merge request lookup with HTTP ${response.status}. Check the token's access to the project.`);
+  const requests = z.array(GitLabOpenMrSchema).safeParse(await response.json().catch(() => undefined));
+
+  if (!requests.success) throw new Error('GitLab answered the open merge request lookup with data TeamAI cannot read.');
+
+  const found = requests.data.find((mr) => mr.state === 'opened' && mr.source_branch === source && mr.target_branch === target
+    && mr.source_project_id === mr.target_project_id);
+
+  if (!found) {
+    if (requests.data.length >= LOOKUP_PAGE) throw new Error('GitLab listed more open merge requests than one page, so TeamAI cannot tell whether this branch has one.');
+
+    return undefined;
+  }
+
+  if (hostOf(found.web_url) !== hostOf(gitlabBaseUrl())) throw new Error('GitLab answered the open merge request lookup with a URL on another host.');
+
+  return found.web_url;
+}
+
+const PipelinesSchema = z.array(z.object({ status: z.string() }));
+const PIPELINE_RUNNING = new Set(['created', 'waiting_for_resource', 'preparing', 'pending', 'running', 'scheduled', 'manual']);
+
+/**
+ * How the CI of a commit went on GitLab: its newest pipeline. A canceled or skipped one says nothing of the commit, as
+ * no pipeline does.
+ */
+export async function gitlabCommitPipelines({ repo, commit, timeoutMs }: CommitRef): Promise<CiStatus> {
+  const token = requireToken();
+  const query = new URLSearchParams({ sha: commit, order_by: 'id', sort: 'desc', per_page: '1' });
+
+  const response = await fetch(`${gitlabApiBase()}/projects/${encodeURIComponent(repo)}/pipelines?${query}`, {
+    headers: authHeaders(token), redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) throw new Error(`GitLab answered the commit pipelines lookup with HTTP ${response.status}. Check the token's access to the project.`);
+  const pipelines = PipelinesSchema.safeParse(await response.json().catch(() => undefined));
+
+  if (!pipelines.success) throw new Error('GitLab answered the commit pipelines lookup with data TeamAI cannot read.');
+  const status = pipelines.data[0]?.status;
+
+  if (status === 'success') return 'passed';
+
+  if (status === 'failed') return 'failed';
+
+  return status !== undefined && PIPELINE_RUNNING.has(status) ? 'pending' : 'none';
+}
+
+const GitLabMrHistorySchema = GitLabOpenMrSchema.extend({
+  title: z.string(),
+  created_at: z.string(),
+  closed_at: z.string().nullish(),
+  merged_at: z.string().nullish(),
+  updated_at: z.string().nullish(),
+  sha: z.string().nullish(),
+  merge_commit_sha: z.string().nullish(),
+  squash_commit_sha: z.string().nullish(),
+});
+
+/**
+ * Every merge request from `source` into `target` in project `repo`, newest first, with how it ended. A request from a
+ * fork with the same branch name is not one of them. Throws, rather than listing none, as `gitlabFindOpenMr` does.
+ */
+export async function gitlabMrHistory({ repo, source, target, timeoutMs }: PullRequestRef): Promise<PullRequestRecord[]> {
+  const token = requireToken();
+  const query = new URLSearchParams({ state: 'all', source_branch: source, target_branch: target, per_page: String(LOOKUP_PAGE) });
+
+  const response = await fetch(`${gitlabApiBase()}/projects/${encodeURIComponent(repo)}/merge_requests?${query}`, {
+    headers: authHeaders(token), redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) throw new Error(`GitLab answered the merge request history lookup with HTTP ${response.status}. Check the token's access to the project.`);
+  const requests = z.array(GitLabMrHistorySchema).safeParse(await response.json().catch(() => undefined));
+
+  if (!requests.success) throw new Error('GitLab answered the merge request history lookup with data TeamAI cannot read.');
+
+  if (requests.data.length >= LOOKUP_PAGE) throw new Error('GitLab listed more merge requests than one page, so TeamAI cannot tell how this branch\'s requests ended.');
+  const ours = requests.data.filter((mr) => mr.source_branch === source && mr.target_branch === target && mr.source_project_id === mr.target_project_id);
+
+  if (ours.some((mr) => hostOf(mr.web_url) !== hostOf(gitlabBaseUrl()))) throw new Error('GitLab answered the merge request history lookup with a URL on another host.');
+
+  // A fast-forward merge without a squash puts the head itself on the target branch.
+  return ours.map((mr) => endedRequest({
+    url: mr.web_url, title: mr.title, openedAt: mr.created_at, state: mr.state, closedAt: mr.closed_at ?? mr.merged_at ?? mr.updated_at,
+    merge: mergedAs({ head: mr.sha, commit: mr.merge_commit_sha ?? mr.squash_commit_sha ?? mr.sha }),
+  }));
+}
+
+function hostOf(url: string): string | undefined {
+  try {
+    return new URL(url).host;
+  } catch {
+    return undefined;
+  }
+}

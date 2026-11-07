@@ -1,0 +1,1394 @@
+from __future__ import annotations
+
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal
+
+import click
+from crewai_core.constants import CREWAI_TRAINED_AGENTS_FILE_ENV
+from packaging import version
+
+from crewai_cli.api_keys import (
+    PASTED_KEYS_ENV,
+    PLACEHOLDER_API_KEY,
+    ask_for_api_key,
+    ask_for_missing_api_keys,
+    missing_key_line,
+)
+from crewai_cli.input_prompt import (
+    closest_name,
+    is_interactive,
+    parse_inputs_json,
+    prompt_for_inputs,
+)
+from crewai_cli.utils import (
+    build_env_with_all_tool_credentials,
+    get_or_create_project_id,
+)
+from crewai_cli.version import get_crewai_tools_dependency, get_crewai_version
+
+
+if TYPE_CHECKING:
+    from crewai_cli.crew_run_tui import CrewRunApp
+
+
+# Must accept the same names as the kickoff interpolation pattern in
+# crewai.utilities.string_utils (_VARIABLE_PATTERN), including hyphens —
+# otherwise placeholders are interpolated at runtime but never prompted for.
+_INPUT_PLACEHOLDER_RE = re.compile(r"(?<!{){([A-Za-z_][A-Za-z0-9_\-]*)}(?!})")
+_CREWAI_CLI_RUNNER_PACKAGE_DIR_ENV = "CREWAI_CLI_RUNNER_PACKAGE_DIR"
+_CREWAI_RUNNER_SOURCE_DIR_ENV = "CREWAI_RUNNER_SOURCE_DIR"
+_CREWAI_JSON_CREW_DEFINITION_ENV = "CREWAI_JSON_CREW_DEFINITION"
+_CREWAI_JSON_CREW_INPUTS_ENV = "CREWAI_JSON_CREW_INPUTS"
+_FULL_CREWAI_INSTALL_MESSAGE = f"""\
+CrewAI CLI is installed without the `crewai` package required to run crews.
+
+Install the full CrewAI package:
+
+  uv tool install --force '{get_crewai_tools_dependency()}'
+
+The quotes are required in zsh so `crewai[tools]` is not treated as a glob.
+"""
+_PROJECT_RUNNER_BOOTSTRAP_CODE = """
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+source_dir = os.environ.get("CREWAI_RUNNER_SOURCE_DIR")
+if source_dir:
+    sys.path.insert(0, source_dir)
+
+# This interpreter never imports cli.py, so pin the machine's proxy and CA for
+# AMP requests here, before the selected runner loads the project's .env. A
+# crewai-core too old to have plus_api pins nothing and ignores proxies anyway;
+# any other import failure is real and must surface here. `python -c` puts the
+# project folder first on sys.path, so the pin is imported with it off the path:
+# a project folder named crewai_core must not decide where the saved login
+# travels. The path is restored after, so project code still imports its own.
+search_path = sys.path[:]
+sys.path[:] = [entry for entry in sys.path if entry not in ("", os.getcwd())]
+try:
+    import crewai_core.plus_api
+except ModuleNotFoundError as error:
+    if error.name != "crewai_core.plus_api":
+        raise
+finally:
+    sys.path[:] = search_path
+
+package_dir = Path(os.environ["CREWAI_CLI_RUNNER_PACKAGE_DIR"])
+package_spec = importlib.util.spec_from_file_location(
+    "crewai_cli",
+    package_dir / "__init__.py",
+    submodule_search_locations=[str(package_dir)],
+)
+if package_spec is None or package_spec.loader is None:
+    raise ImportError(f"Cannot load CrewAI CLI package from {package_dir}")
+
+package = importlib.util.module_from_spec(package_spec)
+sys.modules["crewai_cli"] = package
+package_spec.loader.exec_module(package)
+
+module_path = package_dir / f"{_runner_module}.py"
+module_spec = importlib.util.spec_from_file_location(f"crewai_cli.{_runner_module}", module_path)
+if module_spec is None or module_spec.loader is None:
+    raise ImportError(f"Cannot load CrewAI CLI runner from {module_path}")
+
+module = importlib.util.module_from_spec(module_spec)
+sys.modules[f"crewai_cli.{_runner_module}"] = module
+module_spec.loader.exec_module(module)
+
+""".strip()
+
+
+def _project_runner_code(module_name: str, invocation: str) -> str:
+    return (
+        f"_runner_module = {module_name!r}\n"
+        + _PROJECT_RUNNER_BOOTSTRAP_CODE
+        + "\n"
+        + invocation.strip()
+    )
+
+
+_JSON_CREW_RUNNER_CODE = _project_runner_code(
+    "run_crew",
+    """from crewai_core.constants import CREWAI_TRAINED_AGENTS_FILE_ENV
+
+kwargs = {
+    "trained_agents_file": os.getenv(CREWAI_TRAINED_AGENTS_FILE_ENV),
+}
+if crew_definition := os.getenv("CREWAI_JSON_CREW_DEFINITION"):
+    kwargs["crew_path"] = crew_definition
+if crew_inputs := os.getenv("CREWAI_JSON_CREW_INPUTS"):
+    kwargs["inputs"] = crew_inputs
+
+try:
+    module._run_json_crew(**kwargs)
+except module.click.ClickException as exc:
+    exc.show()
+    raise SystemExit(exc.exit_code)
+except module.click.Abort:
+    # Ctrl-C or Ctrl-D at a prompt, ended as click ends its own commands.
+    module.click.echo("Aborted!", err=True)
+    raise SystemExit(1)
+""",
+)
+
+
+def _is_missing_crewai_package(exc: ModuleNotFoundError) -> bool:
+    return bool(exc.name and exc.name.startswith("crewai"))
+
+
+def _full_crewai_install_error() -> click.ClickException:
+    return click.ClickException(_FULL_CREWAI_INSTALL_MESSAGE)
+
+
+def read_toml(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from crewai_core.project import read_toml as _read_toml
+
+    return _read_toml(*args, **kwargs)
+
+
+def get_crewai_project_type(pyproject_data: dict[str, Any]) -> str | None:
+    from crewai_core.project import get_crewai_project_type as _get_crewai_project_type
+
+    return _get_crewai_project_type(pyproject_data)
+
+
+def configured_project_json_crew(
+    pyproject_data: dict[str, Any] | None = None,
+    project_root: Path | None = None,
+) -> Path | None:
+    """Return the configured JSON crew definition for crew projects."""
+    from crewai_core.project import (
+        ProjectDefinitionError,
+        configured_project_definition,
+    )
+
+    root = project_root or Path.cwd()
+    if pyproject_data is None and not (root / "pyproject.toml").is_file():
+        return None
+
+    try:
+        return configured_project_definition(
+            "crew",
+            pyproject_data=pyproject_data,
+            project_root=root,
+        )
+    except ProjectDefinitionError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+
+def _extract_input_placeholders(text: str | None) -> set[str]:
+    if not text:
+        return set()
+    return set(_INPUT_PLACEHOLDER_RE.findall(text))
+
+
+def _referenced_input_names(crew: Any) -> set[str]:
+    """All ``{placeholder}`` names referenced by a crew's agents and tasks."""
+    placeholders: set[str] = set()
+
+    for agent in getattr(crew, "agents", []) or []:
+        placeholders.update(_extract_input_placeholders(getattr(agent, "role", None)))
+        placeholders.update(_extract_input_placeholders(getattr(agent, "goal", None)))
+        placeholders.update(
+            _extract_input_placeholders(getattr(agent, "backstory", None))
+        )
+
+    for task in getattr(crew, "tasks", []) or []:
+        placeholders.update(
+            _extract_input_placeholders(getattr(task, "description", None))
+        )
+        placeholders.update(
+            _extract_input_placeholders(getattr(task, "expected_output", None))
+        )
+        placeholders.update(
+            _extract_input_placeholders(getattr(task, "output_file", None))
+        )
+
+    return placeholders
+
+
+def _missing_input_names(crew: Any, inputs: dict[str, Any]) -> list[str]:
+    """Return input placeholders referenced by a crew but not provided as inputs."""
+    return sorted(name for name in _referenced_input_names(crew) if name not in inputs)
+
+
+def _resolve_crew_inputs(
+    crew: Any,
+    default_inputs: dict[str, Any],
+    provided: dict[str, Any] | None,
+    *,
+    interactive: bool,
+) -> dict[str, Any]:
+    """Resolve kickoff inputs for a declarative crew.
+
+    Mirrors the declarative-flow experience (``_resolve_flow_inputs``): layers
+    ``--inputs`` over the crew's declared ``inputs`` defaults, warns on provided
+    keys that aren't referenced as ``{placeholder}``s, prompts for any
+    still-missing placeholders when interactive, and exits with a pointed
+    message when one is still missing.
+
+    Unlike flows — whose state schema is an authoritative contract, so unknown
+    keys are dropped — the crew placeholder scan is heuristic (it only covers
+    agent/task text fields). An unrecognized key is therefore warned about but
+    *kept*, never dropped: dropping could silently discard a value that a field
+    the scan doesn't cover actually relies on.
+    """
+    referenced = _referenced_input_names(crew)
+    inputs = dict(default_inputs or {})
+
+    for key, value in (provided or {}).items():
+        # A key the crew declares is no typo, and a retry passes them all back.
+        if key not in referenced and key not in inputs:
+            suggestion = closest_name(key, referenced)
+            hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+            click.secho(
+                f"  Input '{key}' isn't referenced by any {{placeholder}} "
+                f"in the crew.{hint}",
+                fg="yellow",
+                err=True,
+            )
+        inputs[key] = value
+
+    missing = _missing_input_names(crew, inputs)
+    if missing and interactive:
+        inputs.update(
+            prompt_for_inputs(
+                missing,
+                title="Crew inputs",
+                subtitle="This crew needs the following to run.",
+            )
+        )
+        missing = _missing_input_names(crew, inputs)
+
+    if missing:
+        for name in missing:
+            click.secho(f"  Missing required input '{name}'", fg="red", err=True)
+        click.secho(
+            "  Provide them via --inputs or the `inputs` object in crew.json(c).",
+            dim=True,
+            err=True,
+        )
+        record_run_stopped("missing_inputs")
+        raise SystemExit(1)
+
+    return inputs
+
+
+def _json_loading_status(message: str) -> AbstractContextManager[Any]:
+    from rich.console import Console
+    from rich.text import Text
+
+    console = Console()
+    if not console.is_terminal:
+        return nullcontext()
+    return console.status(
+        Text(f"  {message}", style="bold #1F7982"),
+        spinner="dots",
+    )
+
+
+class ApiKeyNotSetError(click.ClickException):
+    """A JSON crew's run stopped because a model's API key is not set."""
+
+    def __init__(self, env_var: str, json_crew: Path) -> None:
+        super().__init__(missing_key_line(env_var, Path.cwd(), json_crew))
+
+
+def _missing_api_key(error: BaseException | None) -> str | None:
+    """The variable a ``MissingAPIKeyError`` behind ERROR names, if one does.
+
+    Kickoff raises it as itself. The JSON loader raises it from a pydantic
+    ValidationError of the agent an OpenAI-compatible model is built for.
+    """
+    try:
+        from crewai.llms.base_llm import MissingAPIKeyError
+    except ImportError:
+        # The project's crewai predates it: the run stops as it always has.
+        return None
+    from pydantic import ValidationError
+
+    # crewAI's providers re-raise with `raise e from e`, which makes an error
+    # its own cause.
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, MissingAPIKeyError):
+            return error.env_var
+        if isinstance(error, ValidationError):
+            for detail in error.errors():
+                cause = detail.get("ctx", {}).get("error")
+                if isinstance(cause, MissingAPIKeyError):
+                    return cause.env_var
+        error = error.__cause__
+    return None
+
+
+@contextmanager
+def _stops_for_a_missing_api_key(json_crew: Path) -> Iterator[None]:
+    """Stop the run with the line that sets the API key the block failed
+    without, instead of a traceback; anything else raises as it is."""
+    try:
+        yield
+    except Exception as error:
+        env_var = _missing_api_key(error)
+        if env_var is None:
+            raise
+        record_run_stopped("missing_api_key")
+        raise ApiKeyNotSetError(env_var, json_crew) from error
+
+
+def _load_json_crew(crew_path: Path) -> tuple[Any, dict[str, Any]]:
+    try:
+        from crewai.project.crew_loader import load_crew
+    except ModuleNotFoundError as exc:
+        if _is_missing_crewai_package(exc):
+            record_run_stopped("crewai_missing")
+            raise _full_crewai_install_error() from exc
+        record_run_stopped("load_failed", exc)
+        raise
+
+    try:
+        return load_crew(crew_path)
+    except (Exception, SystemExit) as exc:
+        # A missing key is counted where the run stops for it.
+        if _missing_api_key(exc) is None:
+            record_run_stopped("load_failed", exc)
+        raise
+
+
+def _load_json_crew_for_tui(
+    crew_path: Path,
+) -> tuple[type[Any], Any, dict[str, Any], list[str], list[str]]:
+    with _json_loading_status("Preparing crew..."):
+        from crewai_cli.crew_run_tui import CrewRunApp
+
+        crew, default_inputs = _load_json_crew(crew_path)
+        _prepare_json_crew_for_tui(crew)
+        task_names = [
+            getattr(task, "name", "") or getattr(task, "description", "")[:40] or "Task"
+            for task in crew.tasks
+        ]
+        agent_names = [
+            getattr(agent, "role", "") or getattr(agent, "name", "") or "Agent"
+            for agent in crew.agents
+        ]
+
+    return CrewRunApp, crew, default_inputs, task_names, agent_names
+
+
+def _prepare_json_crew_for_tui(crew: Any) -> None:
+    """Apply the same quiet/streaming setup used by the TUI JSON loader."""
+    crew.verbose = False
+    for agent in crew.agents:
+        agent.verbose = False
+        if hasattr(agent, "llm") and hasattr(agent.llm, "stream"):
+            agent.llm.stream = True
+
+
+def _run_json_crew_without_tui(crew_path: Path, provided: dict[str, Any] | None) -> Any:
+    """Run a JSON-defined crew with plain terminal output."""
+    with _json_loading_status("Preparing crew..."):
+        crew, default_inputs = _load_json_crew(crew_path)
+
+    runtime_inputs = _resolve_crew_inputs(
+        crew, default_inputs, provided, interactive=False
+    )
+    result = crew.kickoff(inputs=runtime_inputs)
+    if result is not None:
+        click.echo(str(result))
+    return result
+
+
+def _run_json_crew_in_tui(
+    crew_path: Path, provided: dict[str, Any] | None
+) -> tuple[CrewRunApp, dict[str, Any]]:
+    """Run a JSON-defined crew in the run app; returns the app and the inputs."""
+    crew_run_app_cls, crew, default_inputs, task_names, agent_names = (
+        _load_json_crew_for_tui(crew_path)
+    )
+    runtime_inputs = _resolve_crew_inputs(
+        crew, default_inputs, provided, interactive=True
+    )
+
+    app = crew_run_app_cls(
+        crew_name=crew.name or "Crew",
+        total_tasks=len(crew.tasks),
+        agent_names=agent_names,
+        task_names=task_names,
+    )
+    app._crew = crew
+    app._default_inputs = runtime_inputs
+
+    app.run()
+
+    _print_post_tui_summary(app)
+    return app, runtime_inputs
+
+
+def _ask_for_the_api_key(error: BaseException, crew_path: Path) -> None:
+    """Ask for the API key ERROR was raised without, and save it; raise ERROR
+    when it names none or none is pasted."""
+    env_var = _missing_api_key(error)
+    if env_var is None:
+        raise error
+    # Ctrl-C or Ctrl-D at the prompt stops the run there.
+    with stops_run_as("missing_api_key"):
+        pasted = ask_for_api_key(env_var, Path.cwd(), crew_path)
+    if not pasted:
+        raise error
+
+
+def _run_json_crew(
+    trained_agents_file: str | None = None,
+    crew_path: str | Path | None = None,
+    inputs: str | None = None,
+) -> Any:
+    """Load and run a JSON-defined crew."""
+    env_file = Path.cwd() / ".env"
+    if env_file.exists():
+        load_project_env(env_file)
+
+    # JSON crews run in-process, so export the trained-agents file directly
+    # instead of forwarding it to a subprocess like classic crews do.
+    if trained_agents_file:
+        os.environ[CREWAI_TRAINED_AGENTS_FILE_ENV] = trained_agents_file
+
+    if crew_path is None:
+        crew_path = configured_project_json_crew()
+    if crew_path is None:
+        raise FileNotFoundError(
+            "No JSON crew definition configured in [tool.crewai].definition"
+        )
+    crew_path = Path(crew_path)
+
+    provided = parse_inputs_json(inputs)
+
+    # The TUI is the interactive default. Without an interactive terminal (a coding
+    # agent, CI, piped input, CREWAI_DMN) the crew runs on plain output and the
+    # command exits when it finishes, as declarative flows do.
+    if not is_interactive():
+        with _stops_for_a_missing_api_key(crew_path):
+            return _run_json_crew_without_tui(crew_path, provided)
+
+    # A missing key is asked for once, and the crew built again and run once
+    # more: its agents spent their retries, and a model built without the key
+    # keeps none.
+    with _stops_for_a_missing_api_key(crew_path):
+        try:
+            app, runtime_inputs = _run_json_crew_in_tui(crew_path, provided)
+        except Exception as error:
+            _ask_for_the_api_key(error, crew_path)
+            app, runtime_inputs = _run_json_crew_in_tui(crew_path, provided)
+        else:
+            failure: Exception | None = getattr(app, "_failure", None)
+            if failure is not None and _missing_api_key(failure):
+                _ask_for_the_api_key(failure, crew_path)
+                click.echo("Running the crew again from its first task.")
+                app, runtime_inputs = _run_json_crew_in_tui(crew_path, runtime_inputs)
+        # The app only shows a failure; one for a missing key stops the run.
+        failure = getattr(app, "_failure", None)
+        if failure is not None and _missing_api_key(failure):
+            raise failure
+
+    if app._status == "failed":
+        # Mirror the classic subprocess path: a failed crew must produce a
+        # non-zero exit code so scripts and CI don't treat it as success.
+        raise SystemExit(1)
+
+    if app._status not in ("completed", "failed"):
+        # User quit mid-run. kickoff runs in a thread worker that cannot be
+        # force-cancelled, so end the process to stop in-flight LLM and tool
+        # work instead of letting it burn tokens in the background.
+        click.secho("\n  Run cancelled.", fg="yellow")
+        sys.stdout.flush()
+        os._exit(130)
+
+    if getattr(app, "_want_deploy", False):
+        _chain_deploy()
+    if getattr(app, "_want_traced_rerun", False):
+        # The same crew with the inputs this run used, prompted ones included.
+        _chain_traced_rerun(
+            {
+                "trained_agents_file": trained_agents_file,
+                "inputs": json.dumps(runtime_inputs, default=str),
+            }
+        )
+
+    return app._crew_result
+
+
+def _has_lockfile(project_root: Path | None = None) -> bool:
+    """Return True when the project already has a dependency lockfile."""
+    return _has_uv_lockfile(project_root) or _has_poetry_lockfile(project_root)
+
+
+def _has_uv_lockfile(project_root: Path | None = None) -> bool:
+    """Return True when the project has a uv lockfile."""
+    root = project_root or Path.cwd()
+    return (root / "uv.lock").is_file()
+
+
+def _has_poetry_lockfile(project_root: Path | None = None) -> bool:
+    """Return True when the project has a Poetry lockfile."""
+    root = project_root or Path.cwd()
+    return (root / "poetry.lock").is_file()
+
+
+def _uses_poetry_lockfile(project_root: Path | None = None) -> bool:
+    """Return True when Poetry is the only available lock source."""
+    return _has_poetry_lockfile(project_root) and not _has_uv_lockfile(project_root)
+
+
+def _has_project_venv(project_root: Path | None = None) -> bool:
+    """Return True when the project already has a local uv environment."""
+    root = project_root or Path.cwd()
+    return (root / ".venv").is_dir()
+
+
+def _install_project_dependencies_if_needed() -> None:
+    """Prepare project dependencies without mutating existing lockfiles."""
+    project_root = Path.cwd()
+    if not (project_root / "pyproject.toml").is_file():
+        return
+
+    has_uv_lockfile = _has_uv_lockfile(project_root)
+    has_lockfile = has_uv_lockfile or _has_poetry_lockfile(project_root)
+    if has_lockfile and _has_project_venv(project_root):
+        return
+    if _uses_poetry_lockfile(project_root):
+        return
+
+    from crewai_cli.install_crew import install_crew
+
+    try:
+        if has_uv_lockfile:
+            click.echo("Syncing dependencies from lockfile...")
+            install_crew(["--frozen"], raise_on_error=True)
+        else:
+            click.echo("Installing dependencies...")
+            install_crew([], raise_on_error=True)
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(e.returncode) from e
+    except Exception as e:
+        raise SystemExit(1) from e
+
+
+def _find_local_crewai_source_dir() -> Path | None:
+    """Return the repo's CrewAI source dir when running from a source checkout."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "lib" / "crewai" / "src"
+        if (candidate / "crewai" / "project" / "json_loader.py").is_file():
+            return candidate
+    return None
+
+
+def _project_run_command(
+    runner_code: str, project_root: Path | None = None
+) -> list[str]:
+    """Return a runner command using the project environment."""
+    if _uses_poetry_lockfile(project_root):
+        return ["poetry", "run", "python", "-c", runner_code]
+    return ["uv", "run", "--no-sync", "python", "-c", runner_code]
+
+
+def _run_json_crew_in_project_env(
+    trained_agents_file: str | None = None,
+    crew_path: str | Path | None = None,
+    inputs: str | None = None,
+) -> Any:
+    """Run JSON crews from the project's uv-managed environment."""
+    # Validate --inputs up front so bad JSON fails before we spin up the uv env.
+    if inputs is not None:
+        with stops_run_as("invalid_inputs"):
+            parse_inputs_json(inputs)
+
+    if not (Path.cwd() / "pyproject.toml").is_file():
+        return _run_json_crew(
+            trained_agents_file=trained_agents_file,
+            crew_path=crew_path,
+            inputs=inputs,
+        )
+
+    with stops_run_as("install_failed"):
+        _install_project_dependencies_if_needed()
+
+    command = _project_run_command(_JSON_CREW_RUNNER_CODE)
+    env = build_env_with_all_tool_credentials()
+    env[_CREWAI_CLI_RUNNER_PACKAGE_DIR_ENV] = str(Path(__file__).resolve().parent)
+    if local_crewai_source_dir := _find_local_crewai_source_dir():
+        env[_CREWAI_RUNNER_SOURCE_DIR_ENV] = str(local_crewai_source_dir)
+    if trained_agents_file:
+        env[CREWAI_TRAINED_AGENTS_FILE_ENV] = trained_agents_file
+    if crew_path is not None:
+        env[_CREWAI_JSON_CREW_DEFINITION_ENV] = str(crew_path)
+    if inputs is not None:
+        env[_CREWAI_JSON_CREW_INPUTS_ENV] = inputs
+
+    try:
+        subprocess.run(  # noqa: S603
+            command,
+            capture_output=False,
+            text=True,
+            check=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(e.returncode) from e
+    except Exception as e:
+        record_run_stopped("launch_failed")
+        click.echo(f"An unexpected error occurred while running the JSON crew: {e}")
+        raise SystemExit(1) from e
+
+    return None
+
+
+DeployButtonEvent = Literal[
+    "deploy_login_prompted",
+    "deploy_stopped:login_still_required",
+    "deploy_stopped:login_abandoned",
+    "deploy_stopped:login_failed",
+    "deploy_stopped:login_timed_out",
+]
+
+
+def _record_deploy_button(event: DeployButtonEvent) -> None:
+    """Count what the run app's Deploy met before a deployment attempt.
+
+    `cli_usage:deploy` counts the press and `Create Crew Deployment` the
+    attempt; a press that never became an attempt said nothing about why.
+    """
+    _count_usage(f"cli_usage:{event}")
+
+
+def _count_usage(feature: str, attributes: dict[str, str] | None = None) -> None:
+    try:
+        from crewai_core.telemetry import Telemetry
+
+        telemetry = Telemetry()
+        telemetry.set_tracer()
+        if attributes is None:
+            telemetry.feature_usage_span(feature)
+            return
+        try:
+            telemetry.feature_usage_span(feature, attributes=attributes)
+        except TypeError:
+            # A JSON crew's runner imports the project's crewai-core, which
+            # takes no attributes before 1.15.23: count the use without them.
+            telemetry.feature_usage_span(feature)
+    except Exception:  # noqa: S110 - telemetry must never break a command
+        pass
+
+
+# The project type `crewai run` dispatched on; `unknown` when no readable
+# pyproject.toml said which.
+RunKind = Literal["crew", "json_crew", "flow", "declarative_flow", "agent", "unknown"]
+
+# Where `crewai run` stopped before the crew or flow kicked off; except
+# `script_failed`, a Python project's `uv run` script that exited non-zero,
+# which uv reports alike for an install, an import and a run that failed after
+# kickoff, and the run's own kickoff spans tell those apart; and
+# `missing_api_key`, a JSON crew stopped for a model's API key that is not set,
+# found as the crew loads or once kickoff calls the model.
+RunStopReason = Literal[
+    "no_project",
+    "invalid_project",
+    "api_key_prompt",
+    "unsupported_option",
+    "invalid_inputs",
+    "missing_inputs",
+    "install_failed",
+    "crewai_missing",
+    "load_failed",
+    "no_terminal",
+    "launch_failed",
+    "script_failed",
+    "missing_api_key",
+]
+
+# Set on a `crewai run` this command re-runs inside the project's environment,
+# which this command already counted.
+RUN_COUNTED_ENV = "CREWAI_RUN_COUNTED"
+# The flags and yes-values `crewai_core.telemetry.Telemetry` reads from the
+# process env.
+_TELEMETRY_OPT_OUT_ENV = (
+    "OTEL_SDK_DISABLED",
+    "CREWAI_DISABLE_TELEMETRY",
+    "CREWAI_DISABLE_TRACKING",
+)
+_TRUTHY_ENV = frozenset({"1", "on", "true", "yes"})
+
+
+def _project_env_disables_telemetry() -> bool:
+    """Whether the project's `.env` turns telemetry off, as the process env can.
+
+    The crew loads that `.env` (crewai/llm.py), so a project that opted out
+    there sends nothing from its runs; the command that starts them must not
+    either. Read, never loaded: loading it would change the run's environment.
+    """
+    env_file = Path.cwd() / ".env"
+    if not env_file.is_file():
+        return False
+
+    from dotenv import dotenv_values
+
+    values = dotenv_values(env_file)
+    return any(
+        (values.get(name) or "").strip().lower() in _TRUTHY_ENV
+        for name in _TELEMETRY_OPT_OUT_ENV
+    )
+
+
+def _count_run_usage(event: str, attributes: dict[str, str] | None = None) -> None:
+    try:
+        if _project_env_disables_telemetry():
+            return
+    except (OSError, ValueError):  # an unreadable .env: count nothing over guessing
+        return
+    _count_usage(f"cli_usage:{event}", attributes)
+
+
+# The top-level packages whose error classes a `load_failed` stop names: Python's
+# own, crewAI's, and those of the libraries crewAI loads a project with. Their
+# classes are the same in every project; a project's own can name it.
+_NAMED_ERROR_PACKAGES = frozenset(
+    {
+        "builtins",
+        "crewai",
+        "crewai_core",
+        "crewai_tools",
+        "pydantic",
+        # Where pydantic's ValidationError is defined.
+        "pydantic_core",
+        "json",
+        "yaml",
+        "importlib",
+        "click",
+        "litellm",
+        "openai",
+        "anthropic",
+        # Not `google`: it is a namespace package a project's own module can join.
+        "google.genai",
+        "google.api_core",
+        "google.auth",
+        "httpx",
+    }
+)
+
+
+def _carried_error(error: BaseException) -> BaseException | None:
+    """The error ERROR was raised for, when ERROR only carries one: SystemExit,
+    the JSON crew loader's JSONProjectError, an ImportError raised from
+    another error, or a pydantic ValidationError a validator's own error
+    raised."""
+    if isinstance(error, SystemExit):
+        return error.__cause__ or error.__context__
+    # crewAI raises any failure to build a native provider's model, a bad
+    # setting or a blank key, as an ImportError from it (crewai/llm.py). A
+    # provider SDK that is not installed is raised `from None`: it stays one.
+    if isinstance(error, ImportError):
+        return error.__cause__
+    # An error's class is defined in a module already loaded, so look these up
+    # there: counting a stop must never import crewAI (slow, and it loads a
+    # `.env`), nor need pydantic installed.
+    if sys.modules.get("crewai.project.json_loader") is not None:
+        from crewai.project.json_loader import JSONProjectError
+
+        if isinstance(error, JSONProjectError):
+            return error.__cause__
+    if sys.modules.get("pydantic_core") is not None:
+        from pydantic_core import ValidationError
+
+        if isinstance(error, ValidationError):
+            for detail in error.errors():
+                cause = detail.get("ctx", {}).get("error")
+                if isinstance(cause, BaseException):
+                    return cause
+    return None
+
+
+def _error_class(error: BaseException) -> str:
+    """The class of the error behind ERROR, by name when a loaded module of a
+    package in `_NAMED_ERROR_PACKAGES` defines it, else `other`; never its
+    message."""
+    seen: set[int] = set()
+    while id(error) not in seen:
+        seen.add(id(error))
+        carried = _carried_error(error)
+        if carried is None:
+            break
+        error = carried
+    error_type = type(error)
+    module = error_type.__module__
+    if not any(
+        module == package or module.startswith(f"{package}.")
+        for package in _NAMED_ERROR_PACKAGES
+    ):
+        return "other"
+    # `__module__` and `__qualname__` are only what the class says, and a
+    # project's class can say `openai`: name it only when that module really
+    # holds this class there. `vars`, not `getattr`, so a lazy module
+    # `__getattr__` (crewai's, pydantic's) imports nothing.
+    owner: object = sys.modules.get(error_type.__module__)
+    for name in error_type.__qualname__.split("."):
+        if not isinstance(owner, (ModuleType, type)):
+            return "other"
+        owner = vars(owner).get(name)
+    return error_type.__name__ if owner is error_type else "other"
+
+
+def record_run_started(kind: RunKind) -> None:
+    """Count a `crewai run` that started, by the kind of project it runs.
+
+    `Crew Created` and the flow spans only fire at kickoff, so a run that
+    stopped before then was indistinguishable from one never attempted.
+    """
+    if os.environ.get(RUN_COUNTED_ENV) is None:
+        _count_run_usage(f"run_started:{kind}")
+
+
+def record_run_stopped(
+    reason: RunStopReason, error: BaseException | None = None
+) -> None:
+    """Count a `crewai run` that stopped before kickoff, and where; or whose
+    project script failed (`script_failed`); or whose JSON crew stopped, as it
+    loaded or after kickoff, for an API key that is not set (`missing_api_key`).
+
+    The reason is a word from a closed list. A `load_failed` stop also carries
+    the class of ERROR, the error the project failed to load with, as
+    `error_class`: the class behind a SystemExit, a JSONProjectError, an
+    ImportError or a pydantic ValidationError, by name when Python, crewAI or
+    a library crewAI loads projects with defines it, else `other`. Never the
+    error's message, which can carry a path, a project name or the project's
+    own code.
+    """
+    attributes = None
+    if reason == "load_failed" and error is not None:
+        try:
+            attributes = {"error_class": _error_class(error)}
+        except Exception:
+            # Counting must never replace the error the run stopped with; a
+            # class that cannot be read is counted without one.
+            attributes = None
+    _count_run_usage(f"run_stopped:{reason}", attributes)
+
+
+@contextmanager
+def stops_run_as(reason: RunStopReason) -> Iterator[None]:
+    """Count the run as stopped for REASON when the block raises, then re-raise."""
+    try:
+        yield
+    except (Exception, SystemExit) as error:
+        record_run_stopped(reason, error)
+        raise
+
+
+def _run_kind(pyproject_data: dict[str, Any]) -> RunKind:
+    """The kind `run_crew` dispatches on, before it validates the definition."""
+    from crewai_core.project import get_crewai_project_config
+
+    config = get_crewai_project_config(pyproject_data)
+    project_type = config.get("type")
+    if project_type == "flow":
+        return "declarative_flow" if "definition" in config else "flow"
+    if project_type == "agent":
+        return "agent"
+    if project_type == "crew" and "definition" in config:
+        return "json_crew"
+    return "crew"
+
+
+# `crewai eval`'s token for the run it starts (`crew_run_tui._AWAITING_EVAL_ENV`,
+# `crewai_core.eval_handshake.AWAITING_ENV`; a test pins the three).
+EVAL_TOKEN_ENV = "CREWAI_EVAL_AWAITING_RUN"  # noqa: S105 - a variable name, not a secret
+
+
+def load_project_env(env_file: Path) -> None:
+    """The project's `.env` over this process's environment, with two
+    exceptions.
+
+    `crewai eval`'s token: the token this process was started with is kept,
+    and a `.env` never sets one. Otherwise a `.env` could unmark a run `crewai
+    eval` started, and its tracing would no longer apply the command's rules.
+
+    A key pasted at a prompt in this run is kept over a blank line, or one still
+    holding the `YOUR_API_KEY` placeholder: that line holds no key, and the
+    prompt named where the project sends requests before the key was pasted. A
+    key the process only inherited is replaced as any other value is: the
+    `.env` could also point the provider at another host, so a placeholder
+    sends nothing rather than the shell's key.
+    """
+    from dotenv import dotenv_values
+
+    kept = os.environ.get(EVAL_TOKEN_ENV)
+    pasted = set(filter(None, os.environ.get(PASTED_KEYS_ENV, "").split(",")))
+    # Read once: a `.env` a secrets manager serves through a pipe hands its
+    # content to one reader. This applies it as load_dotenv(override=True) would.
+    for name, value in dotenv_values(env_file).items():
+        # A bare name with no `=` sets nothing, as in load_dotenv, and only this
+        # process says which keys were pasted.
+        if value is None or name == PASTED_KEYS_ENV:
+            continue
+        if (
+            name in pasted
+            and value.strip() in ("", PLACEHOLDER_API_KEY)
+            and os.environ.get(name)
+        ):
+            continue
+        os.environ[name] = value
+    if kept is None:
+        os.environ.pop(EVAL_TOKEN_ENV, None)
+    else:
+        os.environ[EVAL_TOKEN_ENV] = kept
+
+
+def _chain_traced_rerun(run_args: dict[str, Any] | None = None) -> None:
+    """The run app's Evaluate, pressed on a run that was not traced: the run
+    happens again, traced, and that run is evaluated — `crewai eval`'s own
+    path, so the run app it opens shows the evaluation as it would there.
+
+    RUN_ARGS are `run_crew`'s arguments for the run the person watched (its
+    definition, inputs and trained agents), so the run graded is that one, not
+    the project's default."""
+    from crewai_cli.experimental.eval_crew import _machine_amp_origins, eval_crew
+
+    eval_crew(
+        run_again=True,
+        run_args={key: value for key, value in (run_args or {}).items() if value},
+        # This process loaded the project's `.env` for the run the person
+        # watched, so the `CREWAI_PLUS_URL` in it cannot be trusted with the
+        # saved login: the AMPs this machine is configured for, only.
+        trusted_amp_origins=_machine_amp_origins(),
+    )
+
+
+def _chain_deploy() -> None:
+    from rich.console import Console
+
+    console = Console()
+
+    def print_system_exit_failure(exc: SystemExit) -> None:
+        if isinstance(exc.code, int):
+            detail = f" with exit code {exc.code}"
+        elif exc.code:
+            detail = f": {exc.code}"
+        else:
+            detail = ""
+        console.print(f"\nDeploy failed{detail}\n", style="bold red")
+
+    try:
+        from crewai_cli.command import AuthenticationRequiredError
+        from crewai_cli.deploy.main import DeployCommand
+
+        console.print("\nStarting deployment…\n", style="bold #FF5A50")
+        DeployCommand().create_crew(confirm=True, skip_validate=True, source="tui")
+    except AuthenticationRequiredError:
+        from crewai_cli.authentication.main import AuthenticationCommand
+
+        _record_deploy_button("deploy_login_prompted")
+        console.print()
+        try:
+            AuthenticationCommand().login()
+        except KeyboardInterrupt:
+            _record_deploy_button("deploy_stopped:login_abandoned")
+            raise
+        except SystemExit:
+            _record_deploy_button("deploy_stopped:login_timed_out")
+            raise
+        except Exception:
+            _record_deploy_button("deploy_stopped:login_failed")
+            raise
+        try:
+            DeployCommand().create_crew(confirm=True, skip_validate=True, source="tui")
+        except AuthenticationRequiredError:
+            _record_deploy_button("deploy_stopped:login_still_required")
+            console.print(
+                "\nDeploy failed: authentication is still required.\n",
+                style="bold red",
+            )
+        except SystemExit as e:
+            print_system_exit_failure(e)
+        except Exception as e:
+            console.print(f"\nDeploy failed: {e}\n", style="bold red")
+    except SystemExit as e:
+        print_system_exit_failure(e)
+    except Exception as e:
+        console.print(f"\nDeploy failed: {e}\n", style="bold red")
+
+
+def _print_post_tui_summary(app: CrewRunApp) -> None:
+    """Print a summary to the terminal after the Textual TUI exits."""
+    import time
+
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.padding import Padding
+    from rich.panel import Panel
+    from rich.text import Text
+
+    console = Console()
+    elapsed = time.time() - app._start_time
+
+    out_tokens = app._output_tokens + app._live_out_tokens
+    token_parts = []
+    if app._input_tokens:
+        token_parts.append(f"↑{app._input_tokens:,}")
+    if out_tokens:
+        token_parts.append(f"↓{out_tokens:,}")
+    token_str = "  ".join(token_parts)
+    if token_str:
+        token_str += " tokens"
+
+    crewai_red = "#FF5A50"
+    crewai_teal = "#1F7982"
+
+    if app._status == "completed":
+        summary = Text()
+        summary.append(
+            f"  ✔ Completed {app._total_tasks} tasks",
+            style=f"bold {crewai_teal}",
+        )
+        summary.append(f" in {elapsed:.1f}s", style="dim")
+        if token_str:
+            summary.append(f"  {token_str}", style="dim")
+        console.print(
+            Panel(
+                summary,
+                title=f" {app._crew_name} ",
+                title_align="left",
+                border_style=crewai_teal,
+                padding=(0, 1),
+            )
+        )
+        if app._final_output:
+            console.print()
+            console.print(Text("  Final Result", style=f"bold {crewai_teal}"))
+            console.print()
+            console.print(Padding(Markdown(app._final_output), (0, 2)))
+    elif app._status == "failed":
+        content = Text()
+        content.append("  ✘ Failed", style=f"bold {crewai_red}")
+        content.append(f" after {elapsed:.1f}s\n", style="dim")
+        if app._error:
+            content.append(f"\n  {app._error}\n", style=crewai_red)
+        console.print(
+            Panel(
+                content,
+                title=f" {app._crew_name} ",
+                title_align="left",
+                border_style=crewai_red,
+                padding=(0, 1),
+            )
+        )
+
+    _print_evaluation_line(app, console, crewai_teal)
+
+
+def _print_evaluation_line(app: CrewRunApp, console: Any, teal: str) -> None:
+    """The evaluation's link, once the app that showed it has gone.
+
+    An evaluation started inside the app is read there; the terminal is what is
+    left afterwards, and a link that only ever existed on a screen that is now
+    closed is a link nobody can open again.
+    """
+    evaluation = getattr(app, "_evaluation", None) or {}
+    url = str(evaluation.get("url") or "")
+    if not url:
+        return
+
+    from rich.text import Text
+
+    state = str(evaluation.get("state"))
+    line = Text("\n  ")
+    if state == "done":
+        verdict = evaluation.get("verdict") or {}
+        line.append("Evaluated: ", style="dim")
+        line.append(
+            f"goal gate {str(verdict.get('gate') or '').upper()}  ", style="bold"
+        )
+    elif state == "failed":
+        line.append("Evaluation stopped — the report has what it got: ", style="dim")
+    else:
+        line.append("Evaluation still running at ", style="dim")
+    line.append(url, style=f"{teal} underline")
+    console.print(line)
+
+    wrote = evaluation.get("wrote_config")
+    if wrote:
+        note = Text("  ")
+        note.append(f"Wrote {wrote}", style="bold")
+        note.append(
+            " — say what good means for this crew there, and the next evaluation is graded on it.",
+            style="dim",
+        )
+        console.print(note)
+
+
+def run_crew(
+    trained_agents_file: str | None = None,
+    definition: str | None = None,
+    inputs: str | None = None,
+) -> None:
+    """Run the crew, flow, or standalone agent.
+
+    Before a crew or a Python flow starts, an API key its models need that is
+    not set is asked for at a terminal and saved to the project's ``.env``, or
+    else named with the line to add; the run starts either way.
+
+    Args:
+        trained_agents_file: Optional path to a trained-agents pickle produced
+            by ``crewai train -f``. When set, exported as
+            ``CREWAI_TRAINED_AGENTS_FILE`` so agents load suggestions from this
+            file instead of the default ``trained_agents_data.pkl``.
+        definition: Optional path to a declarative Flow definition.
+        inputs: Optional JSON object of runtime inputs for an agent, declarative
+            flow or declarative (JSON) crew. Agent projects require ``messages``.
+            Declarative inputs layer over defaults and prompt for missing values
+            interactively.
+    """
+    # --definition is a pure override: run that flow directly.
+    if definition is not None:
+        record_run_started("declarative_flow")
+        _run_explicit_declarative_flow(
+            definition=definition,
+            inputs=inputs,
+            trained_agents_file=trained_agents_file,
+        )
+        return
+
+    try:
+        pyproject_data = read_toml()
+    except (OSError, ValueError) as exc:
+        record_run_started("unknown")
+        record_run_stopped(
+            "no_project" if isinstance(exc, FileNotFoundError) else "invalid_project"
+        )
+        raise
+
+    # Backfills projects created before project_id existed. Only here, in a
+    # command the user explicitly invoked - never from the SDK during kickoff.
+    # Placed after the --definition early return so an explicit-flow run does
+    # not touch the cwd; get_or_create_project_id itself refuses to act unless
+    # [tool.crewai] is already present, so an unrelated project is never
+    # rewritten.
+    get_or_create_project_id()
+    # After the backfill: the first span caches the project id for the process.
+    kind = _run_kind(pyproject_data)
+    record_run_started(kind)
+
+    with stops_run_as("invalid_project"):
+        json_crew_definition = configured_project_json_crew(pyproject_data)
+    project_type = get_crewai_project_type(pyproject_data)
+    # A crewAI crew or Python flow only: `kind` is "crew" for any other
+    # project too. A re-run inside the project's environment was checked by
+    # the run that started it.
+    if (
+        project_type in ("crew", "flow")
+        and kind != "declarative_flow"
+        and os.environ.get(RUN_COUNTED_ENV) is None
+    ):
+        with stops_run_as("api_key_prompt"):
+            api_key = ask_for_missing_api_keys(Path.cwd(), json_crew_definition)
+        if api_key is not None:
+            _count_run_usage(f"run_api_key:{api_key}")
+    if json_crew_definition:
+        # Declarative (JSON) crews resolve inputs the same way flows do: --inputs
+        # layers over the crew's declared defaults, missing {placeholder}s are
+        # prompted for, and unknown keys are flagged. Forward the raw JSON.
+        _run_json_crew_in_project_env(
+            trained_agents_file=trained_agents_file,
+            crew_path=json_crew_definition,
+            inputs=inputs,
+        )
+        return
+
+    _warn_if_old_poetry_project(pyproject_data)
+
+    if project_type == "flow":
+        # No --definition: resolve the configured [tool.crewai] flow — the same
+        # resolution as a bare `crewai run` — and pass --inputs straight through.
+        _run_flow_project(
+            pyproject_data=pyproject_data,
+            trained_agents_file=trained_agents_file,
+            inputs=inputs,
+        )
+        return
+
+    if project_type == "agent":
+        if trained_agents_file is not None:
+            record_run_stopped("unsupported_option")
+            raise click.UsageError("--filename can only be used when running crews")
+        from crewai_cli.run_agent import run_agent_in_project_env
+
+        run_agent_in_project_env(inputs)
+        return
+
+    _reject_inputs_for_non_flow(inputs)
+    _run_classic_crew_project(
+        pyproject_data=pyproject_data,
+        trained_agents_file=trained_agents_file,
+    )
+
+
+def _reject_inputs_for_non_flow(inputs: str | None) -> None:
+    if inputs is not None:
+        record_run_stopped("unsupported_option")
+        raise click.UsageError(
+            "--inputs is only supported for declarative flows and crews"
+        )
+
+
+def _run_explicit_declarative_flow(
+    definition: str, inputs: str | None, trained_agents_file: str | None
+) -> None:
+    if trained_agents_file is not None:
+        raise click.UsageError("--filename can only be used when running crews")
+
+    from crewai_cli.run_declarative_flow import run_declarative_flow
+
+    run_declarative_flow(definition=definition, inputs=inputs)
+
+
+def _run_flow_project(
+    pyproject_data: dict[str, Any],
+    trained_agents_file: str | None,
+    inputs: str | None = None,
+) -> None:
+    if trained_agents_file is not None:
+        record_run_stopped("unsupported_option")
+        raise click.UsageError("--filename can only be used when running crews")
+
+    from crewai_cli.run_declarative_flow import (
+        configured_project_declarative_flow,
+        run_declarative_flow_in_project_env,
+    )
+
+    with stops_run_as("invalid_project"):
+        definition = configured_project_declarative_flow(pyproject_data)
+    if definition:
+        run_declarative_flow_in_project_env(definition=definition, inputs=inputs)
+        return
+
+    if inputs is not None:
+        from crewai_cli.kickoff_flow import _kickoff_flow_with_inputs
+        from crewai_cli.run_declarative_flow import (
+            _execute_declarative_flow_command,
+            _has_project_file,
+            is_declarative_flow_project_env,
+        )
+
+        # Validate before starting the project env, so bad JSON fails here.
+        with stops_run_as("invalid_inputs"):
+            provided = parse_inputs_json(inputs)
+        if is_declarative_flow_project_env() or not _has_project_file():
+            _kickoff_flow_with_inputs(provided or {})
+        else:
+            # Re-run inside the project env, as a declarative flow does, so the
+            # flow imports with the project's dependencies.
+            _execute_declarative_flow_command(
+                ["uv", "run", "crewai", "run", "--inputs", inputs], counted_run=True
+            )
+        return
+
+    from crewai_cli.kickoff_flow import (
+        _exit_without_chat_terminal,
+        _load_conversational_flow_from_kickoff_script,
+        _run_conversational_flow_tui,
+    )
+
+    flow = _load_conversational_flow_from_kickoff_script()
+    if flow is not None:
+        if not is_interactive():
+            _exit_without_chat_terminal()
+        _run_conversational_flow_tui(flow)
+        return
+
+    _execute_uv_script("kickoff", entity_type="flow")
+
+
+def _run_classic_crew_project(
+    pyproject_data: dict[str, Any], trained_agents_file: str | None
+) -> None:
+    _execute_uv_script(
+        "run_crew",
+        entity_type="crew",
+        trained_agents_file=trained_agents_file,
+    )
+
+
+def _warn_if_old_poetry_project(pyproject_data: dict[str, Any]) -> None:
+    crewai_version = get_crewai_version()
+    min_required_version = "0.71.0"
+
+    if pyproject_data.get("tool", {}).get("poetry") and (
+        version.parse(crewai_version) < version.parse(min_required_version)
+    ):
+        click.secho(
+            f"You are running an older version of crewAI ({crewai_version}) that uses poetry pyproject.toml. "
+            f"Please run `crewai update` to update your pyproject.toml to use uv.",
+            fg="red",
+        )
+
+
+def _execute_uv_script(
+    script_name: str,
+    *,
+    entity_type: str,
+    trained_agents_file: str | None = None,
+) -> None:
+    """Execute a project script through uv.
+
+    Args:
+        script_name: The project script to run.
+        entity_type: The user-facing entity being run.
+        trained_agents_file: Optional trained-agents pickle path forwarded to
+            the subprocess via the ``CREWAI_TRAINED_AGENTS_FILE`` env var.
+    """
+    command = ["uv", "run", script_name]
+
+    env = build_env_with_all_tool_credentials()
+    if trained_agents_file:
+        env[CREWAI_TRAINED_AGENTS_FILE_ENV] = trained_agents_file
+
+    try:
+        subprocess.run(command, capture_output=False, text=True, check=True, env=env)  # noqa: S603
+
+    except subprocess.CalledProcessError as e:
+        record_run_stopped("script_failed")
+        _handle_run_error(e, entity_type)
+
+    except Exception as e:
+        record_run_stopped("launch_failed")
+        click.echo(f"An unexpected error occurred: {e}", err=True)
+
+
+def _handle_run_error(error: subprocess.CalledProcessError, entity_type: str) -> None:
+    """
+    Handle subprocess errors with appropriate messaging.
+
+    Args:
+        error: The subprocess error that occurred
+        entity_type: The type of entity that was being run
+    """
+    click.echo(f"An error occurred while running the {entity_type}: {error}", err=True)
+
+    if error.output:
+        click.echo(error.output, err=True, nl=True)
+
+    pyproject_data = read_toml()
+    if pyproject_data.get("tool", {}).get("poetry"):
+        click.secho(
+            "It's possible that you are using an old version of crewAI that uses poetry, "
+            "please run `crewai update` to update your pyproject.toml to use uv.",
+            fg="yellow",
+        )

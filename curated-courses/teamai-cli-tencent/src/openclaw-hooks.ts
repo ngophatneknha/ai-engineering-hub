@@ -1,0 +1,746 @@
+/**
+ * OpenClaw / 龙虾-family hook injection (issue #1, 方案二 §四).
+ *
+ * NOTE: WorkBuddy was originally assumed to use this OpenClaw engine, but
+ * real-device verification (WorkBuddy 5.2.0) showed it embeds the CodeBuddy CLI
+ * engine and reads Claude-format hooks from ~/.workbuddy/settings.json instead.
+ * WorkBuddy is therefore wired via the settings-based path (see types.ts
+ * toolPaths.workbuddy.settings), NOT here. This adapter remains for the other
+ * claw variants (openclaw / qclaw / easyclaw / autoclaw) whose engine is still
+ * unconfirmed; it writes a `HOOK.md` (frontmatter with metadata.openclaw.events)
+ * plus a `handler.ts` under `<hooksDir>/<hookName>/`, both shelling out to the
+ * same `teamai hook-dispatch` entry point.
+ *
+ * The teamai hook is a workspace hook (`<workspace>/hooks/teamai-status-report`),
+ * which OpenClaw loads only once openclaw.json enables its entry
+ * (`hooks.internal.entries.teamai-status-report.enabled`). The workspace and
+ * state dir resolve the way OpenClaw resolves them: OPENCLAW_STATE_DIR,
+ * OPENCLAW_HOME, OPENCLAW_PROFILE, OPENCLAW_CONFIG_PATH, OPENCLAW_WORKSPACE_DIR.
+ *
+ * Events (OpenClaw calls the handler with `{ type, action, sessionKey, context }`):
+ *   command:new, command:reset, session:auto-reset, gateway:startup
+ *                      → session-start dispatch (report + sync);
+ *   message:received   → prompt-submit dispatch (sync only).
+ *
+ * The team's hooks need what an internal hook cannot do (block a tool call,
+ * add context to a prompt), so they run from a standalone plugin,
+ * `<state dir>/teamai/teamai-team-hooks.mjs`, which openclaw.json loads
+ * (`plugins.load.paths`) and enables (`plugins.entries.teamai-team-hooks`)
+ * while the team has hooks for OpenClaw.
+ */
+
+import path from 'node:path';
+import { z } from 'zod';
+import { writeIfChanged, pathExists, readFileSafe, writeJsonAtomic, remove, symlinkTarget } from './utils/fs.js';
+import { isPlainJson, parseJsonAs } from './utils/json.js';
+import { log } from './utils/logger.js';
+import { getUserHome } from './utils/home.js';
+import { OPENCLAW_TEAM_HOOK_PLUGIN, openclawTeamHookPluginIn, resolveOpenclawConfigPath, resolveOpenclawStateDir } from './openclaw-home.js';
+import { resolveCliEntry } from './builtin-hooks.js';
+import { openclawWorkspaceDir } from './locate.js';
+import { bridgedTeamHookEvents, bridgedTeamHookFile } from './bridged-team-hooks.js';
+
+/**
+ * Resolve the managed hooks directory for an OpenClaw-family tool:
+ * `<state dir>/hooks` for `openclaw`. Other claw variants
+ * (qclaw/easyclaw/autoclaw) are not confirmed to use OpenClaw's env vars and
+ * always fall back to ~/.<tool>/hooks.
+ */
+export function resolveOpenClawHooksDir(tool: string): string {
+  if (tool === 'openclaw') return path.join(resolveOpenclawStateDir(), 'hooks');
+
+  return path.join(getUserHome(), `.${tool}`, 'hooks');
+}
+
+/** Sub-directory name under <hooksDir> that holds the teamai OpenClaw hook. */
+export const OPENCLAW_HOOK_DIR = 'teamai-status-report';
+
+/** Marker so we can recognize (and cleanly remove) our own hook. */
+const TEAMAI_MARKER = '[teamai]';
+
+/**
+ * The key OpenClaw reads this hook's settings under
+ * (`hooks.internal.entries.<hookKey>`). Same as the directory name, so
+ * `openclaw hooks enable teamai-status-report` finds it by either.
+ */
+export const OPENCLAW_HOOK_KEY = OPENCLAW_HOOK_DIR;
+
+/**
+ * OpenClaw event key (`${type}:${action}`) → teamai dispatch event. Only keys
+ * OpenClaw emits (docs/automation/hooks/event-types.md). `command:stop` only
+ * observes a cancel, so it is not a stop.
+ */
+const EVENT_MAP = {
+  'command:new': 'session-start',
+  'command:reset': 'session-start',
+  'session:auto-reset': 'session-start',
+  'gateway:startup': 'session-start',
+  'message:received': 'prompt-submit',
+} satisfies Record<string, string>;
+
+function buildHookMd(tool: string): string {
+  const events = Object.keys(EVENT_MAP);
+  const metadata = JSON.stringify({ openclaw: { events, hookKey: OPENCLAW_HOOK_KEY } });
+
+  return [
+    '---',
+    // A bare `[teamai] ...` value is a YAML flow sequence followed by a
+    // scalar: a parse error, and OpenClaw then treats the metadata as invalid.
+    `name: ${OPENCLAW_HOOK_KEY}`,
+    `description: ${JSON.stringify(`${TEAMAI_MARKER} Reports agent status to the team backend and syncs team resources.`)}`,
+    `metadata:`,
+    `  ${metadata}`,
+    `handler: ./handler.ts`,
+    '---',
+    '',
+    `${TEAMAI_MARKER} Reports agent status to the team backend (report/sync/ack) for tool \`${tool}\`.`,
+    'Managed by teamai — do not edit by hand.',
+    '',
+  ].join('\n');
+}
+
+function buildHandlerTs(tool: string, entry: string): string {
+  // OpenClaw calls the default export with the event itself
+  // ({ type, action, sessionKey, context, ... }). Map `${type}:${action}` to a
+  // teamai dispatch event and shell out, passing the event's workspace as the
+  // hook cwd so hook-dispatch resolves the scope from it. Events that carry no
+  // workspaceDir (message:received) use the workspace this hook is installed
+  // in: <workspace>/hooks/teamai-status-report/handler.ts. Failures are
+  // swallowed so the agent is never blocked; the child is not awaited.
+  const mapLiteral = JSON.stringify(EVENT_MAP);
+
+  return `// ${TEAMAI_MARKER} status-report handler — generated by teamai, do not edit.
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const EVENT_MAP: Record<string, string> = ${mapLiteral};
+const TOOL = ${JSON.stringify(tool)};
+const NODE = ${JSON.stringify(process.execPath)};
+const ENTRY = ${JSON.stringify(entry)};
+const HOOK_WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+type HookEvent = { type?: unknown; action?: unknown; sessionKey?: unknown; context?: { workspaceDir?: unknown } | null };
+
+export default async function handler(event?: HookEvent): Promise<void> {
+  if (!event || typeof event.type !== 'string' || typeof event.action !== 'string') return;
+  const key = event.type + ':' + event.action;
+  const dispatchEvent = Object.hasOwn(EVENT_MAP, key) ? EVENT_MAP[key] : undefined;
+  if (!dispatchEvent) return;
+  const workspaceDir = event.context?.workspaceDir;
+  const payload: Record<string, string> = {
+    cwd: typeof workspaceDir === 'string' && workspaceDir ? workspaceDir : HOOK_WORKSPACE,
+  };
+  if (typeof event.sessionKey === 'string' && event.sessionKey) payload.session_id = event.sessionKey;
+  try {
+    const child = spawn(NODE, [ENTRY, 'hook-dispatch', dispatchEvent, '--tool', TOOL], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      windowsHide: true,
+    });
+    child.on('error', () => {});
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(JSON.stringify(payload));
+  } catch {
+    // never block the agent
+  }
+}
+`;
+}
+
+/**
+ * Inject (or refresh) the teamai OpenClaw hook.
+ *
+ * Writes into the resolved OpenClaw workspace directory (the same location
+ * skills sync to and the engine reads from), NOT the HOME-relative
+ * `~/.<tool>/hooks` — writing there left the hook where the engine never
+ * looks, so status reporting silently stopped. Idempotent — writes and reports
+ * the two files only when their content changes. Skips (no-op) when the
+ * workspace dir cannot be resolved.
+ *
+ * @param tool claw variant (openclaw/qclaw/easyclaw/autoclaw)
+ */
+export async function injectOpenClawHooks(tool = 'openclaw'): Promise<void> {
+  const entry = resolveCliEntry();
+
+  if (!entry) {
+    log.warn('OpenClaw: cannot resolve the teamai CLI entry; run `teamai hooks inject` from the installed CLI.');
+
+    return;
+  }
+
+  const wsDir = await openclawWorkspaceDir();
+
+  if (!wsDir) {
+    log.debug(`openclaw: skip hook injection for ${tool} — workspace dir not found`);
+
+    return;
+  }
+
+  const dir = path.join(wsDir, 'hooks', OPENCLAW_HOOK_DIR);
+  const hookMdChanged = await writeIfChanged(path.join(dir, 'HOOK.md'), buildHookMd(tool));
+  const handlerChanged = await writeIfChanged(path.join(dir, 'handler.ts'), buildHandlerTs(tool, entry));
+
+  if (hookMdChanged || handlerChanged) {
+    log.success(`Injected teamai OpenClaw hook into ${dir}`);
+  } else {
+    log.debug(`teamai OpenClaw hook already up-to-date in ${dir}`);
+  }
+
+  // openclaw-only: other claw variants are not known to use this config.
+  if (tool === 'openclaw') {
+    await enableOpenClawHookEntry(OPENCLAW_HOOK_KEY);
+    await reconcileOpenClawTeamHooks(entry, wsDir);
+  }
+}
+
+/** Reconcile only the team hooks plugin, leaving teamai's own OpenClaw hook as it is. */
+export async function refreshOpenClawTeamHooks(): Promise<void> {
+  const entry = resolveCliEntry();
+
+  if (!entry) {
+    log.warn('OpenClaw: cannot resolve the teamai CLI entry; run `teamai hooks inject` from the installed CLI.');
+
+    return;
+  }
+
+  const wsDir = await openclawWorkspaceDir();
+
+  if (wsDir) await reconcileOpenClawTeamHooks(entry, wsDir);
+}
+
+/** The entry teamai writes under `plugins.entries`: conversation access lets the plugin read the prompt. */
+const TEAM_HOOK_PLUGIN_ENTRY = { enabled: true, hooks: { allowConversationAccess: true } };
+
+/** OpenClaw's longest handler timeout; past it a before_tool_call fails closed. */
+const OPENCLAW_MAX_HANDLER_MS = 600000;
+
+function buildTeamHookPluginSource(entry: string, workspace: string): string {
+  return `// ${TEAMAI_MARKER} team hooks plugin — generated by teamai, do not edit by hand.
+//
+// Runs the team's hooks (hooks/hooks.yaml) through
+// \`teamai hook-dispatch <Event> --tool openclaw --team-hooks\`, on the events
+// the team has hooks on: a PreToolUse hook can block a tool call, SessionStart
+// (on a session's first prompt) and UserPromptSubmit hooks add context to the
+// prompt, PostToolUse and Stop hooks observe. Never throws: OpenClaw blocks a
+// tool call whose before_tool_call handler fails.
+
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+
+const NODE = ${JSON.stringify(process.execPath)};
+const ENTRY = ${JSON.stringify(entry)};
+const TEAM_HOOKS_FILE = ${JSON.stringify(bridgedTeamHookFile('openclaw'))};
+/** Where a session runs when OpenClaw does not say: the agent workspace. */
+const WORKSPACE = ${JSON.stringify(workspace)};
+const HANDLER_TIMEOUT_MS = ${OPENCLAW_MAX_HANDLER_MS};
+/** Ends the run before OpenClaw gives up on the handler. */
+const TEAM_HOOKS_TIMEOUT_MS = HANDLER_TIMEOUT_MS - 10000;
+
+/** A tool call's context has no workspace, so each session's comes from its prompt. */
+const workspaces = new Map();
+/** Sessions whose SessionStart hooks ran. */
+const started = new Set();
+
+const sessionOf = (ctx) => ctx.sessionId || ctx.sessionKey;
+
+// {block} for a PreToolUse hook that refuses, {context} for what a
+// SessionStart or UserPromptSubmit hook adds, else undefined. What a hook
+// wrote on stderr goes to OpenClaw's console.
+const teamHooks = (event, ctx, payload) => new Promise((resolve) => {
+  try {
+    const hooks = JSON.parse(fs.readFileSync(TEAM_HOOKS_FILE, "utf8")).hooks;
+    if (!hooks || !Array.isArray(hooks[event]) || hooks[event].length === 0) return resolve(undefined);
+    const session = sessionOf(ctx);
+    const cwd = ctx.workspaceDir || workspaces.get(session) || WORKSPACE;
+    const child = spawn(NODE, [ENTRY, "hook-dispatch", event, "--tool", "openclaw", "--team-hooks"], {
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      shell: false,
+    });
+    let out = "";
+    let err = "";
+    const finish = () => {
+      clearTimeout(timer);
+      if (err.trim()) console.error(err.trimEnd());
+      err = "";
+      try {
+        resolve(out.trim() ? JSON.parse(out) : undefined);
+      } catch {
+        resolve(undefined);
+      }
+    };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      out = "";
+      finish();
+    }, TEAM_HOOKS_TIMEOUT_MS);
+    child.stdout?.on("data", (chunk) => { out += chunk; });
+    child.stderr?.on("data", (chunk) => { err += chunk; });
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(JSON.stringify({ cwd, ...(session ? { session_id: session } : {}), ...(payload || {}) }));
+    child.once("close", finish);
+    child.once("error", () => { out = ""; finish(); });
+  } catch {
+    resolve(undefined);
+  }
+});
+
+export default {
+  id: ${JSON.stringify(OPENCLAW_TEAM_HOOK_PLUGIN)},
+  name: "teamai team hooks",
+  description: "Runs the team's hooks from hooks/hooks.yaml.",
+  register(api) {
+    api.on("before_prompt_build", async (event, ctx) => {
+      const session = sessionOf(ctx);
+      if (ctx.workspaceDir) workspaces.set(session, ctx.workspaceDir);
+      const first = !started.has(session);
+      started.add(session);
+      const start = first ? await teamHooks("SessionStart", ctx) : undefined;
+      // currentUserMessage is the member's request; prompt may hold the history OpenClaw rebuilt.
+      const prompt = await teamHooks("UserPromptSubmit", ctx, { prompt: event.currentUserMessage ?? event.prompt });
+      const added = [start?.context, prompt?.context].filter((part) => typeof part === "string" && part);
+      return added.length ? { prependContext: added.join("\\n\\n") } : undefined;
+    }, { timeoutMs: HANDLER_TIMEOUT_MS });
+
+    api.on("before_tool_call", async (event, ctx) => {
+      const decision = await teamHooks("PreToolUse", ctx, { tool_name: event.toolName, tool_input: event.params });
+      return decision && typeof decision.block === "string" ? { block: true, blockReason: decision.block } : undefined;
+    }, { timeoutMs: HANDLER_TIMEOUT_MS });
+
+    api.on("after_tool_call", async (event, ctx) => {
+      await teamHooks("PostToolUse", ctx, { tool_name: event.toolName, tool_input: event.params, tool_response: event.error ?? event.result });
+    });
+
+    api.on("agent_end", async (_event, ctx) => {
+      await teamHooks("Stop", ctx);
+    });
+  },
+};
+`;
+}
+
+/**
+ * Install the team-hook plugin and load it from openclaw.json while the team
+ * has hooks for OpenClaw (the bridged file), and take both out otherwise.
+ */
+async function reconcileOpenClawTeamHooks(entry: string, wsDir: string): Promise<void> {
+  if ((await bridgedTeamHookEvents('openclaw')).size === 0) {
+    await removeOpenClawTeamHooks();
+
+    return;
+  }
+
+  const file = openclawTeamHookPluginIn(resolveOpenclawStateDir());
+
+  if (await writeIfChanged(file, buildTeamHookPluginSource(entry, wsDir))) log.success(`Installed the teamai OpenClaw team hooks plugin at ${file}`);
+  await updateOpenClawPluginConfig(file, 'load');
+}
+
+/** Remove the team-hook plugin and its openclaw.json entries. */
+export async function removeOpenClawTeamHooks(): Promise<void> {
+  const file = openclawTeamHookPluginIn(resolveOpenclawStateDir());
+  await updateOpenClawPluginConfig(file, 'unload');
+
+  if (await pathExists(file)) {
+    await remove(path.dirname(file));
+    log.success(`Removed the teamai OpenClaw team hooks plugin from ${file}`);
+  }
+}
+
+/** A JSON object of openclaw.json. teamai reads it in place and writes it back key for key. */
+const ConfigObjectSchema = z.record(z.string(), z.unknown());
+
+type ConfigObject = z.infer<typeof ConfigObjectSchema>;
+
+function isConfigObject(value: unknown): value is ConfigObject {
+  return ConfigObjectSchema.safeParse(value).success;
+}
+
+/**
+ * openclaw.json as OpenClaw reads it (`json5`). teamai decides from a `json5`
+ * read too, but does not write it back: that would drop the member's comments.
+ */
+type OpenclawConfigRead =
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'invalid'; readonly error: string }
+  | { readonly kind: 'json'; readonly value: ConfigObject }
+  | { readonly kind: 'json5'; readonly value: ConfigObject };
+
+/** Why teamai leaves openclaw.json as it is: it does not parse, or a rewrite would drop its comments. */
+type LeftAsWritten = Extract<OpenclawConfigRead, { kind: 'invalid' | 'json5' }>;
+
+async function readOpenclawConfigFile(cfgPath: string): Promise<OpenclawConfigRead> {
+  const raw = await readFileSafe(cfgPath);
+
+  if (raw === null) return { kind: 'missing' };
+
+  try {
+    const value = parseJsonAs(raw, 'json5');
+
+    if (!isConfigObject(value)) return { kind: 'invalid', error: 'not a JSON object' };
+
+    return isPlainJson(raw) ? { kind: 'json', value } : { kind: 'json5', value };
+  } catch (e) {
+    return { kind: 'invalid', error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** A list of openclaw.json. */
+const ConfigListSchema = z.array(z.unknown());
+
+/** A directory OpenClaw searches: a name that is not blank. */
+const ExtraDirSchema = z.string().trim().min(1);
+
+export function pluginsOf(config: ConfigObject): ConfigObject {
+  return isConfigObject(config.plugins) ? config.plugins : {};
+}
+
+/** The object `object` holds under `key`, as written, or undefined when it holds none. */
+function childObject(object: ConfigObject | undefined, key: string): ConfigObject | undefined {
+  const child = object?.[key];
+
+  return isConfigObject(child) ? child : undefined;
+}
+
+/** Why the plugin does not load under this config and the fix, or null when it loads once listed and enabled. */
+export function teamHookPluginBlocker(plugins: ConfigObject): string | null {
+  // OpenClaw trims and lowercases the ids these lists hold.
+  const listed = (key: 'allow' | 'deny'): boolean => (ConfigListSchema.safeParse(plugins[key]).data ?? [])
+    .some((id) => z.string().safeParse(id).data?.trim().toLowerCase() === OPENCLAW_TEAM_HOOK_PLUGIN);
+
+  if (plugins.enabled === false) return 'plugins are switched off (plugins.enabled: false); turn them on';
+
+  if (listed('deny')) return `plugins.deny lists ${OPENCLAW_TEAM_HOOK_PLUGIN}; take it out`;
+  const allow = ConfigListSchema.safeParse(plugins.allow).data;
+
+  if (allow && allow.length > 0 && !listed('allow')) return `plugins.allow does not list ${OPENCLAW_TEAM_HOOK_PLUGIN}; add it`;
+  const entry = childObject(childObject(plugins, 'entries'), OPENCLAW_TEAM_HOOK_PLUGIN);
+
+  if (entry?.enabled === false) return `plugins.entries.${OPENCLAW_TEAM_HOOK_PLUGIN}.enabled is false; set it to true`;
+
+  return null;
+}
+
+/** `config` with the plugin's load path and entry added (`load`) or taken out (`unload`), dropping parents left empty. */
+function withTeamHookPlugin(config: ConfigObject, file: string, action: 'load' | 'unload'): ConfigObject {
+  const plugins = pluginsOf(config);
+  const pluginsLoad = childObject(plugins, 'load');
+  const paths = ConfigListSchema.safeParse(pluginsLoad?.paths).data?.filter((p) => p !== file) ?? [];
+  const entries = childObject(plugins, 'entries') ?? {};
+  const ownEntry = JSON.stringify(entries[OPENCLAW_TEAM_HOOK_PLUGIN]) === JSON.stringify(TEAM_HOOK_PLUGIN_ENTRY);
+  const nextPaths = action === 'load' ? [...paths, file] : paths;
+
+  const nextEntries = action === 'load'
+    ? { ...entries, [OPENCLAW_TEAM_HOOK_PLUGIN]: TEAM_HOOK_PLUGIN_ENTRY }
+    : ownEntry ? withoutKey(entries, OPENCLAW_TEAM_HOOK_PLUGIN) ?? {} : entries;
+
+  const load = { ...pluginsLoad, paths: nextPaths };
+  const nextLoad = nextPaths.length > 0 ? load : withoutKey(load, 'paths');
+  const next: ConfigObject = { ...plugins, load: nextLoad, entries: nextEntries };
+
+  if (!nextLoad) delete next.load;
+
+  if (Object.keys(nextEntries).length === 0) delete next.entries;
+
+  return Object.keys(next).length > 0 ? { ...config, plugins: next } : withoutKey(config, 'plugins') ?? {};
+}
+
+/** What pull says when it leaves openclaw.json as written instead of loading or unloading the team hooks plugin. */
+function pluginConfigLeftAsWritten(read: LeftAsWritten, cfgPath: string, file: string, action: 'load' | 'unload'): string {
+  switch (read.kind) {
+    case 'invalid':
+      return action === 'load'
+        ? `OpenClaw: ${cfgPath} does not parse as JSON or JSON5 (${read.error}), so teamai left it as it is. The team's hooks do not run until you add ${file} to plugins.load.paths.`
+        : `OpenClaw: ${cfgPath} does not parse as JSON or JSON5 (${read.error}), so teamai left it as it is. Its plugins.load.paths may still list ${file}, the team hooks plugin; remove it by hand.`;
+    case 'json5':
+      return action === 'load'
+        ? `OpenClaw: ${cfgPath} has comments or other JSON5 syntax, which a rewrite would drop, so teamai left it as it is. The team's hooks do not run until you add ${file} to plugins.load.paths.`
+        : `OpenClaw: ${cfgPath} has comments or other JSON5 syntax, which a rewrite would drop, so teamai left it as it is. Its plugins.load.paths still lists ${file}, the team hooks plugin; remove it by hand.`;
+    default: {
+      const unhandled: never = read;
+
+      return unhandled;
+    }
+  }
+}
+
+/** What pull says when it leaves openclaw.json as written instead of enabling teamai's hook entry. */
+function hookEntryLeftAsWritten(read: LeftAsWritten, cfgPath: string, hookKey: string): string {
+  switch (read.kind) {
+    case 'invalid':
+      return `OpenClaw: ${cfgPath} does not parse as JSON or JSON5 (${read.error}), so teamai left it as it is. teamai's hook ${hookKey} does not run until you run \`openclaw hooks enable ${hookKey}\`.`;
+    case 'json5':
+      return `OpenClaw: ${cfgPath} has comments or other JSON5 syntax, which a rewrite would drop, so teamai left it as it is. teamai's hook ${hookKey} does not run until you run \`openclaw hooks enable ${hookKey}\`.`;
+    default: {
+      const unhandled: never = read;
+
+      return unhandled;
+    }
+  }
+}
+
+/** What removal says when it leaves teamai's hook entry in openclaw.json. */
+function hookEntryKeptMessage(read: LeftAsWritten, cfgPath: string, hookKey: string): string {
+  switch (read.kind) {
+    case 'invalid':
+      return `OpenClaw: ${cfgPath} does not parse as JSON or JSON5 (${read.error}), so teamai left it as it is. It may still enable teamai's hook ${hookKey} (hooks.internal.entries.${hookKey}); remove that entry by hand or run \`openclaw hooks disable ${hookKey}\`.`;
+    case 'json5':
+      return `OpenClaw: ${cfgPath} has comments or other JSON5 syntax, which a rewrite would drop, so teamai left it as it is. It still enables teamai's hook ${hookKey} (hooks.internal.entries.${hookKey}); remove that entry by hand or run \`openclaw hooks disable ${hookKey}\`.`;
+    default: {
+      const unhandled: never = read;
+
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * Load (`load`) or unload the team-hook plugin in openclaw.json. When the
+ * config keeps the plugin from loading (plugins off, denied, left out of an
+ * allowlist, or its entry disabled), teamai leaves that choice alone and says
+ * so. No-op when the config's directory does not exist.
+ */
+async function updateOpenClawPluginConfig(file: string, action: 'load' | 'unload'): Promise<void> {
+  const cfgPath = resolveOpenclawConfigPath();
+
+  if (!await pathExists(path.dirname(cfgPath))) return;
+  const read = await readOpenclawConfigFile(cfgPath);
+
+  if (read.kind === 'missing' && action === 'unload') return;
+
+  if (read.kind === 'invalid') {
+    log.warn(pluginConfigLeftAsWritten(read, cfgPath, file, action));
+
+    return;
+  }
+
+  const config = read.kind === 'missing' ? {} : read.value;
+  const plugins = pluginsOf(config);
+  const blocker = action === 'load' ? teamHookPluginBlocker(plugins) : null;
+
+  if (blocker) {
+    log.warn(`OpenClaw does not load teamai's team hooks plugin, so the team's hooks do not run in OpenClaw: in ${cfgPath}, ${blocker}. teamai leaves that setting to you.`);
+
+    return;
+  }
+
+  const next = withTeamHookPlugin(config, file, action);
+
+  if (JSON.stringify(next) === JSON.stringify(config)) return;
+
+  if (read.kind === 'json5') {
+    log.warn(pluginConfigLeftAsWritten(read, cfgPath, file, action));
+
+    return;
+  }
+
+  await writeJsonAtomic(await symlinkTarget(cfgPath), next);
+  log.success(action === 'load'
+    ? `Loaded the teamai OpenClaw team hooks plugin in ${cfgPath}`
+    : `Unloaded the teamai OpenClaw team hooks plugin in ${cfgPath}`);
+}
+
+/** `hooks.internal` of openclaw.json, as written. */
+function internalHooksOf(cfg: ConfigObject): ConfigObject {
+  return childObject(childObject(cfg, 'hooks'), 'internal') ?? {};
+}
+
+/**
+ * True when OpenClaw would load every hook it discovers with these entries:
+ * master flag on, no named entry, no extra dir (src/hooks/configured.ts).
+ */
+function isOpenEndedDiscovery(internal: ConfigObject, entries: ConfigObject): boolean {
+  const extraDirs = ConfigListSchema.safeParse(childObject(internal, 'load')?.extraDirs).data;
+  const hasExtraDirs = extraDirs !== undefined && extraDirs.some((d) => ExtraDirSchema.safeParse(d).success);
+
+  return internal.enabled === true && !Object.keys(entries).some((name) => name.trim()) && !hasExtraDirs;
+}
+
+/** True when this openclaw.json loads teamai's workspace hook: internal hooks on and its entry enabled. */
+export function openclawHookEnabledIn(config: ConfigObject): boolean {
+  const internal = internalHooksOf(config);
+
+  return internal.enabled !== false && childObject(childObject(internal, 'entries'), OPENCLAW_HOOK_KEY)?.enabled === true;
+}
+
+/**
+ * Enable one of teamai's hooks in OpenClaw's config, by its hook key.
+ *
+ * OpenClaw loads a workspace hook only when
+ * `hooks.internal.entries.<hookKey>.enabled` is true, and once any named entry
+ * exists only the named hooks load (docs/automation/hooks/configuration.md).
+ * This writes the entry, deep-merged so every other field stays, and without
+ * the master flag, so removing the entry restores the config.
+ *
+ * Adding the first named entry turns open-ended discovery into an allowlist
+ * of one, which would silently stop every other hook, so there the config is
+ * left alone and a warning names the command that enables it. The same warning is
+ * given when the user switched internal hooks or this entry off, or the config
+ * does not parse or is JSON5. No-op when the config's directory does not exist.
+ */
+async function enableOpenClawHookEntry(hookKey: string): Promise<void> {
+  const cfgPath = resolveOpenclawConfigPath();
+
+  if (!await pathExists(path.dirname(cfgPath))) {
+    log.debug(`openclaw: skip enabling ${hookKey} — ${path.dirname(cfgPath)} does not exist`);
+
+    return;
+  }
+
+  const enableCmd = `\`openclaw hooks enable ${hookKey}\``;
+  const read = await readOpenclawConfigFile(cfgPath);
+
+  if (read.kind === 'invalid') {
+    log.warn(hookEntryLeftAsWritten(read, cfgPath, hookKey));
+
+    return;
+  }
+
+  const config = read.kind === 'missing' ? {} : read.value;
+  const internal = internalHooksOf(config);
+  const entries = childObject(internal, 'entries') ?? {};
+  const entry = childObject(entries, hookKey);
+
+  if (internal.enabled === false) {
+    log.warn(`OpenClaw internal hooks are switched off (hooks.internal.enabled: false in ${cfgPath}), `
+      + `so teamai's hook ${hookKey} does not run. teamai leaves that setting to you: run ${enableCmd} to turn them on.`);
+
+    return;
+  }
+
+  if (entry?.enabled === true) {
+    log.debug(`openclaw: ${hookKey} already enabled`);
+
+    return;
+  }
+
+  if (entry?.enabled === false) {
+    log.warn(`teamai's OpenClaw hook ${hookKey} is disabled in ${cfgPath} (hooks.internal.entries.${hookKey}), `
+      + `so it does not run. Run ${enableCmd} to turn it back on.`);
+
+    return;
+  }
+
+  if (isOpenEndedDiscovery(internal, entries)) {
+    log.warn(`OpenClaw loads every hook it discovers (${cfgPath} turns internal hooks on with no named entries). `
+      + `Enabling teamai's hook adds the first named entry, which makes that an allowlist and stops the other hooks, `
+      + `so teamai left the config unchanged and its hook does not run. Run ${enableCmd}, `
+      + `then \`openclaw hooks enable <name>\` for each other hook you use.`);
+
+    return;
+  }
+
+  if (read.kind === 'json5') {
+    log.warn(hookEntryLeftAsWritten(read, cfgPath, hookKey));
+
+    return;
+  }
+
+  const hooks = childObject(config, 'hooks') ?? {};
+  config.hooks = { ...hooks, internal: { ...internal, entries: { ...entries, [hookKey]: { ...entry, enabled: true } } } };
+
+  try {
+    await writeJsonAtomic(await symlinkTarget(cfgPath), config);
+    log.success(`Enabled the teamai OpenClaw hook ${hookKey} in ${cfgPath}`);
+  } catch (e) {
+    log.warn(`OpenClaw: could not enable the teamai hook ${hookKey} in ${cfgPath}: ${e instanceof Error ? e.message : String(e)}. Run ${enableCmd}.`);
+  }
+}
+
+/** `obj` without `key`; `undefined` when nothing is left. */
+function withoutKey(obj: ConfigObject, key: string): ConfigObject | undefined {
+  const { [key]: _dropped, ...rest } = obj;
+
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+/**
+ * Take one of teamai's entries back out of openclaw.json (uninstall,
+ * `hooks remove`, a removed agent hook), dropping parents it leaves empty.
+ *
+ * Kept when removing it would turn the allowlist the entry made back into
+ * open-ended discovery (master flag on, no other named entry).
+ */
+export async function removeOpenClawHookEntry(hookKey: string = OPENCLAW_HOOK_KEY): Promise<void> {
+  const cfgPath = resolveOpenclawConfigPath();
+  const read = await readOpenclawConfigFile(cfgPath);
+
+  if (read.kind === 'missing') return;
+
+  if (read.kind === 'invalid') {
+    log.warn(hookEntryKeptMessage(read, cfgPath, hookKey));
+
+    return;
+  }
+
+  const cfg = read.value;
+  const internal = internalHooksOf(cfg);
+  const entries = childObject(internal, 'entries');
+
+  if (!entries || !Object.hasOwn(entries, hookKey)) return;
+  const rest = withoutKey(entries, hookKey);
+
+  if (isOpenEndedDiscovery(internal, rest ?? {})) {
+    log.debug(`openclaw: keeping ${hookKey} in ${cfgPath}; removing it would load every discovered hook`);
+
+    return;
+  }
+
+  if (read.kind === 'json5') {
+    log.warn(hookEntryKeptMessage(read, cfgPath, hookKey));
+
+    return;
+  }
+
+  const nextInternal = rest ? { ...internal, entries: rest } : withoutKey(internal, 'entries');
+  const hooks = childObject(cfg, 'hooks') ?? {};
+  const nextHooks = nextInternal ? { ...hooks, internal: nextInternal } : withoutKey(hooks, 'internal');
+  const next = nextHooks ? { ...cfg, hooks: nextHooks } : withoutKey(cfg, 'hooks') ?? {};
+  await writeJsonAtomic(await symlinkTarget(cfgPath), next);
+  log.success(`Removed the teamai OpenClaw hook entry ${hookKey} from ${cfgPath}`);
+}
+
+/** Remove the teamai OpenClaw hook from `<hooksDir>` if present. */
+export async function removeOpenClawHooks(hooksDir: string): Promise<void> {
+  const dir = path.join(hooksDir, OPENCLAW_HOOK_DIR);
+
+  if (await pathExists(dir)) {
+    await remove(dir);
+    log.success(`Removed teamai OpenClaw hook from ${dir}`);
+  }
+
+  // Also check the state dir (OPENCLAW_STATE_DIR or the profile's) in case the hook was installed there
+  const altDir = path.join(resolveOpenclawStateDir(), 'hooks', OPENCLAW_HOOK_DIR);
+
+  if (altDir !== dir && await pathExists(altDir)) {
+    await remove(altDir);
+    log.success(`Removed teamai OpenClaw hook from ${altDir}`);
+  }
+}
+
+/** The key a server-pushed agent hook is selected and configured under in openclaw.json. */
+function agentHookKey(slug: string): string {
+  return `teamai-agent-${slug}`;
+}
+
+/**
+ * Remove the agent hook directory an earlier release installed for an
+ * OpenClaw-family tool; agent hooks now run from the team-hook plugin.
+ */
+export async function removeOpenClawAgentHook(opts: {
+  slug: string;
+  tool?: string;
+}): Promise<void> {
+  const tool = opts.tool ?? 'openclaw';
+  const hooksDir = resolveOpenClawHooksDir(tool);
+  const dir = path.join(hooksDir, opts.slug);
+
+  if (await pathExists(dir)) {
+    await remove(dir);
+    log.success(`Removed OpenClaw agent hook [${opts.slug}] from ${dir}`);
+  }
+
+  if (tool === 'openclaw') await removeOpenClawHookEntry(agentHookKey(opts.slug));
+}
+

@@ -1,0 +1,2803 @@
+import fs from 'node:fs';
+import { z } from 'zod';
+import path from 'node:path';
+import { toolHome } from './tool-home.js';
+import readline from 'node:readline';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { log } from './utils/logger.js';
+import { deriveDispatchSessionId } from './utils/session-id.js';
+import { resolveHookCwd } from './utils/hook-cwd.js';
+import { ensureDir } from './utils/fs.js';
+import { repoKeys, repoLabel } from './utils/repo-attribution.js';
+import { isProcessAlive, resolveMonitorPid } from './pid-monitor.js';
+import { normalizeToolName } from './utils/tool-names.js';
+import { redactWithEnv } from './utils/redact.js';
+import { acquireLock, releaseLock } from './update.js';
+import {
+  DASHBOARD_COMPACTION_THRESHOLD,
+  DASHBOARD_IDLE_TIMEOUT_MS,
+  DASHBOARD_STALE_TIMEOUT_MS,
+  DASHBOARD_STOPPED_DISPLAY_MS,
+  CORRECTION_WINDOW_MS,
+  CORRECTION_KEYWORDS,
+  INTERVENTION_SCAN_MAX_BYTES,
+  TRANSCRIPT_INTERRUPT_PREFIX,
+  TRANSCRIPT_SYSTEM_PREFIXES,
+  stripInjectedPrompt,
+  TRANSCRIPT_REJECT_MARKERS,
+  COPILOT_TOOL_ID,
+  getDataHome,
+  emptyTokenUsage,
+  addTokenUsage,
+  totalTokens,
+  type DashboardEvent,
+  type DashboardEventType,
+  type DashboardSession,
+  type TokenUsage,
+  type SessionMetrics,
+  type RequestCostMetrics,
+  type LocalConfig,
+  type JsonValue,
+} from './types.js';
+import { getUserHome } from './utils/home.js';
+import type { HeadState } from './utils/git.js';
+import type { SessionRun } from './launch-context.js';
+import { SessionOutcomeEventSchema, uniqueOutcomes, type SessionOutcomeEvent, type WorkOutcome } from './outcomes.js';
+import { readCopilotShutdown } from './token-usage/formats/copilot-shutdown.js';
+import { isTokenFormatId, readTokenUsage, type TokenRequest } from './token-usage/index.js';
+import { priceTokens } from './token-usage/pricing.js';
+import { isToolId, TOOLS, type ToolDescriptor } from './tools.js';
+import { HookStdinSchema, type HookStdin } from './hook-dispatch.js';
+
+// ─── Event collection data flow ─────────────────────────
+//
+//  Hook STDIN JSON (varies by event type)
+//      │
+//      ▼
+//  parseHookEvent(raw, tool)
+//      │ extract: session_id / cwd / tool_name / prompt
+//      ▼
+//  DashboardEvent
+//      │ dataHomeKey = key of the data home of the scope the hook resolved
+//      ▼
+//  appendEvent(event) → events.jsonl
+//
+
+// ─── STDIN parsing ──────────────────────────────────────
+
+/** Read STDIN fully. Returns empty string if STDIN is a TTY. */
+async function readStdin(): Promise<string> {
+  if (process.stdin.isTTY) return '';
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of process.stdin) {
+    // SAFETY: process.stdin has no encoding set, so its async iterator yields Buffer chunks.
+    chunks.push(chunk as Buffer);
+  }
+
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
+// ─── Transcript reading ─────────────────────────────────
+
+/** Maximum bytes to read from the end of a transcript file. */
+const TRANSCRIPT_TAIL_BYTES = 10240;
+
+/** Maximum characters for stoppedOutput. */
+const STOPPED_OUTPUT_MAX_CHARS = 500;
+
+/** A Claude Code assistant transcript entry: `{type: "assistant", message: {content: [{type: "text", text: "..."}]}}`. */
+const AssistantTranscriptEntrySchema = z.object({
+  type: z.literal('assistant'),
+  message: z.object({ content: z.array(z.looseObject({ type: z.unknown().optional(), text: z.unknown().optional() })) }),
+});
+
+/**
+ * Read the last assistant message from a Claude Code transcript file.
+ * Uses tail-read (last 10KB) to avoid loading the entire file into memory.
+ * Returns empty string on any error (file missing, permission denied, etc.).
+ */
+export async function readLastAssistantOutput(transcriptPath: string): Promise<string> {
+  try {
+    const stat = await fs.promises.stat(transcriptPath);
+    const fileSize = stat.size;
+
+    if (fileSize === 0) return '';
+
+    const readSize = Math.min(fileSize, TRANSCRIPT_TAIL_BYTES);
+    const offset = Math.max(0, fileSize - readSize);
+
+    const fh = await fs.promises.open(transcriptPath, 'r');
+
+    try {
+      const buffer = Buffer.alloc(readSize);
+      await fh.read(buffer, 0, readSize, offset);
+      const tail = buffer.toString('utf-8');
+
+      // Parse JSONL lines from the tail, find the last assistant message
+      const lines = tail.split('\n').filter(l => l.trim());
+      let lastAssistantText = '';
+
+      for (const line of lines) {
+        try {
+          const entry = AssistantTranscriptEntrySchema.safeParse(JSON.parse(line));
+
+          if (entry.success) {
+            const textParts = entry.data.message.content.flatMap((c) => (c.type === 'text' && c.text ? [c.text] : []));
+
+            if (textParts.length > 0) {
+              lastAssistantText = textParts.join('\n');
+            }
+          }
+        } catch {
+          // Skip malformed lines (expected when tail starts mid-line)
+        }
+      }
+
+      // Scrub secrets before this text is persisted to events.jsonl and rendered
+      // in the dashboard. Redact first, then slice, so a placeholder (not a raw
+      // token fragment) is what lands near the length boundary.
+      return redactWithEnv(lastAssistantText).slice(0, STOPPED_OUTPUT_MAX_CHARS);
+    } finally {
+      await fh.close();
+    }
+  } catch (e) {
+    log.warn(`dashboard: failed to read transcript: ${e instanceof Error ? e.message : String(e)}`);
+
+    return '';
+  }
+}
+
+/** Result of a full-transcript scan at session Stop: cumulative, idempotent snapshot. */
+export interface TranscriptScanResult {
+  interrupt: number;
+  toolReject: number;
+  /**
+   * Cumulative count of genuine tool failures (tool_result with is_error=true that
+   * is NOT a user permission rejection). Signals the AI struggled with a tool and
+   * had to retry — a strong "this session hit a real snag" indicator for contribute
+   * scoring. Distinct from toolReject (human deny).
+   */
+  toolError: number;
+  /**
+   * Cumulative count of genuine human prompt turns in the transcript. Sourced here
+   * (not from compactable prompt_submit events) so the reported baseline stays
+   * monotonic across compaction + same-session resume — same guarantee as `tokens`.
+   */
+  prompts: number;
+}
+
+/** How many days the request log keeps a request. */
+export const REQUEST_LOG_RETENTION_DAYS = 90;
+
+const RequestCount = z.number().finite().nonnegative();
+
+/**
+ * One request in `~/.teamai/dashboard/requests.jsonl`: its tokens and model,
+ * and its cost when a price was known, kept as recorded so a later catalog
+ * does not reprice it. Records written before teamai logged unpriced requests
+ * have no tool, session or cost source; their cost came from the catalog.
+ */
+const LocalRequestRecordSchema = z.object({
+  id: z.string().min(1),
+  timestamp: z.string().refine((value) => Number.isFinite(Date.parse(value))),
+  tool: z.string().optional(),
+  sessionId: z.string().optional(),
+  /** The data home of the scope that recorded it (`dataHomeKey`), so a workspace finds it after compaction dropped its session. */
+  dataHomeKey: z.string().optional(),
+  model: z.string(),
+  inputTokens: RequestCount,
+  outputTokens: RequestCount,
+  cacheReadTokens: RequestCount,
+  cacheCreationTokens: RequestCount,
+}).and(z.union([
+  z.object({
+    costMicros: RequestCount,
+    /** Absent on records from before reported costs were kept: the catalog's. */
+    costSource: z.enum(['reported', 'catalog']).optional(),
+    priceVersion: z.string(),
+    /** What the cache reads saved against paying for them as input, at the catalog price. */
+    cacheSavingsMicros: RequestCount.optional(),
+  }),
+  z.object({ costMicros: z.null(), priceVersion: z.null() }),
+]));
+
+export type LocalRequestRecord = z.infer<typeof LocalRequestRecordSchema>;
+
+type PricedRequestRecord = Extract<LocalRequestRecord, { costMicros: number }>;
+
+const isPriced = (record: LocalRequestRecord): record is PricedRequestRecord => record.costMicros !== null;
+
+/**
+ * Where the dashboard reads `tool`'s token usage: its TOOLS entry's `tokens`.
+ * A tool TOOLS does not list is read as a Claude transcript, as every Stop
+ * transcript was before tools named their format.
+ */
+function tokenSourceOf(tool: string): ToolDescriptor['tokens'] {
+  const id = tool.toLowerCase();
+
+  return isToolId(id) ? TOOLS[id].tokens : 'claude-jsonl';
+}
+
+/** A request's catalog cost with its cache reads billed as input, less its catalog cost. */
+function cacheSavingsMicros(request: TokenRequest, aliases?: Record<string, string>): number | undefined {
+  if (request.tokens.cacheRead === 0) return undefined;
+  const { reportedCostMicros: _reported, ...estimate } = request;
+  const actual = priceTokens(estimate, aliases);
+  const uncached = priceTokens({ ...estimate, tokens: { ...request.tokens, input: request.tokens.input + request.tokens.cacheRead, cacheRead: 0 } }, aliases);
+
+  return actual && uncached ? Math.max(0, uncached.costMicros - actual.costMicros) : undefined;
+}
+
+/**
+ * Log `requests` to the request log, keyed by `scope` (the transcript, or the
+ * tool and session), and stamp the cost of the priced ones on `event`. A
+ * request logged with a cost keeps it; an unpriced one is priced again, so a
+ * newer catalog or a `modelAliases` entry prices it.
+ */
+async function recordTokenRequests(
+  event: DashboardEvent,
+  requests: readonly TokenRequest[],
+  scope: string,
+  options: ParseHookEventOptions | undefined,
+): Promise<void> {
+  const aliases = options?.modelAliases;
+
+  if (!requests.length) return;
+  const logged = await readLocalRequestRecords();
+
+  const records = requests.map((request): LocalRequestRecord => {
+    const id = createHash('sha256').update(`${scope}\0${request.key}`).digest('hex');
+    const kept = logged.get(id);
+    // A request stays with the workspace that first recorded it, even when its session resumes in another.
+    const dataHome = kept?.dataHomeKey ?? options?.dataHomeKey;
+    const owner: Pick<LocalRequestRecord, 'tool' | 'sessionId' | 'dataHomeKey'> = { tool: kept?.tool ?? event.tool, sessionId: kept?.sessionId ?? event.sessionId };
+
+    if (dataHome) owner.dataHomeKey = dataHome;
+
+    if (kept && isPriced(kept)) return { ...kept, ...owner };
+
+    const base = {
+      id,
+      timestamp: Number.isFinite(Date.parse(request.timestamp)) ? new Date(request.timestamp).toISOString() : event.timestamp,
+      ...owner,
+      model: request.model,
+      inputTokens: request.tokens.input,
+      outputTokens: request.tokens.output,
+      cacheReadTokens: request.tokens.cacheRead,
+      cacheCreationTokens: request.tokens.cacheCreation,
+    };
+
+    const priced = priceTokens(request, aliases);
+
+    if (!priced) return { ...base, costMicros: null, priceVersion: null };
+    const savings = cacheSavingsMicros(request, aliases);
+
+    const pricedRecord: PricedRequestRecord = {
+      ...base,
+      costMicros: priced.costMicros,
+      costSource: priced.source,
+      priceVersion: priced.priceVersion,
+    };
+
+    if (savings !== undefined) pricedRecord.cacheSavingsMicros = savings;
+
+    return pricedRecord;
+  });
+
+  const priced = records.filter(isPriced);
+
+  if (priced.length) {
+    const daily = aggregateRequestDaily(priced);
+    event.requestDaily = daily;
+    event.requestMetrics = Object.values(daily).reduce((sum, day) => ({
+      pricedRequests: sum.pricedRequests + day.pricedRequests,
+      costMicros: sum.costMicros + day.costMicros,
+      cacheReadTokens: sum.cacheReadTokens + day.cacheReadTokens,
+      cacheEligibleInputTokens: sum.cacheEligibleInputTokens + day.cacheEligibleInputTokens,
+      priceVersion: day.priceVersion,
+    }));
+  }
+
+  await reconcileRequestLog(records);
+}
+
+/**
+ * Scan a full transcript once at Stop time and collect cumulative, idempotent
+ * snapshots of:
+ * - interrupt:  Claude user interrupt markers or Cursor user-aborted turn_ended records
+ * - toolReject: tool_result with is_error=true marked as a user rejection
+ * - prompts:    genuine human prompt turns (user entries with real text, excluding
+ *               interrupts, tool_results, and meta/sidechain entries).
+ *
+ * Token usage is read by `readTokenUsage` (src/token-usage/) in the format the
+ * tool's `TOOLS` entry names. Uses a streaming line reader so large transcripts
+ * don't load fully into memory. Returns zero counts on any error (file missing,
+ * too large, permission denied).
+ */
+export async function scanTranscriptStop(transcriptPath: string): Promise<TranscriptScanResult> {
+  // CodeBuddy persists its transcript as a single `index.json` document, not JSONL.
+  if (path.basename(transcriptPath) === 'index.json') {
+    const cb = await scanCodebuddyIndex(transcriptPath);
+
+    if (cb) return cb;
+  }
+
+  return scanJsonlTranscriptOnce(transcriptPath);
+}
+
+/** A tool_result's `content`: plain text, or parts whose string `text` is joined. */
+const ToolResultContentSchema = z.union([
+  z.string(),
+  z.array(z.object({ text: z.string().optional().catch(undefined) }).catch({})),
+]).optional().catch(undefined);
+
+/** One part of a transcript message's `content`; a part that is not an object matches no part type. */
+const TranscriptPartSchema = z.object({
+  type: z.unknown().optional(),
+  text: z.string().optional().catch(undefined),
+  is_error: z.unknown().optional(),
+  content: ToolResultContentSchema,
+}).catch({});
+
+/**
+ * The fields of a Claude transcript line the Stop scan and the session owner
+ * scan read. A field of the wrong type reads as absent, as does a message that
+ * is not an object.
+ */
+export const TranscriptEntrySchema = z.object({
+  type: z.unknown().optional(),
+  isMeta: z.unknown().optional(),
+  isSidechain: z.unknown().optional(),
+  cwd: z.string().optional().catch(undefined),
+  message: z.object({
+    content: z.union([z.string(), z.array(TranscriptPartSchema)]).optional().catch(undefined),
+  }).optional().catch(undefined),
+});
+
+export type TranscriptEntry = z.infer<typeof TranscriptEntrySchema>;
+
+/**
+ * Whether a Claude transcript entry is a human turn, what the Stop scan counts
+ * as a prompt: plain-string user content, or user content with text that is
+ * neither an interrupt marker nor a system injection; never meta or sidechain.
+ * One human turn per user entry (tool_result-only entries have no human text).
+ */
+export function isHumanPromptEntry(entry: TranscriptEntry): boolean {
+  if (entry.type !== 'user') return false;
+
+  if (entry.isMeta === true || entry.isSidechain === true) return false;
+  const content = entry.message?.content;
+
+  if (content === undefined) return false;
+
+  if (!Array.isArray(content)) {
+    const text = content.trim();
+
+    return !!text && !text.startsWith(TRANSCRIPT_INTERRUPT_PREFIX) && !TRANSCRIPT_SYSTEM_PREFIXES.some((p) => text.startsWith(p));
+  }
+
+  return content.some((item) => {
+    if (item.type !== 'text' || item.text === undefined || item.text.startsWith(TRANSCRIPT_INTERRUPT_PREFIX)) return false;
+    const text = item.text.trim();
+
+    return !!text && !TRANSCRIPT_SYSTEM_PREFIXES.some((p) => text.startsWith(p));
+  });
+}
+
+const StopTranscriptEntrySchema = TranscriptEntrySchema.extend({
+  role: z.string().optional().catch(undefined),
+  status: z.string().optional().catch(undefined),
+  error: z.string().optional().catch(undefined),
+});
+
+async function scanJsonlTranscriptOnce(transcriptPath: string): Promise<TranscriptScanResult> {
+  let interrupt = 0;
+  let toolReject = 0;
+  let toolError = 0;
+  let prompts = 0;
+
+  try {
+    const stat = await fs.promises.stat(transcriptPath);
+
+    if (stat.size === 0) return { interrupt, toolReject, toolError, prompts };
+
+    if (stat.size > INTERVENTION_SCAN_MAX_BYTES) {
+      log.warn(`dashboard: transcript too large to scan (${stat.size} bytes)`);
+
+      return { interrupt, toolReject, toolError, prompts };
+    }
+
+    const rl = readline.createInterface({
+      input: fs.createReadStream(transcriptPath, { encoding: 'utf-8' }),
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+      const trimmed = line.trim();
+
+      // Cursor puts aborts on turn_ended records, not user messages.
+      if (!trimmed || (!trimmed.includes('"user"') && !trimmed.includes('"turn_ended"'))) continue;
+
+      let entry: z.infer<typeof StopTranscriptEntrySchema>;
+
+      try {
+        const parsed = StopTranscriptEntrySchema.safeParse(JSON.parse(trimmed));
+
+        if (!parsed.success) continue;
+        entry = parsed.data;
+      } catch {
+        continue;
+      }
+
+      if (entry.type === 'turn_ended') {
+        if (entry.status === 'aborted'
+          || (entry.status === 'error' && (entry.error === 'User aborted request' || entry.error === 'user_stopped_generation'))) interrupt++;
+
+        continue;
+      }
+
+      const entryType = entry.type ?? entry.role;
+
+      if (entryType !== 'user') continue;
+
+      if (isHumanPromptEntry({ ...entry, type: entryType })) prompts++;
+      const content = entry.message?.content;
+
+      if (!Array.isArray(content)) continue;
+
+      for (const item of content) {
+        if (item.type === 'text' && item.text !== undefined) {
+          if (item.text.startsWith(TRANSCRIPT_INTERRUPT_PREFIX)) interrupt++;
+        } else if (item.type === 'tool_result' && item.is_error === true) {
+          const text = item.content === undefined
+            ? ''
+            : Array.isArray(item.content)
+              ? item.content.map((c) => c.text ?? '').join(' ')
+              : item.content;
+
+          if (TRANSCRIPT_REJECT_MARKERS.some((m) => text.includes(m))) {
+            toolReject++;
+          } else {
+            // is_error=true but not a permission deny → a genuine tool failure
+            // the AI had to work around (bad args, command error, etc.).
+            toolError++;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    log.warn(`dashboard: failed to scan transcript: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  return { interrupt, toolReject, toolError, prompts };
+}
+
+function isCodexTool(tool: string | undefined): boolean {
+  return tool !== undefined && tool.toLowerCase().includes('codex');
+}
+
+const COPILOT_USAGE_TAIL_BYTES = 256 * 1024;
+const COPILOT_RUN_SCAN_BYTES = 8 * 1024 * 1024;
+const COPILOT_USAGE_MAX_ATTEMPTS = 8;
+const COPILOT_USAGE_RETRY_MS = 250;
+const COPILOT_SHUTDOWN_EVENT = 'session.shutdown';
+const COPILOT_SESSION_STATE_DIR = 'session-state';
+const COPILOT_SESSION_EVENTS_FILE = 'events.jsonl';
+const COPILOT_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/** The run linkage fields of a Copilot event log record; a field of the wrong type reads as absent. */
+const CopilotLogRecordSchema = z.object({
+  type: z.unknown().optional(),
+  id: z.string().optional().catch(undefined),
+  parentId: z.string().optional().catch(undefined),
+  timestamp: z.union([z.string(), z.number()]).optional().catch(undefined),
+});
+
+type CopilotLogRecord = z.infer<typeof CopilotLogRecordSchema>;
+
+interface CopilotUsageObservation {
+  shutdownObserved: boolean;
+  shutdownOffset?: number;
+  tokens?: TokenUsage;
+  /** One per model, from the shutdown record. */
+  requests?: TokenRequest[];
+}
+
+function copilotUsageEquals(
+  first: CopilotUsageObservation,
+  second: CopilotUsageObservation,
+): boolean {
+  if (first.shutdownObserved !== second.shutdownObserved) return false;
+
+  if (!first.tokens || !second.tokens) return first.tokens === second.tokens;
+
+  return first.tokens.input === second.tokens.input
+    && first.tokens.output === second.tokens.output
+    && first.tokens.cacheRead === second.tokens.cacheRead
+    && first.tokens.cacheCreation === second.tokens.cacheCreation;
+}
+
+/** Parse only Copilot's final token counters from a shutdown record. */
+function parseCopilotShutdown(entry: JsonValue): CopilotUsageObservation {
+  const shutdown = readCopilotShutdown(entry);
+
+  return shutdown ? { shutdownObserved: true, ...shutdown } : { shutdownObserved: false };
+}
+
+/** Read a bounded tail without retaining any prompt, output, or request fields. */
+async function readLatestCopilotUsageFromTail(
+  transcriptPath: string,
+): Promise<CopilotUsageObservation> {
+  try {
+    const stat = await fs.promises.stat(transcriptPath);
+
+    if (stat.size === 0) return { shutdownObserved: false };
+    const readSize = Math.min(stat.size, COPILOT_USAGE_TAIL_BYTES);
+    const offset = stat.size - readSize;
+    const fh = await fs.promises.open(transcriptPath, 'r');
+
+    try {
+      const buffer = Buffer.alloc(readSize);
+      await fh.read(buffer, 0, readSize, offset);
+      let lineStart = 0;
+
+      if (offset > 0) {
+        const partialLineEnd = buffer.indexOf('\n');
+
+        if (partialLineEnd < 0) return { shutdownObserved: false };
+        lineStart = partialLineEnd + 1;
+      }
+
+      let latest: CopilotUsageObservation = { shutdownObserved: false };
+
+      while (lineStart < buffer.length) {
+        const newline = buffer.indexOf('\n', lineStart);
+        const lineEnd = newline < 0 ? buffer.length : newline;
+        const line = buffer.subarray(lineStart, lineEnd).toString('utf-8');
+
+        if (line.includes(`"${COPILOT_SHUTDOWN_EVENT}"`)) {
+          try {
+            const observed = parseCopilotShutdown(JSON.parse(line));
+
+            if (observed.shutdownObserved) {
+              latest = { ...observed, shutdownOffset: offset + lineEnd };
+            }
+          } catch {
+            // The last line may still be in flight; the bounded retry sees it later.
+          }
+        }
+
+        if (newline < 0) break;
+        lineStart = newline + 1;
+      }
+
+      return latest;
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    log.debug('dashboard: failed to read Copilot usage tail');
+
+    return { shutdownObserved: false };
+  }
+}
+
+/** Wait briefly because Copilot can append session.shutdown after SessionEnd. */
+async function waitForCopilotShutdownUsage(
+  transcriptPath: string,
+  initial: CopilotUsageObservation,
+): Promise<CopilotUsageObservation> {
+  const isCurrent = (observed: CopilotUsageObservation): boolean => {
+    if (!observed.shutdownObserved) return false;
+
+    // Legacy sessions have no run marker; only a newly observed record is safe.
+    return !initial.shutdownObserved
+      || observed.shutdownOffset !== initial.shutdownOffset
+      || !copilotUsageEquals(initial, observed);
+  };
+
+  if (isCurrent(initial)) return initial;
+
+  for (let attempt = 1; attempt < COPILOT_USAGE_MAX_ATTEMPTS; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, COPILOT_USAGE_RETRY_MS));
+    const observed = await readLatestCopilotUsageFromTail(transcriptPath);
+
+    if (isCurrent(observed)) return observed;
+  }
+
+  return { shutdownObserved: false };
+}
+
+interface CopilotRunMarker {
+  id: string;
+  offset: number;
+}
+
+/** Recover a marker written after SessionStart from a bounded private-log tail. */
+async function findCopilotRunMarkerAfter(
+  transcriptPath: string,
+  startOffset: number,
+  startedAt: number,
+  endedAt: number,
+  useProviderTime: boolean,
+): Promise<CopilotRunMarker | undefined> {
+  try {
+    const stat = await fs.promises.stat(transcriptPath);
+
+    if (startOffset > stat.size || stat.size - startOffset > COPILOT_RUN_SCAN_BYTES) {
+      return undefined;
+    }
+
+    const readSize = stat.size - startOffset;
+    const offset = startOffset;
+    const fh = await fs.promises.open(transcriptPath, 'r');
+
+    try {
+      const buffer = Buffer.alloc(readSize);
+      await fh.read(buffer, 0, readSize, offset);
+      let lineStart = 0;
+      let selected: CopilotRunMarker | undefined;
+
+      while (lineStart < buffer.length) {
+        const newline = buffer.indexOf('\n', lineStart);
+        const lineEnd = newline < 0 ? buffer.length : newline;
+        const line = buffer.subarray(lineStart, lineEnd).toString('utf-8');
+
+        if (line.includes('"session.start"') || line.includes('"session.resume"')) {
+          try {
+            const parsed = CopilotLogRecordSchema.safeParse(JSON.parse(line));
+            const record = parsed.success ? parsed.data : undefined;
+            const markerTime = record?.timestamp;
+            const time = markerTime === undefined ? NaN : new Date(markerTime).getTime();
+
+            if ((record?.type === 'session.start' || record?.type === 'session.resume')
+              && record.id !== undefined
+              && offset + lineStart >= startOffset
+              && (!useProviderTime || (Number.isFinite(time)
+                && time >= startedAt && time <= endedAt))) {
+              selected = { id: record.id, offset: offset + lineStart };
+            }
+          } catch {
+            // Partial records provide no safe run linkage.
+          }
+        }
+
+        if (newline < 0) break;
+        lineStart = newline + 1;
+      }
+
+      return selected;
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    log.debug('dashboard: failed to recover Copilot run marker');
+
+    return undefined;
+  }
+}
+
+/** Follow Copilot event parent IDs from the current run marker, discarding content. */
+async function readCopilotUsageForRun(
+  transcriptPath: string,
+  marker: CopilotRunMarker,
+): Promise<CopilotUsageObservation> {
+  const descendants = new Set<string>([marker.id]);
+  let latest: CopilotUsageObservation = { shutdownObserved: false };
+
+  try {
+    const stat = await fs.promises.stat(transcriptPath);
+
+    // Large transcript bodies are private and may be arbitrarily long. Missing
+    // totals are safer than rereading an unbounded log on every retry.
+    if (stat.size - marker.offset > COPILOT_RUN_SCAN_BYTES) return latest;
+
+    const stream = fs.createReadStream(transcriptPath, {
+      start: marker.offset, encoding: 'utf-8',
+    });
+
+    const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+    try {
+      for await (const line of lines) {
+        let json: JsonValue;
+        let record: CopilotLogRecord;
+
+        try {
+          json = JSON.parse(line);
+          const parsed = CopilotLogRecordSchema.safeParse(json);
+
+          if (!parsed.success) continue;
+          record = parsed.data;
+        } catch {
+          continue;
+        }
+
+        if (record.id === undefined) continue;
+
+        if ((record.type === 'session.start' || record.type === 'session.resume')
+          && record.id !== marker.id) break;
+
+        if (record.parentId !== undefined && descendants.has(record.parentId)) {
+          descendants.add(record.id);
+        }
+
+        if (record.type === COPILOT_SHUTDOWN_EVENT && descendants.has(record.id)) {
+          latest = parseCopilotShutdown(json);
+        }
+      }
+    } finally {
+      lines.close();
+      stream.destroy();
+    }
+  } catch {
+    log.debug('dashboard: failed to read Copilot run lineage');
+  }
+
+  return latest;
+}
+
+async function waitForCopilotRunUsage(
+  transcriptPath: string,
+  marker: CopilotRunMarker,
+): Promise<CopilotUsageObservation> {
+  for (let attempt = 0; attempt < COPILOT_USAGE_MAX_ATTEMPTS; attempt++) {
+    const observed = await readCopilotUsageForRun(transcriptPath, marker);
+
+    if (observed.tokens) return observed;
+
+    if (attempt < COPILOT_USAGE_MAX_ATTEMPTS - 1) {
+      await new Promise((resolve) => setTimeout(resolve, COPILOT_USAGE_RETRY_MS));
+    }
+  }
+
+  return { shutdownObserved: false };
+}
+
+/** Resolve Copilot's local event log without accepting path traversal via sessionId. */
+/** Copilot's own session log for `sessionId`, derived from the ID alone (TeamAI stores no path of it, #666). */
+export function resolveCopilotUsageTranscript(
+  sessionId: string,
+): string | null {
+  if (!COPILOT_SESSION_ID_RE.test(sessionId) || sessionId === '.' || sessionId === '..') return null;
+
+  return path.join(
+    toolHome(COPILOT_TOOL_ID),
+    COPILOT_SESSION_STATE_DIR,
+    sessionId,
+    COPILOT_SESSION_EVENTS_FILE,
+  );
+}
+
+/**
+ * The human turns of a CodeBuddy `index.json` transcript: its `messages[]`
+ * entries with role `user`. Null when the file is missing, too large,
+ * unparseable (read mid-write) or not a CodeBuddy index document.
+ */
+/** The parts of a CodeBuddy `index.json` the prompt count reads; `requests` tells it from other JSON. */
+const CodebuddyIndex = z.object({
+  requests: z.array(z.unknown()),
+  messages: z.array(z.object({ role: z.unknown() }).catch({ role: undefined })).catch([]).default([]),
+});
+
+async function readCodebuddyIndexPrompts(transcriptPath: string): Promise<number | null> {
+  try {
+    const stat = await fs.promises.stat(transcriptPath);
+
+    if (stat.size === 0 || stat.size > INTERVENTION_SCAN_MAX_BYTES) return null;
+    const index = CodebuddyIndex.safeParse(JSON.parse(await fs.promises.readFile(transcriptPath, 'utf-8')));
+
+    return index.success ? index.data.messages.filter((m) => m.role === 'user').length : null;
+  } catch (e) {
+    log.warn(`dashboard: failed to scan CodeBuddy index: ${e instanceof Error ? e.message : String(e)}`);
+
+    return null;
+  }
+}
+
+/** Cap on CodeBuddy message blobs scanned for friction, to bound Stop-hook IO. */
+const CODEBUDDY_BLOB_MAX_COUNT = 2000;
+
+/** User-rejection marker CodeBuddy writes into a cancelled tool's result.errorMessage. */
+const CODEBUDDY_REJECT_MARKER = 'User rejected this command';
+
+/** A CodeBuddy message blob; `extra` and `message` hold JSON documents as strings. */
+const CodebuddyBlobSchema = z.object({
+  role: z.unknown().optional(),
+  extra: z.string().optional().catch(undefined),
+  message: z.string().optional().catch(undefined),
+});
+
+/** An assistant blob's parsed `extra`: tool call status by call id; an entry that is not an object matches nothing. */
+const CodebuddyExtraSchema = z.object({
+  toolStatus: z.record(z.string(), z.object({
+    status: z.unknown().optional(),
+    result: z.object({ errorMessage: z.string().optional().catch(undefined) }).nullish().catch(undefined),
+  }).catch({})),
+});
+
+/** A tool blob's parsed `message`: its tool results; an item that is not an object matches nothing. */
+const CodebuddyToolMessageSchema = z.object({
+  content: z.array(z.object({
+    type: z.unknown().optional(),
+    toolCallId: z.string().optional().catch(undefined),
+    isError: z.unknown().optional(),
+  }).catch({})),
+});
+
+/**
+ * Scan CodeBuddy message blobs for tool-reject and tool-error friction signals.
+ *
+ * `index.json` is only a skeleton (tokens + prompt list) and omits tool results,
+ * so the friction signals must be read from the sibling `messages/*.json` blobs,
+ * where each blob is one message turn.
+ *
+ * Detection criteria (verified against real CodeBuddy transcripts):
+ * - toolReject: a blob with `role === 'assistant'` whose `extra` field is a JSON
+ *   *string* (parsed a second time) yielding `extra.toolStatus` as
+ *   `{ [callId]: entry }`. An entry with `status === 'cancelled'` and
+ *   `result.errorMessage` containing {@link CODEBUDDY_REJECT_MARKER} counts as one
+ *   rejection. That marker is CodeBuddy's user-rejection-only fixed string, which
+ *   naturally excludes system auto-cancels (UNFINISHED TOOL / MalformedToolArgs)
+ *   and interrupt residue.
+ * - toolError: a blob with `role === 'tool'` whose `message` field is a JSON
+ *   *string* (parsed a second time) yielding `message.content` as an array of
+ *   `{ type: 'tool-result', toolCallId, isError, result }`. An element with
+ *   `isError === true` counts as one error. Executed tools and rejected tools both
+ *   carry `isError === false`, so only genuine execution errors are counted — this
+ *   aligns with Claude's "is_error=true and not a reject" semantics.
+ *
+ * Counts are de-duplicated per `callId` via Sets, since the same callId may appear
+ * in multiple blobs. The function never throws: any single-blob read/parse/shape
+ * failure is skipped, yielding a best-effort count. Blob count is capped at
+ * {@link CODEBUDDY_BLOB_MAX_COUNT} because this runs on the Stop hook, which
+ * has a fixed timeout budget — a pathologically large directory must not
+ * stall it.
+ */
+async function scanCodebuddyBlobs(
+  messagesDir: string,
+): Promise<{ toolReject: number; toolError: number }> {
+  let names: string[];
+
+  try {
+    names = await fs.promises.readdir(messagesDir);
+  } catch {
+    return { toolReject: 0, toolError: 0 };
+  }
+
+  const blobPaths = names
+    .filter((n) => n.endsWith('.json'))
+    // Truncation is by lexicographic filename order (not chronological); real
+    // sessions have far fewer message turns than this cap, so correctness is
+    // unaffected — it only bounds Stop-hook IO.
+    .sort()
+    .slice(0, CODEBUDDY_BLOB_MAX_COUNT)
+    .map((n) => path.join(messagesDir, n));
+
+  const rejectedCallIds = new Set<string>();
+  const erroredCallIds = new Set<string>();
+
+  for (const blobPath of blobPaths) {
+    try {
+      const stat = await fs.promises.stat(blobPath);
+
+      if (stat.size === 0 || stat.size > INTERVENTION_SCAN_MAX_BYTES) continue;
+
+      const raw = await fs.promises.readFile(blobPath, 'utf-8');
+
+      const blob = CodebuddyBlobSchema.safeParse(JSON.parse(raw));
+
+      if (!blob.success) continue;
+
+      if (blob.data.role === 'assistant') {
+        if (blob.data.extra === undefined) continue;
+        let extra: z.infer<typeof CodebuddyExtraSchema>;
+
+        try {
+          const parsed = CodebuddyExtraSchema.safeParse(JSON.parse(blob.data.extra));
+
+          if (!parsed.success) continue;
+          extra = parsed.data;
+        } catch {
+          continue;
+        }
+
+        for (const [callId, e] of Object.entries(extra.toolStatus)) {
+          if (
+            e.status === 'cancelled' &&
+            e.result?.errorMessage !== undefined &&
+            e.result.errorMessage.includes(CODEBUDDY_REJECT_MARKER)
+          ) {
+            rejectedCallIds.add(callId);
+          }
+        }
+      } else if (blob.data.role === 'tool') {
+        if (blob.data.message === undefined) continue;
+        let message: z.infer<typeof CodebuddyToolMessageSchema>;
+
+        try {
+          const parsed = CodebuddyToolMessageSchema.safeParse(JSON.parse(blob.data.message));
+
+          if (!parsed.success) continue;
+          message = parsed.data;
+        } catch {
+          continue;
+        }
+
+        for (const i of message.content) {
+          if (
+            i.type === 'tool-result' &&
+            i.isError === true &&
+            i.toolCallId !== undefined
+          ) {
+            erroredCallIds.add(i.toolCallId);
+          }
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { toolReject: rejectedCallIds.size, toolError: erroredCallIds.size };
+}
+
+/**
+ * Friction and prompts of a CodeBuddy `index.json` transcript. Friction
+ * (toolReject / toolError) comes from the sibling `messages/` blobs (see
+ * {@link scanCodebuddyBlobs}), even while `index.json` is unreadable or
+ * mid-write, when prompts count 0; `interrupt` stays 0, as CodeBuddy has no
+ * on-disk marker for it. Null when the file does not parse as a CodeBuddy
+ * index and no blob shows friction, so the caller falls back to the JSONL scanner.
+ */
+async function scanCodebuddyIndex(transcriptPath: string): Promise<TranscriptScanResult | null> {
+  const [prompts, friction] = await Promise.all([
+    readCodebuddyIndexPrompts(transcriptPath),
+    scanCodebuddyBlobs(path.join(path.dirname(transcriptPath), 'messages')),
+  ]);
+
+  if (prompts === null && friction.toolReject + friction.toolError === 0) return null;
+
+  return { interrupt: 0, ...friction, prompts: prompts ?? 0 };
+}
+
+/**
+ * Backward-compatible intervention-only scan. Delegates to {@link scanTranscriptStop}.
+ */
+export async function countInterventions(
+  transcriptPath: string,
+): Promise<{ interrupt: number; toolReject: number; toolError: number }> {
+  const { interrupt, toolReject, toolError } = await scanTranscriptStop(transcriptPath);
+
+  return { interrupt, toolReject, toolError };
+}
+
+/** Scripts that do not separate words with spaces: substring matching is correct there. */
+const UNSPACED_SCRIPT_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+/**
+ * Match a keyword as a whole word: no letter, digit or underscore may touch either
+ * end, so `undo` does not fire on "segundo" or on the identifier "test_undo".
+ */
+function wordBoundaryPattern(keyword: string): RegExp {
+  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  return new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'u');
+}
+
+/** True when `lower` contains `keyword`, whole-word for spaced scripts, substring otherwise. */
+function containsKeyword(lower: string, keyword: string): boolean {
+  const k = keyword.trim().normalize('NFC').toLowerCase();
+
+  if (!k) return false;
+
+  if (UNSPACED_SCRIPT_RE.test(k)) return lower.includes(k);
+
+  return wordBoundaryPattern(k).test(lower);
+}
+
+/**
+ * True when a prompt looks like a course-correction (vs. a fresh task).
+ * `extraKeywords` are the team's `sharing.intervention.correctionKeywords`.
+ */
+function isCorrectionPrompt(text?: string, extraKeywords: readonly string[] = []): boolean {
+  if (!text) return false;
+  const lower = text.normalize('NFC').toLowerCase();
+
+  return [...CORRECTION_KEYWORDS, ...extraKeywords].some((k) => containsKeyword(lower, k));
+}
+
+/**
+ * Map hook event names to dashboard event types.
+ * Supports Claude Code (PascalCase), Cursor and CodeBuddy (camelCase) formats.
+ */
+function mapEventType(hookEventName: string): DashboardEventType | null {
+  switch (hookEventName) {
+    case 'SessionStart':
+    case 'sessionStart':
+      return 'session_start';
+    case 'SessionEnd':
+    case 'sessionEnd':
+      return 'session_end';
+    case 'PostToolUse':
+    case 'postToolUse':
+      return 'tool_use';
+    case 'UserPromptSubmit':
+    case 'userPromptSubmit':
+    case 'beforeSubmitPrompt':
+      return 'prompt_submit';
+    case 'Stop':
+    case 'stop':
+      return 'stop';
+    default:
+      return null;
+  }
+}
+
+export interface ParseHookEventOptions {
+  /** Team keywords (`sharing.intervention.correctionKeywords`) merged with the built-in list. */
+  correctionKeywords?: readonly string[];
+  /** Per-machine gateway model alias → a model the price catalog lists, for cost estimation. */
+  modelAliases?: Record<string, string>;
+  /**
+   * `false`: leave token usage unread and the request log unwritten, for a
+   * caller that needs only the event's type and session (the local agent),
+   * so it does not log the requests again without the scope's aliases.
+   */
+  readUsage?: false;
+  /** The recording scope's `dataHomeKey`, kept on each request it logs. */
+  dataHomeKey?: string;
+}
+
+/** The answers Codex wraps in a question reply prompt: a non-empty array, each with a string `answer`. */
+const CodexQuestionRepliesSchema = z.array(z.object({ answer: z.string() })).min(1);
+
+function codexReplyText(prompt: string): string {
+  // JSON.parse skips the whitespace around the array, so the pattern needs no
+  // whitespace quantifiers inside the tags: those backtrack on long runs.
+  const match = /^\s*<send_user_message_question_reply>([\s\S]*)<\/send_user_message_question_reply>\s*$/.exec(prompt);
+
+  if (!match) return prompt;
+
+  try {
+    const replies = CodexQuestionRepliesSchema.safeParse(JSON.parse(match[1]));
+
+    if (!replies.success) return prompt;
+
+    // A reply with no answer text keeps the prompt, so the turn is still counted.
+    const text = replies.data.map((reply) => reply.answer).join('\n');
+
+    return text.trim() ? text : prompt;
+  } catch {
+    return prompt;
+  }
+}
+
+/**
+ * The hook STDIN fields the collector reads; a field of the wrong type reads as
+ * absent. Other fields pass through for the session id and cwd resolvers.
+ */
+const HookPayloadSchema = z.looseObject({
+  hook_event_name: z.string().optional().catch(undefined),
+  timestamp: z.union([z.string(), z.number()]).optional().catch(undefined),
+  tool_name: z.string().optional().catch(undefined),
+  prompt: z.string().optional().catch(undefined),
+  transcript_path: z.string().optional().catch(undefined),
+});
+
+/**
+ * Parse a hook STDIN JSON payload into a DashboardEvent.
+ * Returns null if the payload is invalid or irrelevant.
+ * For stop events, reads the transcript file to capture AI output.
+ */
+export async function parseHookEvent(
+  raw: string,
+  tool: string,
+  options?: ParseHookEventOptions,
+): Promise<DashboardEvent | null> {
+  if (!raw.trim()) return null;
+
+  let json: JsonValue;
+
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    log.error('dashboard-collector: failed to parse STDIN JSON');
+
+    return null;
+  }
+
+  const payload = HookPayloadSchema.safeParse(json);
+  const hookData = payload.success ? payload.data : undefined;
+
+  // Determine event type from hook_event_name field
+  const hookEventName = hookData?.hook_event_name ?? '';
+  const eventType = mapEventType(hookEventName);
+
+  if (!eventType || !hookData) {
+    log.debug(`dashboard-collector: unknown hook event: ${hookEventName}`);
+
+    return null;
+  }
+
+  const isCopilot = tool.toLowerCase() === COPILOT_TOOL_ID;
+  const derivedSessionId = deriveDispatchSessionId(hookData, tool);
+
+  // Copilot IDs are persisted, so reject path-like IDs even when supplied directly.
+  const sessionId = isCopilot && !COPILOT_SESSION_ID_RE.test(derivedSessionId)
+    ? `pid-${process.ppid ?? process.pid}`
+    : derivedSessionId;
+
+  const cwd = isCopilot ? undefined : resolveHookCwd(hookData);
+
+  const providerTime = isCopilot && hookData.timestamp !== undefined
+    ? new Date(hookData.timestamp).getTime() : NaN;
+
+  const event: DashboardEvent = {
+    type: eventType,
+    timestamp: Number.isFinite(providerTime)
+      ? new Date(providerTime).toISOString() : new Date().toISOString(),
+    sessionId,
+    tool,
+    cwd,
+  };
+
+  // Extract tool name from PostToolUse (normalize IDE-style names)
+  if (eventType === 'tool_use' && hookData.tool_name !== undefined) {
+    event.toolName = normalizeToolName(hookData.tool_name);
+  }
+
+  // Resolve AI tool PID for liveness monitoring on session start
+  if (eventType === 'session_start') {
+    const ppid = process.ppid ?? process.pid;
+
+    if (ppid > 1) {
+      try {
+        event.monitorPid = resolveMonitorPid(ppid);
+      } catch {
+        // PID lookup failure must not discard the session lifecycle event.
+        event.monitorPid = ppid;
+      }
+    }
+  }
+
+  // Extract prompt summary from UserPromptSubmit. Strip harness/hook injections
+  // (task-notifications, system-reminders, interrupt markers) that also fire this
+  // hook — a background task completing is not a human prompt turn. A prompt that
+  // is purely injected content produces no event at all, so it neither inflates the
+  // prompt count nor shows up as a session prompt.
+  if (eventType === 'prompt_submit' && hookData.prompt !== undefined) {
+    const prompt = isCodexTool(tool) ? codexReplyText(hookData.prompt) : hookData.prompt;
+    const human = stripInjectedPrompt(prompt);
+
+    if (!human) return null;
+    // Decide "correction" here, over the full prompt, because only the hook knows
+    // which team (and so which extra keywords) the prompt belongs to. The
+    // machine-level events file mixes sessions from every team. Do this before
+    // dropping the original prompt so keywords beyond the persisted summary are
+    // still detected.
+    event.correction = isCorrectionPrompt(human, options?.correctionKeywords);
+
+    // Persist only a redacted, capped summary. Redact before truncating so a
+    // secret that crosses the 200-character boundary cannot be partially leaked.
+    // Copilot prompts remain entirely absent from telemetry, matching its
+    // provider-specific privacy contract while retaining the correction signal.
+    if (!isCopilot) event.promptSummary = redactWithEnv(human).slice(0, 200);
+  }
+
+  // The transcript a session runs in records where it started, which a report
+  // needs once compaction dropped the session's earlier events (#785). A
+  // SessionStart on a resume from another project names a file that never
+  // exists, so it is not kept there.
+  if ((eventType === 'prompt_submit' || eventType === 'session_end') && !isCopilot
+    && hookData.transcript_path !== undefined) {
+    event.transcriptPath = hookData.transcript_path;
+  }
+
+  // Extract transcript path, AI output and intervention counts from Stop event.
+  // DSH sends an empty transcript_path.
+  const stopTranscript = eventType === 'stop' && !isCopilot
+    && hookData.transcript_path
+    ? hookData.transcript_path : undefined;
+
+  if (stopTranscript) {
+    event.transcriptPath = stopTranscript;
+    const output = await readLastAssistantOutput(stopTranscript);
+
+    if (output) {
+      event.stoppedOutput = output;
+    }
+
+    // Full-transcript snapshot of interrupt/tool_reject counts + human prompt
+    // count (idempotent, sourced from the non-compactable transcript).
+    const scan = await scanTranscriptStop(stopTranscript);
+
+    if (scan.interrupt > 0 || scan.toolReject > 0 || scan.toolError > 0) {
+      event.interventions = {
+        interrupt: scan.interrupt,
+        toolReject: scan.toolReject,
+        toolError: scan.toolError,
+      };
+    }
+
+    if (scan.prompts > 0) {
+      event.prompts = scan.prompts;
+    }
+  }
+
+  // Token usage, in the format the tool's TOOLS entry names.
+  const tokenSource = tokenSourceOf(tool);
+
+  if (eventType === 'stop' && options?.readUsage !== false && isTokenFormatId(tokenSource)) {
+    const reading = await readTokenUsage(tokenSource, { transcriptPath: stopTranscript, sessionId });
+
+    if (totalTokens(reading.tokens) > 0) {
+      event.tokens = reading.tokens;
+
+      if (reading.scope) event.tokenScope = reading.scope;
+    }
+
+    // A session total that names no model (agy, Muse's rollup) is logged as one unpriced request, updated at each Stop.
+    const requests = !reading.requests.length && reading.scope === 'session' && totalTokens(reading.tokens) > 0
+      ? [{ key: 'session', timestamp: event.timestamp, model: '', tokens: reading.tokens, speed: 'standard' as const }]
+      : reading.requests;
+
+    await recordTokenRequests(event, requests, stopTranscript ?? `${tool}:${sessionId}`, options);
+  }
+
+  // SessionStart and SessionEnd run in separate processes. Capture the log
+  // boundary and an already-written marker only when it has not closed or
+  // appeared in a previous start event for this session.
+  if (eventType === 'session_start' && isCopilot) {
+    const transcriptPath = resolveCopilotUsageTranscript(sessionId);
+
+    if (transcriptPath) {
+      try {
+        let boundary = (await fs.promises.stat(transcriptPath)).size;
+
+        if (boundary > 0) {
+          const tailSize = Math.min(boundary, COPILOT_USAGE_TAIL_BYTES);
+          const tail = Buffer.alloc(tailSize);
+          const fh = await fs.promises.open(transcriptPath, 'r');
+
+          try {
+            await fh.read(tail, 0, tailSize, boundary - tailSize);
+          } finally {
+            await fh.close();
+          }
+
+          if (tail[tailSize - 1] !== 10) {
+            const newline = tail.lastIndexOf(10);
+
+            if (newline >= 0) boundary = boundary - tailSize + newline + 1;
+            else if (tailSize === boundary) boundary = 0;
+          }
+        }
+
+        event.copilotRunStartOffset = boundary;
+
+        const candidate = await findCopilotRunMarkerAfter(
+          transcriptPath, Math.max(0, boundary - COPILOT_USAGE_TAIL_BYTES),
+          NaN, NaN, false,
+        );
+
+        if (candidate) {
+          const shutdown = await readLatestCopilotUsageFromTail(transcriptPath);
+          const history = await readEventsRaw(getEventsPath());
+
+          const previousStarts = history.filter((entry) => entry.tool === COPILOT_TOOL_ID
+            && entry.sessionId === sessionId && entry.type === 'session_start');
+
+          const reused = previousStarts.some((entry) => entry.copilotRunMarkerId === candidate.id);
+
+          const unclaimedPrior = previousStarts.some(
+            (entry) => entry.copilotRunMarkerId === undefined,
+          );
+
+          const closed = shutdown.shutdownObserved
+            && shutdown.shutdownOffset !== undefined
+            && shutdown.shutdownOffset > candidate.offset;
+
+          if (!reused && !unclaimedPrior && !closed) {
+            event.copilotRunMarkerId = candidate.id;
+            event.copilotRunMarkerOffset = candidate.offset;
+          }
+        }
+      } catch {
+        event.copilotRunStartOffset = 0;
+      }
+    }
+  }
+
+  // Copilot's session log contains prompts, tool arguments, assistant output,
+  // and auth-bearing request metadata. Follow opaque event IDs, extract only
+  // final shutdown counters, and never persist paths or transcript content.
+  if (eventType === 'session_end' && tokenSource === 'copilot-shutdown' && options?.readUsage !== false) {
+    const transcriptPath = resolveCopilotUsageTranscript(sessionId);
+
+    if (transcriptPath) {
+      const history = await readEventsRaw(getEventsPath());
+      const endTime = Date.parse(event.timestamp);
+
+      const sessionHistory = history.filter((entry) => entry.tool === COPILOT_TOOL_ID
+        && entry.sessionId === sessionId);
+
+      // Copilot may omit the provider timestamp. A delayed End handler then has
+      // only its receipt time, so two unmatched Starts make its run ambiguous.
+      const starts = sessionHistory.filter((entry) => entry.type === 'session_start');
+      let lastEnd = -1;
+
+      for (let index = 0; index < sessionHistory.length; index++) {
+        if (sessionHistory[index].type === 'session_end') lastEnd = index;
+      }
+
+      const pendingStarts = sessionHistory.slice(lastEnd + 1)
+        .filter((entry) => entry.type === 'session_start');
+
+      const start = Number.isFinite(providerTime)
+        ? starts.toReversed().find((entry) => Date.parse(entry.timestamp) <= endTime)
+        : starts.length === 1 ? starts[0]
+          : pendingStarts.length === 1 ? pendingStarts[0] : undefined;
+
+      let usage: CopilotUsageObservation = { shutdownObserved: false };
+      const startTime = start ? Date.parse(start.timestamp) : NaN;
+      const boundary = start?.copilotRunStartOffset;
+
+      const recovered = Number.isFinite(providerTime)
+        && boundary !== undefined && Number.isFinite(boundary)
+        ? await findCopilotRunMarkerAfter(
+          transcriptPath, boundary, startTime, endTime, Number.isFinite(providerTime),
+        )
+        : undefined;
+
+      const stored = start?.copilotRunMarkerId !== undefined
+        && start.copilotRunMarkerOffset !== undefined
+        && Number.isFinite(start.copilotRunMarkerOffset)
+        ? { id: start.copilotRunMarkerId, offset: start.copilotRunMarkerOffset }
+        : undefined;
+
+      // Without a provider End time, a later marker may belong to the next run
+      // whose Start handler has not persisted yet. Only the marker claimed at
+      // this Start can safely supply totals.
+      const marker = Number.isFinite(providerTime) ? recovered ?? stored : stored;
+
+      if (marker) {
+        usage = await waitForCopilotRunUsage(transcriptPath, marker);
+      } else if ((start && boundary === undefined && !stored)
+        || (!start && sessionHistory.every((entry) => entry.type !== 'session_start'))) {
+        // Pre-upgrade sessions lack a run marker: accept only a new shutdown
+        // observed during this handler, never an unchanged historical record.
+        const initial = await readLatestCopilotUsageFromTail(transcriptPath);
+        usage = await waitForCopilotShutdownUsage(transcriptPath, initial);
+      }
+
+      if (usage.tokens) {
+        event.tokens = usage.tokens;
+        event.tokenScope = 'session';
+      }
+
+      // Request ids hash the session id, so the request log keeps no Copilot path.
+      await recordTokenRequests(event, usage.requests ?? [], `${COPILOT_TOOL_ID}:${sessionId}`, options);
+    }
+  }
+
+  return event;
+}
+
+// ─── JSONL persistence ──────────────────────────────────
+
+/** Get events path (evaluated at call time). */
+function getEventsPath(): string {
+  return path.join(getUserHome(), '.teamai', 'dashboard', 'events.jsonl');
+}
+
+function getRequestsPath(): string {
+  return path.join(getUserHome(), '.teamai', 'dashboard', 'requests.jsonl');
+}
+
+/** A request log line, or undefined for a partial or malformed one. */
+function parseRequestLine(line: string): LocalRequestRecord | undefined {
+  if (!line.trim()) return undefined;
+
+  try {
+    const record = LocalRequestRecordSchema.safeParse(JSON.parse(line));
+
+    return record.success ? record.data : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The local request log, by request id; empty before the first request. */
+export async function readLocalRequestRecords(): Promise<Map<string, LocalRequestRecord>> {
+  const records = new Map<string, LocalRequestRecord>();
+
+  try {
+    const content = await fs.promises.readFile(getRequestsPath(), 'utf-8');
+
+    for (const line of content.split('\n')) {
+      const record = parseRequestLine(line);
+
+      if (record) records.set(record.id, record);
+    }
+  } catch {
+    // No local request history yet.
+  }
+
+  return records;
+}
+
+function aggregateRequestDaily(records: readonly PricedRequestRecord[]) {
+  const daily: Record<string, RequestCostMetrics> = {};
+
+  for (const record of records) {
+    const date = record.timestamp.slice(0, 10);
+
+    const bucket = daily[date] ?? {
+      pricedRequests: 0,
+      costMicros: 0,
+      cacheReadTokens: 0,
+      cacheEligibleInputTokens: 0,
+      priceVersion: record.priceVersion,
+    };
+
+    bucket.pricedRequests += 1;
+    bucket.costMicros += record.costMicros;
+    bucket.cacheReadTokens += record.cacheReadTokens;
+    bucket.cacheEligibleInputTokens += record.inputTokens + record.cacheReadTokens + record.cacheCreationTokens;
+    bucket.priceVersion = record.priceVersion;
+    daily[date] = bucket;
+  }
+
+  return daily;
+}
+
+/** Upsert privacy-safe request details and retain only the latest 90 days locally. */
+export async function reconcileRequestLog(
+  incoming: LocalRequestRecord[],
+  now = new Date(),
+): Promise<void> {
+  const requestsPath = getRequestsPath();
+  const lockPath = `${requestsPath}.lock`;
+  const cutoff = now.getTime() - REQUEST_LOG_RETENTION_DAYS * 86_400_000;
+  let lock: fs.promises.FileHandle | undefined;
+
+  try {
+    await ensureDir(path.dirname(requestsPath));
+
+    for (let attempt = 0; attempt < 10 && !lock; attempt++) {
+      try {
+        lock = await fs.promises.open(lockPath, 'wx', 0o600);
+      } catch (e) {
+        if (!(e instanceof Error && 'code' in e && e.code === 'EEXIST')) throw e;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+
+    if (!lock) throw new Error('request log is busy');
+    let existing = '';
+
+    try {
+      existing = await fs.promises.readFile(requestsPath, 'utf-8');
+    } catch {
+      // First write.
+    }
+
+    const records = new Map<string, LocalRequestRecord>();
+
+    for (const line of existing.split('\n')) {
+      const record = parseRequestLine(line);
+
+      if (record && Date.parse(record.timestamp) >= cutoff) records.set(record.id, record);
+    }
+
+    for (const record of incoming) {
+      if (Date.parse(record.timestamp) >= cutoff) {
+        records.set(record.id, record);
+      }
+    }
+
+    const content = [...records.values()]
+      .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
+      .map((record) => JSON.stringify(record))
+      .join('\n');
+
+    const tempPath = `${requestsPath}.${process.pid}.${randomUUID()}.tmp`;
+    await fs.promises.writeFile(tempPath, content ? `${content}\n` : '', { encoding: 'utf-8', mode: 0o600 });
+    await fs.promises.rename(tempPath, requestsPath);
+  } catch (e) {
+    log.warn(`dashboard: failed to update local request log: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    await lock?.close().catch(() => undefined);
+
+    if (lock) await fs.promises.unlink(lockPath).catch(() => undefined);
+  }
+}
+
+/**
+ * The key an event records for the scope that wrote it, and that a scope's
+ * report matches (#785): a hash of the data home, so the log stores no path
+ * (Copilot events persist none, #666). The data home is realpath'd, so a
+ * symlinked checkout or macOS `/tmp` vs `/private/tmp` keys the same; a
+ * Windows path also folds separators and case, as the report's cwd rule does.
+ * A data home that is gone (an in-repo `.teamai` removed after migration)
+ * keys through its parent's realpath.
+ */
+export async function dataHomeKey(dataHome: string): Promise<string> {
+  const real = await fs.promises.realpath(dataHome).catch(() => !path.isAbsolute(dataHome) ? dataHome
+    : fs.promises.realpath(path.dirname(dataHome)).then((p) => path.join(p, path.basename(dataHome)), () => dataHome));
+
+  const norm = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(real) ? real.replace(/\\/g, '/').toLowerCase() : real;
+
+  return createHash('sha256').update(norm.replace(/\/+$/, '')).digest('hex').slice(0, 16);
+}
+
+// ─── Events file lock (#804) ────────────────────────────
+//
+// appendEvent and compactEvents serialize on `<events file>.lock`, the
+// pattern the usage file took for the same lost-update race (#788, #803):
+// compaction's read-modify-write must not drop an append that lands while it
+// runs, and two compactions must not interleave their rewrites. The holder
+// first folds in the side files of appends that gave up waiting. A lock
+// whose owner is gone is reclaimed (acquireLock).
+
+/** A hook append waits at most ~250 ms for the events lock, inside its foreground budget. */
+const EVENTS_APPEND_LOCK_WAIT = { attempts: 10, delayMs: 25 };
+
+/** A compaction waits up to ~5 s for a peer's compaction to finish. */
+const EVENTS_REWRITE_LOCK_WAIT = { attempts: 100, delayMs: 50 };
+
+/**
+ * Run `fn` holding the lock every writer of the events file takes (#804): a
+ * hook append and the compaction rewrite. A rewrite then cannot drop an
+ * append made while it runs, and two rewrites cannot interleave. Returns
+ * false, without running `fn`, when the lock is still held after the wait.
+ */
+async function withEventsLock(
+  eventsPath: string,
+  wait: { attempts: number; delayMs: number },
+  fn: () => Promise<void>,
+): Promise<boolean> {
+  const lockPath = `${eventsPath}.lock`;
+
+  for (let i = 0; i < wait.attempts; i++) {
+    if (await acquireLock(lockPath)) {
+      try {
+        await foldPendingEvents(eventsPath);
+        await fn();
+      } finally {
+        await releaseLock(lockPath);
+      }
+
+      return true;
+    }
+
+    await new Promise((r) => setTimeout(r, wait.delayMs));
+  }
+
+  return false;
+}
+
+/** Name prefix of the side files an append writes while the events lock is held. */
+function eventsPendingPrefix(eventsPath: string): string {
+  return `${path.basename(eventsPath, '.jsonl')}.pending-`;
+}
+
+/**
+ * Append the side files of appends that gave up on the lock to the events
+ * file, then remove them — in the events' own time order, not readdir's
+ * arbitrary order, so a side file that outlived several newer appends does
+ * not land after them in the file. Each side file holds one whole line; one
+ * without its newline is still being written and waits for the next holder.
+ * A side file whose id the file already holds was folded by a holder that
+ * died or could not remove it, so it is not appended again; identical events
+ * keep their own ids and lines.
+ */
+async function foldPendingEvents(eventsPath: string): Promise<void> {
+  const dir = path.dirname(eventsPath);
+  const prefix = eventsPendingPrefix(eventsPath);
+  const names = await fs.promises.readdir(dir).catch(() => []);
+  const pending: Array<{ pendingPath: string; content: string; timestamp: number }> = [];
+
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.jsonl')) continue;
+    const pendingPath = path.join(dir, name);
+
+    try {
+      const content = await fs.promises.readFile(pendingPath, 'utf-8');
+
+      if (!content.endsWith('\n')) continue;
+      const timestamp = Date.parse(pendingTimestampOf(content));
+      pending.push({ pendingPath, content, timestamp: Number.isNaN(timestamp) ? 0 : timestamp });
+    } catch (e) {
+      log.debug(`dashboard: could not fold ${pendingPath} into ${eventsPath}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  pending.sort((a, b) => a.timestamp - b.timestamp);
+  let folded: Set<string> | undefined;
+
+  for (const { pendingPath, content } of pending) {
+    try {
+      const id = pendingIdOf(content);
+      folded ??= new Set(
+        (await fs.promises.readFile(eventsPath, 'utf-8').catch(() => '')).split('\n').map(pendingIdOf).filter((i) => i !== undefined),
+      );
+
+      if (id === undefined || !folded.has(id)) {
+        await fs.promises.appendFile(eventsPath, content, 'utf-8');
+
+        if (id !== undefined) folded.add(id);
+      }
+
+      await fs.promises.rm(pendingPath, { force: true });
+    } catch (e) {
+      log.debug(`dashboard: could not fold ${pendingPath} into ${eventsPath}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+}
+
+/** The fields a side file's line is folded by; a field of the wrong type reads as absent. */
+const PendingLineSchema = z.object({
+  timestamp: z.string().optional().catch(undefined),
+  pendingId: z.string().optional().catch(undefined),
+});
+
+/** The timestamp of the event a side file holds, for folding side files in time order. */
+function pendingTimestampOf(content: string): string {
+  try {
+    const pending = PendingLineSchema.safeParse(JSON.parse(content));
+
+    return pending.success ? pending.data.timestamp ?? '' : '';
+  } catch {
+    return '';
+  }
+}
+
+/** The id a side file gave its line, if the line has one. */
+function pendingIdOf(line: string): string | undefined {
+  if (!line.includes('"pendingId"')) return undefined;
+
+  try {
+    const pending = PendingLineSchema.safeParse(JSON.parse(line));
+
+    return pending.success ? pending.data.pendingId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Remove the temp copies a killed compaction left beside `target`; only the lock holder writes one. */
+async function removeOrphanTemps(target: string): Promise<void> {
+  const dir = path.dirname(target);
+  const prefix = `${path.basename(target)}.`;
+  const names = await fs.promises.readdir(dir).catch(() => []);
+
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !/^\d+\.[0-9a-f]{12}\.tmp$/.test(name.slice(prefix.length))) continue;
+    await fs.promises.rm(path.join(dir, name), { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Append a DashboardEvent, or a session outcome event, to the events JSONL file.
+ * Silently fails on I/O errors to avoid disrupting the AI session.
+ */
+export async function appendEvent(event: DashboardEvent | SessionOutcomeEvent): Promise<void> {
+  try {
+    const eventsPath = getEventsPath();
+    await ensureDir(path.dirname(eventsPath));
+    const line = JSON.stringify(event) + '\n';
+
+    const detail = 'toolName' in event && event.toolName
+      ? ` [tool=${event.toolName}]`
+      : 'promptSummary' in event && event.promptSummary
+        ? ` [prompt=${event.promptSummary}]`
+        : '';
+
+    const summary = `dashboard: recorded ${event.type} for session ${event.sessionId.slice(0, 16)}${detail}`;
+
+    if (await withEventsLock(eventsPath, EVENTS_APPEND_LOCK_WAIT, () => fs.promises.appendFile(eventsPath, line, 'utf-8'))) {
+      log.debug(summary);
+
+      return;
+    }
+
+    // The lock is still held: record the event in a side file of its own for
+    // the next lock holder to fold in, rather than race a rewrite (#804).
+    // It holds what the events file holds, so it gets no wider mode than that
+    // file (the umask can only narrow it); owner-only while there is no file
+    // yet. The id lets a fold tell whether this very line is already in the
+    // file; readers drop it (readEventsRaw), so it never leaves this machine.
+    const pendingId = randomUUID();
+    const pendingPath = path.join(path.dirname(eventsPath), `${eventsPendingPrefix(eventsPath)}${pendingId}.jsonl`);
+    const mode = await fs.promises.stat(eventsPath).then((s) => s.mode & 0o777, () => 0o600);
+    await fs.promises.writeFile(pendingPath, JSON.stringify({ ...event, pendingId }) + '\n', { encoding: 'utf-8', flag: 'wx', mode });
+    log.debug(`${summary} (in ${path.basename(pendingPath)}; ${path.basename(eventsPath)}.lock is held)`);
+  } catch (e) {
+    log.error(`dashboard: failed to write event: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * Read raw events from the JSONL file, in file (append) order. Skips corrupted
+ * lines. Callers that must preserve the on-disk stream verbatim (e.g. compaction)
+ * use this; everything else goes through {@link readEvents}, which also dedupes
+ * and drops a folded side file's `pendingId`.
+ *
+ * A folded side file's id stays in the file (and in every rewrite of it,
+ * compaction included) until the side file itself is gone — a fold that could
+ * not remove its side file must stay recognizable, or the next holder would
+ * append the event a second time. The usage file's rewrite keeps the id the
+ * same way (#788).
+ */
+async function readEventsRaw(filePath: string): Promise<DashboardEvent[]> {
+  return (await readLogRaw(filePath)).events;
+}
+
+/**
+ * The log's lines: its events, as {@link readEventsRaw} returns them, apart from its session outcome lines (#1387),
+ * which only {@link readSessionOutcomes} reads, kept verbatim with their timestamp. They are not a session's activity,
+ * so no reader that rebuilds sessions, times or counts from events may see them.
+ */
+async function readLogRaw(filePath: string): Promise<{ events: DashboardEvent[]; outcomes: Array<{ timestamp: string; line: string }> }> {
+  const events: DashboardEvent[] = [];
+  const outcomes: Array<{ timestamp: string; line: string }> = [];
+  const content = await fs.promises.readFile(filePath, 'utf-8').catch(() => '');
+
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+
+    if (!trimmed) continue;
+
+    try {
+      // SAFETY: only appendEvent, the side file fold and compaction write this log, each line a serialized
+      // DashboardEvent or SessionOutcomeEvent; a line without its type, session id and timestamp is dropped below.
+      const parsed = JSON.parse(trimmed) as DashboardEvent | SessionOutcomeEvent;
+
+      if (!parsed.type || !parsed.sessionId || !parsed.timestamp) continue;
+
+      if (parsed.type === 'session_outcome') outcomes.push({ timestamp: parsed.timestamp, line: trimmed });
+      else events.push(parsed);
+    } catch {
+      // Skip corrupted lines
+    }
+  }
+
+  return { events, outcomes };
+}
+
+/** How long compaction keeps a session outcome line: past the 6 hours a session takes to finish, and the dashboard's month. */
+export const SESSION_OUTCOME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** The session outcome events of the log at `eventsPath` (the default log when absent), in file order. */
+export async function readSessionOutcomes(eventsPath?: string): Promise<SessionOutcomeEvent[]> {
+  const content = await fs.promises.readFile(eventsPath ?? getEventsPath(), 'utf-8').catch(() => '');
+  const outcomes: SessionOutcomeEvent[] = [];
+
+  for (const line of content.split('\n')) {
+    if (!line.includes('"session_outcome"')) continue;
+
+    try {
+      const parsed = SessionOutcomeEventSchema.safeParse(JSON.parse(line));
+
+      if (parsed.success) outcomes.push(parsed.data);
+    } catch {
+      // Skip corrupted lines
+    }
+  }
+
+  return outcomes;
+}
+
+/**
+ * Cross-tool duplicate window. When a host (e.g. Cursor) also loads claude's
+ * `~/.claude/settings.json`, one action fires both that hook (`--tool claude`)
+ * and the host's own hook (`--tool cursor`), writing two near-identical events
+ * under the SAME sessionId. Observed skew is 7–172ms; 2s is a generous guard.
+ * A shared sessionId across two DIFFERENT tools only happens under this bug —
+ * genuine distinct-tool sessions get distinct session ids — so the window is a
+ * secondary safety check, not the primary discriminator.
+ */
+const CROSS_TOOL_DEDUP_WINDOW_MS = 2000;
+
+/** Content signature within a session: distinguishes genuine repeats from dupes. */
+function eventSignature(e: DashboardEvent): string {
+  switch (e.type) {
+    case 'tool_use': return `tool_use\0${e.toolName ?? ''}`;
+    case 'prompt_submit': return `prompt_submit\0${e.promptSummary ?? ''}`;
+    default: return e.type; // session_start | session_end | stop | process_exit
+  }
+}
+
+/** Higher = richer payload; the richer record is kept as the surviving carrier. */
+function eventPayloadScore(e: DashboardEvent): number {
+  return (e.tokens ? 8 : 0) + (e.stoppedOutput ? 4 : 0) + (e.interventions ? 2 : 0)
+    + (e.prompts !== undefined ? 2 : 0) + (e.requestMetrics || e.requestDaily ? 2 : 0)
+    + (e.monitorPid ? 1 : 0);
+}
+
+/** A specific host wins over the generic `claude` default (index.ts hook --tool). */
+function preferTool(a: string, b: string): string {
+  if (a === b) return a;
+
+  if (a === 'claude') return b;
+
+  if (b === 'claude') return a;
+
+  return a; // both specific (shouldn't occur under the bug): keep earliest deterministically
+}
+
+/**
+ * Collapse cross-tool duplicate events (see {@link CROSS_TOOL_DEDUP_WINDOW_MS}).
+ * Two events merge only when they share sessionId + type + content signature, are
+ * within the window, and have DIFFERENT tools — so genuine same-tool repeats and
+ * single-tool sessions pass through untouched. The surviving record keeps the
+ * richest payload and adopts the specific host tool. Output is timestamp-ascending.
+ */
+export function dedupeEvents(events: DashboardEvent[]): DashboardEvent[] {
+  const sorted = [...events].sort((x, y) => Date.parse(x.timestamp) - Date.parse(y.timestamp));
+  const result: DashboardEvent[] = [];
+  const lastByKey = new Map<string, number>(); // (sessionId\0signature) -> index in result
+
+  for (const e of sorted) {
+    const key = `${e.sessionId}\0${eventSignature(e)}`;
+    const idx = lastByKey.get(key);
+
+    if (idx !== undefined) {
+      const prev = result[idx];
+      const gap = Math.abs(Date.parse(e.timestamp) - Date.parse(prev.timestamp));
+
+      if (prev.tool !== e.tool && gap <= CROSS_TOOL_DEDUP_WINDOW_MS) {
+        const carrier = eventPayloadScore(e) > eventPayloadScore(prev) ? e : prev; // tie -> prev (earlier)
+        result[idx] = { ...carrier, tool: preferTool(prev.tool, e.tool) };
+        continue; // collapsed; do not push
+      }
+    }
+
+    result.push(e);
+    lastByKey.set(key, result.length - 1);
+  }
+
+  return result;
+}
+
+/**
+ * Read all events from the JSONL file, cross-tool-deduped. Skips corrupted lines.
+ * A folded side file's `pendingId` is machine-local bookkeeping (foldPendingEvents
+ * keeps it in the raw file so a surviving side file is never appended twice) and
+ * never reaches a reader.
+ */
+export async function readEvents(eventsPath?: string): Promise<DashboardEvent[]> {
+  const filePath = eventsPath ?? getEventsPath();
+
+  return dedupeEvents(await readEventsRaw(filePath)).map((event) => {
+    // SAFETY: readEventsRaw keeps the pendingId a folded side file gave its line, a key DashboardEvent does not declare.
+    delete (event as DashboardEvent & { pendingId?: unknown }).pendingId;
+
+    return event;
+  });
+}
+
+// ─── Session state rebuild ──────────────────────────────
+//
+//  events.jsonl (append-only)
+//      │
+//      ▼
+//  rebuildSessions(events)
+//      │ fold events into session map
+//      │ apply idle/stale timeouts
+//      ▼
+//  DashboardSession[]
+//
+
+/**
+ * Rebuild current session states from a list of events.
+ * This is the core "event sourcing" logic:
+ * - session_start → create session, record monitorPid
+ * - tool_use → update lastActivity + lastTool, mark running
+ * - prompt_submit → capture prompt, mark running
+ * - stop → mark as waiting_for_input (LLM finished, user still in session)
+ * - session_end / process_exit → mark as stopped (process truly exited)
+ * Then apply timeouts: idle after 5 min, remove stale after 30 min.
+ * Stopped sessions are kept for 30 seconds before removal.
+ */
+export function rebuildSessions(events: DashboardEvent[], outcomes: readonly SessionOutcomeEvent[] = []): DashboardSession[] {
+  const sessions = new Map<string, DashboardSession>();
+  const now = Date.now();
+  const keys = repoKeys(events);
+  const allKeys = new Set(keys.values());
+  const delivered = new Map<string, WorkOutcome[]>();
+
+  for (const outcome of outcomes) delivered.set(outcome.sessionId, uniqueOutcomes([...delivered.get(outcome.sessionId) ?? [], ...outcome.outcomes]));
+
+  for (const event of events) {
+    let session = sessions.get(event.sessionId);
+
+    if (!session) {
+      const repoKey = keys.get(event.sessionId) ?? '';
+      session = {
+        sessionId: event.sessionId,
+        tool: event.tool,
+        status: 'running',
+        cwd: event.cwd ?? '',
+        repoKey,
+        repoLabel: repoLabel(repoKey, allKeys),
+        promptSummary: '',
+        lastActivity: event.timestamp,
+        startedAt: event.timestamp,
+        lastTool: '',
+        prompts: [],
+        stoppedOutput: '',
+        stoppedAt: '',
+        interventions: { interrupt: 0, toolReject: 0, correction: 0 },
+        interventionCount: 0,
+        promptCount: 0,
+        tokens: emptyTokenUsage(),
+        outcomes: delivered.get(event.sessionId) ?? [],
+      };
+      sessions.set(event.sessionId, session);
+    }
+
+    // Update common fields
+    session.lastActivity = event.timestamp;
+
+    if (event.cwd) session.cwd = event.cwd;
+
+    switch (event.type) {
+      case 'session_start':
+        session.status = 'running';
+        session.startedAt = event.timestamp;
+
+        if (event.monitorPid) session.monitorPid = event.monitorPid;
+        break;
+      case 'tool_use':
+        session.status = 'running';
+
+        if (event.toolName) session.lastTool = event.toolName;
+        break;
+      case 'prompt_submit':
+        session.status = 'running';
+
+        // Capture the first prompt as summary
+        if (!session.promptSummary && event.promptSummary) {
+          session.promptSummary = event.promptSummary;
+        }
+
+        // Collect all prompts
+        if (event.promptSummary) {
+          session.prompts.push(event.promptSummary);
+        }
+
+        break;
+      case 'stop':
+        // Stop = LLM finished responding, but the user is still in the session.
+        // Mark as waiting_for_input instead of stopped. The session will return
+        // to 'running' when the next prompt_submit or tool_use arrives.
+        session.status = 'waiting_for_input';
+
+        if (event.stoppedOutput) {
+          session.stoppedOutput = event.stoppedOutput;
+        }
+
+        break;
+      case 'session_end':
+        session.status = 'stopped';
+        session.stoppedAt = event.timestamp;
+        break;
+      case 'process_exit':
+        // The AI tool process has truly exited (detected by PID liveness monitor).
+        // This is the real "session ended" signal.
+        session.status = 'stopped';
+        session.stoppedAt = event.timestamp;
+        break;
+    }
+  }
+
+  // Fill per-session metrics (single source of truth: aggregate fold)
+  const metricsMap = aggregateSessionMetrics(events);
+
+  for (const session of sessions.values()) {
+    const m = metricsMap.get(session.sessionId);
+
+    if (m) {
+      session.interventions = { interrupt: m.interrupt, toolReject: m.toolReject, correction: m.correction };
+      session.interventionCount = m.interrupt + m.toolReject + m.correction;
+      session.promptCount = m.prompts;
+      session.tokens = m.tokens;
+    }
+  }
+
+  // Apply timeouts
+  const result: DashboardSession[] = [];
+
+  for (const session of sessions.values()) {
+    const lastActivityMs = new Date(session.lastActivity).getTime();
+    const elapsed = now - lastActivityMs;
+
+    if (session.status === 'stopped') {
+      // Keep stopped sessions for 30 seconds, then remove
+      const stoppedAtMs = session.stoppedAt
+        ? new Date(session.stoppedAt).getTime()
+        : lastActivityMs;
+
+      const stoppedElapsed = now - stoppedAtMs;
+
+      if (stoppedElapsed > DASHBOARD_STOPPED_DISPLAY_MS) continue;
+      result.push(session);
+      continue;
+    }
+
+    // Remove stale sessions (> 30 min)
+    if (elapsed > DASHBOARD_STALE_TIMEOUT_MS) continue;
+
+    // Mark idle sessions (> 5 min)
+    if (elapsed > DASHBOARD_IDLE_TIMEOUT_MS) {
+      session.status = 'idle';
+    }
+
+    result.push(session);
+  }
+
+  // Sort: active sessions first, stopped last; within each group by total runtime descending
+  result.sort((a, b) => {
+    if (a.status === 'stopped' && b.status !== 'stopped') return 1;
+
+    if (a.status !== 'stopped' && b.status === 'stopped') return -1;
+    // Sort by total runtime descending (longest-running first) for stable card positions
+    const sortNow = Date.now();
+    const aEnd = a.stoppedAt ? new Date(a.stoppedAt).getTime() : sortNow;
+    const bEnd = b.stoppedAt ? new Date(b.stoppedAt).getTime() : sortNow;
+    const aRuntime = aEnd - new Date(a.startedAt).getTime();
+    const bRuntime = bEnd - new Date(b.startedAt).getTime();
+
+    return bRuntime - aRuntime;
+  });
+
+  return result;
+}
+
+interface TimedTokenSnapshot {
+  timestamp: string;
+  tokens: TokenUsage;
+}
+
+/**
+ * Keep the chronologically latest snapshot. Stop handlers run in the background,
+ * so append order can differ from hook/event order when two scans overlap.
+ */
+function setLatestTokenSnapshot(
+  snapshots: Map<string, TimedTokenSnapshot>,
+  key: string,
+  event: DashboardEvent,
+): void {
+  if (!event.tokens) return;
+  const current = snapshots.get(key);
+  const candidateTime = Date.parse(event.timestamp);
+  const currentTime = current ? Date.parse(current.timestamp) : Number.NaN;
+
+  if (!current || !Number.isFinite(candidateTime) || !Number.isFinite(currentTime)
+    || candidateTime >= currentTime) {
+    snapshots.set(key, { timestamp: event.timestamp, tokens: event.tokens });
+  }
+}
+
+/**
+ * The events of the member's own sessions: an event a session teamai launched recorded (`launchedBy`) never counts as
+ * the member's, in either mode. A step that continued a member's session leaves the member's earlier turns theirs, and
+ * ends what counts of that session: a Stop's snapshot covers the whole transcript, so a later one holds the step's turns.
+ */
+export function memberEvents(events: DashboardEvent[]): DashboardEvent[] {
+  const launchedFrom = new Map<string, number>();
+
+  for (const event of events) {
+    const at = Date.parse(event.timestamp);
+
+    if (event.launchedBy && Number.isFinite(at)) launchedFrom.set(event.sessionId, Math.min(at, launchedFrom.get(event.sessionId) ?? at));
+  }
+
+  return events.filter((event) => {
+    if (event.launchedBy) return false;
+    const from = launchedFrom.get(event.sessionId);
+
+    return from === undefined || Date.parse(event.timestamp) < from;
+  });
+}
+
+/**
+ * Each session's run: the mode and launcher its latest event that recorded a mode says. A session with no such event,
+ * such as one recorded before the mode was, has none, and counts as not recorded.
+ */
+export function sessionRuns(events: DashboardEvent[]): Map<string, SessionRun> {
+  const runs = new Map<string, SessionRun>();
+
+  for (const { sessionId, runMode, launchedBy } of events) {
+    if (!runMode) continue;
+    const run: SessionRun = { runMode };
+
+    if (launchedBy) run.launchedBy = launchedBy;
+    runs.set(sessionId, run);
+  }
+
+  return runs;
+}
+
+/**
+ * Aggregate per-session metrics from raw events (no timeout filtering).
+ *
+ * - interrupt / toolReject: taken from the latest Stop event's snapshot.
+ * - tokens: unscoped and session-scoped snapshots use latest-wins. Legacy Codex
+ *   transcript-scoped snapshots use latest-wins per transcript path, then sum the
+ *   distinct rollout segments for the logical session.
+ * - correction: a prompt_submit arriving within CORRECTION_WINDOW_MS of a Stop AND
+ *   matching a correction keyword. Each Stop is consumed by the next prompt only once.
+ * - prompts: total number of prompt_submit events (human conversation turns).
+ *
+ * Used both by rebuildSessions (live dashboard) and by the team-stats reporter.
+ */
+export function aggregateSessionMetrics(
+  events: DashboardEvent[],
+): Map<string, SessionMetrics> {
+  const map = new Map<string, SessionMetrics>();
+  const lastStopAt = new Map<string, number>();
+  // Two prompt-count sources, kept separate then reconciled with max():
+  // - submitCount: live prompt_submit events (real-time, but compactable).
+  // - stopPrompts: latest Stop transcript snapshot (compaction/resume-proof).
+  const submitCount = new Map<string, number>();
+  const stopPrompts = new Map<string, number>();
+  const unscopedTokens = new Map<string, TimedTokenSnapshot>();
+  const sessionTokens = new Map<string, TimedTokenSnapshot>();
+  const transcriptTokens = new Map<string, Map<string, TimedTokenSnapshot>>();
+  // Per rollout, for a transcript-scoped session (Codex), whose counters restart
+  // with each rollout: see SessionMetrics.segments.
+  const rolloutSessions = new Set<string>();
+  const transcriptPrompts = new Map<string, Map<string, number>>();
+  const transcriptInterventions = new Map<string, Map<string, { interrupt: number; toolReject: number }>>();
+  const transcriptRequests = new Map<string, Map<string, Record<string, RequestCostMetrics>>>();
+  const transcriptCorrections = new Map<string, Map<string, number>>();
+  const transcriptErrors = new Map<string, Set<string>>();
+  const transcriptSubmits = new Map<string, Map<string, number>>();
+  const stopAt = new Map<string, Map<string, number>>();
+  const transcriptSince = new Map<string, Map<string, string>>();
+  const lastTranscript = new Map<string, string>();
+  const timeline = new Map<string, Array<{ at: number; transcript: string | undefined }>>();
+
+  for (const event of events) {
+    let m = map.get(event.sessionId);
+
+    if (!m) {
+      m = { interrupt: 0, toolReject: 0, correction: 0, prompts: 0, tokens: emptyTokenUsage() };
+      map.set(event.sessionId, m);
+    }
+
+    if (event.transcriptPath !== undefined) {
+      const since = transcriptSince.get(event.sessionId) ?? new Map<string, string>();
+      const first = since.get(event.transcriptPath);
+
+      if (first === undefined || Date.parse(event.timestamp) < Date.parse(first)) since.set(event.transcriptPath, event.timestamp);
+      transcriptSince.set(event.sessionId, since);
+      lastTranscript.set(event.sessionId, event.transcriptPath);
+    }
+
+    if (event.tokenScope === 'transcript' || (isCodexTool(event.tool) && event.transcriptPath !== undefined)) {
+      rolloutSessions.add(event.sessionId);
+    }
+
+    const sessionTimeline = timeline.get(event.sessionId) ?? [];
+    const rolloutOf = event.transcriptPath ?? lastTranscript.get(event.sessionId);
+    sessionTimeline.push({ at: Date.parse(event.timestamp), transcript: rolloutOf });
+    timeline.set(event.sessionId, sessionTimeline);
+
+    if (event.status === 'error' && rolloutOf !== undefined) {
+      transcriptErrors.set(event.sessionId, (transcriptErrors.get(event.sessionId) ?? new Set<string>()).add(rolloutOf));
+    }
+
+    if (event.type === 'prompt_submit' && rolloutOf !== undefined) {
+      const submits = transcriptSubmits.get(event.sessionId) ?? new Map<string, number>();
+      submits.set(rolloutOf, (submits.get(rolloutOf) ?? 0) + 1);
+      transcriptSubmits.set(event.sessionId, submits);
+    }
+
+    if (event.type === 'stop' && event.transcriptPath !== undefined) {
+      const rollout = event.transcriptPath;
+      // The latest Stop by its timestamp, as for tokens: background Stop
+      // handlers may append an older scan after a newer one.
+      const at = Date.parse(event.timestamp);
+      const latest = stopAt.get(event.sessionId) ?? new Map<string, number>();
+      const seen = latest.get(rollout);
+      const newest = seen === undefined || !Number.isFinite(at) || !Number.isFinite(seen) || at >= seen;
+
+      if (newest) {
+        latest.set(rollout, at);
+        stopAt.set(event.sessionId, latest);
+      }
+
+      const record = <T>(maps: Map<string, Map<string, T>>, value: T) => {
+        if (!newest) return;
+        const perRollout = maps.get(event.sessionId) ?? new Map<string, T>();
+        perRollout.set(rollout, value);
+        maps.set(event.sessionId, perRollout);
+      };
+
+      if (event.prompts !== undefined) record(transcriptPrompts, event.prompts);
+
+      if (event.interventions) {
+        record(transcriptInterventions, { interrupt: event.interventions.interrupt, toolReject: event.interventions.toolReject });
+      }
+
+      // An older Stop records its cost as one request, on its own day.
+      if (event.requestDaily) record(transcriptRequests, event.requestDaily);
+      else if (event.requestMetrics) record(transcriptRequests, { [event.timestamp.slice(0, 10)]: event.requestMetrics });
+    }
+
+    if (event.type === 'stop') {
+      if (event.interventions) {
+        m.interrupt = event.interventions.interrupt;
+        m.toolReject = event.interventions.toolReject;
+      }
+
+      if (event.prompts !== undefined) {
+        stopPrompts.set(event.sessionId, event.prompts);
+      }
+
+      lastStopAt.set(event.sessionId, new Date(event.timestamp).getTime());
+    } else if (event.type === 'prompt_submit') {
+      submitCount.set(event.sessionId, (submitCount.get(event.sessionId) ?? 0) + 1);
+      const priorStopAt = lastStopAt.get(event.sessionId);
+
+      if (priorStopAt !== undefined) {
+        const gap = new Date(event.timestamp).getTime() - priorStopAt;
+        // Legacy events (no `correction` flag) fall back to the built-in list.
+        const isCorrection = event.correction ?? isCorrectionPrompt(event.promptSummary);
+
+        if (gap >= 0 && gap <= CORRECTION_WINDOW_MS && isCorrection) {
+          m.correction++;
+          const rollout = event.transcriptPath ?? lastTranscript.get(event.sessionId);
+
+          if (rollout !== undefined) {
+            const corrections = transcriptCorrections.get(event.sessionId) ?? new Map<string, number>();
+            corrections.set(rollout, (corrections.get(rollout) ?? 0) + 1);
+            transcriptCorrections.set(event.sessionId, corrections);
+          }
+        }
+
+        // Each stop is consumed once — a later prompt is a new task, not a correction.
+        lastStopAt.delete(event.sessionId);
+      }
+    }
+
+    if ((event.type === 'stop' || event.type === 'session_end') && event.tokens) {
+      if (event.tokenScope === 'session') {
+        setLatestTokenSnapshot(sessionTokens, event.sessionId, event);
+      } else if (event.tokenScope === 'transcript' && event.transcriptPath) {
+        let segments = transcriptTokens.get(event.sessionId);
+
+        if (!segments) {
+          segments = new Map<string, TimedTokenSnapshot>();
+          transcriptTokens.set(event.sessionId, segments);
+        }
+
+        // A rollout's counter is cumulative within that file. Repeated Stop scans
+        // replace the same segment; a resumed rollout has a distinct path and adds
+        // one new segment to the logical session total.
+        setLatestTokenSnapshot(segments, event.transcriptPath, event);
+      } else {
+        // Claude, CodeBuddy, and pre-existing events retain latest-Stop semantics.
+        setLatestTokenSnapshot(unscopedTokens, event.sessionId, event);
+      }
+    }
+  }
+
+  // Reconcile prompt count: the Stop transcript snapshot is the durable baseline
+  // (survives compaction + resume); live submit events cover the period before the
+  // first Stop. max() keeps the count monotonic across both.
+  for (const [sid, m] of map) {
+    const sessionSnapshot = sessionTokens.get(sid);
+    const segments = transcriptTokens.get(sid);
+
+    if (sessionSnapshot) {
+      // The newer thread-level counter already spans rollout files.
+      m.tokens = { ...sessionSnapshot.tokens };
+      m.tokensSpanRollouts = true;
+    } else if (segments && segments.size > 0) {
+      let total = emptyTokenUsage();
+
+      for (const segment of segments.values()) total = addTokenUsage(total, segment.tokens);
+      m.tokens = total;
+    } else {
+      const unscoped = unscopedTokens.get(sid);
+
+      if (unscoped) m.tokens = { ...unscoped.tokens };
+    }
+
+    if (rolloutSessions.has(sid)) {
+      // Active time per rollout: each gap goes to the rollout of the event it ends at.
+      const durations = new Map<string, number>();
+      const own = [...(timeline.get(sid) ?? [])].sort((a, b) => a.at - b.at);
+
+      for (let i = 1; i < own.length; i++) {
+        const gap = own[i].at - own[i - 1].at;
+        const rollout = own[i].transcript;
+
+        if (rollout !== undefined && Number.isFinite(gap) && gap >= 0 && gap <= DASHBOARD_IDLE_TIMEOUT_MS) {
+          durations.set(rollout, (durations.get(rollout) ?? 0) + gap);
+        }
+      }
+
+      const since = transcriptSince.get(sid) ?? new Map<string, string>();
+      m.segments = Object.fromEntries([...since].map(([transcript, first]) => [transcript, {
+        // A Codex Stop may count no prompts: the rollout's submits then do.
+        prompts: Math.max(transcriptPrompts.get(sid)?.get(transcript) ?? 0, transcriptSubmits.get(sid)?.get(transcript) ?? 0),
+        // A session-scoped counter already spans the rollouts: none holds tokens of its own.
+        tokens: { ...(sessionSnapshot ? emptyTokenUsage() : segments?.get(transcript)?.tokens ?? emptyTokenUsage()) },
+        interrupt: transcriptInterventions.get(sid)?.get(transcript)?.interrupt ?? 0,
+        toolReject: transcriptInterventions.get(sid)?.get(transcript)?.toolReject ?? 0,
+        correction: transcriptCorrections.get(sid)?.get(transcript) ?? 0,
+        durationMs: durations.get(transcript) ?? 0,
+        requestDaily: transcriptRequests.get(sid)?.get(transcript) ?? {},
+        since: first,
+        error: transcriptErrors.get(sid)?.has(transcript) ?? false,
+      }]));
+
+      // A rollout's Stop counts restart too; the session sums them.
+      const sum = (field: 'interrupt' | 'toolReject') =>
+        Object.values(m.segments ?? {}).reduce((total, segment) => total + segment[field], 0);
+
+      m.interrupt = Math.max(m.interrupt, sum('interrupt'));
+      m.toolReject = Math.max(m.toolReject, sum('toolReject'));
+    }
+
+    // A rollout's prompt count restarts too: its segments sum where they exist.
+    const rolloutPrompts = m.segments
+      ? Object.values(m.segments).reduce((sum, segment) => sum + segment.prompts, 0) : 0;
+
+    m.prompts = Math.max(submitCount.get(sid) ?? 0, stopPrompts.get(sid) ?? 0, rolloutPrompts);
+  }
+
+  return map;
+}
+
+/**
+ * Backward-compatible intervention-only view. Delegates to {@link aggregateSessionMetrics}.
+ */
+export function aggregateSessionInterventions(
+  events: DashboardEvent[],
+): Map<string, { interrupt: number; toolReject: number; correction: number }> {
+  const out = new Map<string, { interrupt: number; toolReject: number; correction: number }>();
+
+  for (const [sid, m] of aggregateSessionMetrics(events)) {
+    out.set(sid, { interrupt: m.interrupt, toolReject: m.toolReject, correction: m.correction });
+  }
+
+  return out;
+}
+
+// ─── JSONL compaction ───────────────────────────────────
+
+/** How long compaction keeps where a launched session started: Claude Code removes a transcript after 30 days by default. */
+const LAUNCHED_RESUMABLE_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Compact events.jsonl by keeping only events for active sessions.
+ * Active = not stopped and last activity within STALE_TIMEOUT, or its tool
+ * process still running: an exit a dashboard wrote before `processExitAfter`
+ * existed can mark a live run stopped, and dropping that run's start would give
+ * its next activity a new run ID (#785).
+ * Called when file exceeds COMPACTION_THRESHOLD lines.
+ */
+export async function compactEvents(eventsPath?: string): Promise<void> {
+  const filePath = eventsPath ?? getEventsPath();
+
+  try {
+    // Cheap lock-free pre-check: one of these runs detached after every
+    // append, and nearly always finds nothing to do. Below the threshold with
+    // no side files to fold it must not create the lock at all — the state it
+    // would lock may be a sandbox another test (or a rolling state dir) is
+    // deleting concurrently.
+    const pre = await fs.promises.readFile(filePath, 'utf-8').catch(() => null);
+
+    if (pre === null) return;
+    const preLines = pre.split('\n').filter(l => l.trim());
+
+    const hasSideFiles = await fs.promises.readdir(path.dirname(filePath)).then(
+      (names) => names.some((n) => n.startsWith(eventsPendingPrefix(filePath)) && n.endsWith('.jsonl')),
+      () => false,
+    );
+
+    if (preLines.length < DASHBOARD_COMPACTION_THRESHOLD && !hasSideFiles) return;
+
+    const locked = await withEventsLock(filePath, EVENTS_REWRITE_LOCK_WAIT, async () => {
+      // Replace the file itself, not a symlink to it.
+      const target = await fs.promises.realpath(filePath).catch(() => filePath);
+      await removeOrphanTemps(target);
+      const content = await fs.promises.readFile(target, 'utf-8');
+      const lines = content.split('\n').filter(l => l.trim());
+
+      if (lines.length < DASHBOARD_COMPACTION_THRESHOLD) return;
+
+      // Compaction rewrites the file, so it must preserve raw (append-order,
+      // un-deduped) events — dedup is a read-time view, not a disk mutation.
+      // Dedup never changes the active-session set, so activeIds is identical.
+      const { events, outcomes } = await readLogRaw(target);
+      // Classify sessions in time order, not raw file order: a side file that
+      // outlived newer appends can sit after them in the file even though it
+      // folds in time order, and every reader rebuilds sessions from
+      // time-sorted events (dedupeEvents sorts). Classifying from raw order
+      // could re-mark a live session stopped from a late older event past its
+      // stopped-display window, and the rewrite would drop its events.
+      const chronological = [...events].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+      const activeSessions = rebuildSessions(chronological);
+      const activeIds = new Set(activeSessions.map(s => s.sessionId));
+      const monitored = new Map<string, number>();
+
+      for (const e of chronological) {
+        if (e.type === 'session_start' && e.monitorPid !== undefined) monitored.set(e.sessionId, e.monitorPid);
+      }
+
+      for (const [sessionId, pid] of monitored) {
+        if (isProcessAlive(pid)) activeIds.add(sessionId);
+      }
+
+      // A session teamai launched keeps its first launched event: a member's resume of it must still find where teamai
+      // started, or its Stop would bring the launched turns back to the member (memberEvents). One line per session,
+      // and none once its tool may no longer resume it, so those lines never refill the log. Until the session is stale
+      // it keeps every event, since its first one alone would list it as running again.
+      const launchedFrom = new Map<string, DashboardEvent>();
+      const lastAt = new Map<string, number>();
+
+      for (const e of chronological) {
+        if (e.launchedBy && !launchedFrom.has(e.sessionId)) launchedFrom.set(e.sessionId, e);
+        lastAt.set(e.sessionId, Date.parse(e.timestamp));
+      }
+
+      const now = Date.now();
+      const marks = new Set<DashboardEvent>();
+
+      for (const [sessionId, first] of launchedFrom) {
+        if (now - (lastAt.get(sessionId) ?? 0) <= DASHBOARD_STALE_TIMEOUT_MS) activeIds.add(sessionId);
+        else if (now - Date.parse(first.timestamp) <= LAUNCHED_RESUMABLE_MS) marks.add(first);
+      }
+
+      // Keep only events for active sessions, and outcomes until the report and the dashboard are done with them.
+      const kept = events.filter(e => activeIds.has(e.sessionId) || marks.has(e));
+      const keptOutcomes = outcomes.filter((outcome) => now - Date.parse(outcome.timestamp) <= SESSION_OUTCOME_RETENTION_MS);
+      const compacted = [...kept.map(e => JSON.stringify(e)), ...keptOutcomes.map((outcome) => outcome.line)].join('\n') + '\n';
+
+      // Atomic write: write to temp with the file's mode, then rename. The
+      // lock makes the temp name ours; a killed compaction's copy is an
+      // orphan a later one removes (removeOrphanTemps).
+      const mode = await fs.promises.stat(target).then((s) => s.mode & 0o7777, () => 0o600);
+      const tmpPath = `${target}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+
+      try {
+        await fs.promises.writeFile(tmpPath, compacted, { encoding: 'utf-8', mode });
+        await fs.promises.rename(tmpPath, target);
+      } catch (e) {
+        await fs.promises.rm(tmpPath, { force: true }).catch(() => undefined);
+        throw e;
+      }
+
+      log.debug(`dashboard: compacted ${lines.length} → ${kept.length} events`);
+    });
+
+    // An opportunistic cleanup: leave the file as it is and let the next
+    // compaction try again, rather than reporting a lost race as a failure.
+    if (!locked) log.debug(`dashboard: ${path.basename(filePath)}.lock is still held after 5 s, so compaction is skipped`);
+  } catch (e) {
+    log.error(`dashboard: compaction failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/** What a session last recorded: its scope and the repo it was in. */
+interface RecordedScope {
+  cwd?: string;
+  /** The last event's data home key, with the `projectAnchor` of that same event. */
+  scope?: { key: string; anchor: string | undefined };
+  /** The last `projectAnchor` the session recorded (#809's attribution rule). */
+  projectAnchor?: string;
+}
+
+const recordedScopes = new Map<string, Promise<RecordedScope>>();
+
+/**
+ * What the session last recorded at `cwd`, else anywhere. A detached hook (a
+ * Stop's) can run after the session moved on, so its own directory comes first.
+ * Read once per process, and only for a hook whose cwd is gone: every other
+ * hook resolves its scope from its cwd without touching events.jsonl.
+ */
+function recordedScope(sessionId: string, cwd: string): Promise<RecordedScope> {
+  const key = `${sessionId}\0${cwd}`;
+  let known = recordedScopes.get(key);
+
+  if (!known) {
+    known = readEvents().then((events) => {
+      const own = events.filter((e) => e.sessionId === sessionId).toReversed();
+      const here = own.filter((e) => e.cwd === cwd);
+      const scoped = here.find((e) => e.dataHomeKey) ?? own.find((e) => e.dataHomeKey);
+
+      return {
+        cwd: scoped?.cwd ?? own.find((e) => e.cwd)?.cwd,
+        scope: scoped?.dataHomeKey ? { key: scoped.dataHomeKey, anchor: scoped.projectAnchor } : undefined,
+        projectAnchor: (here.find((e) => e.projectAnchor) ?? own.find((e) => e.projectAnchor))?.projectAnchor,
+      };
+    });
+    recordedScopes.set(key, known);
+  }
+
+  return known;
+}
+
+/** Recover the latest missing directory when the launcher's process cwd is gone. */
+export async function recordedHookCwd(hookData: HookStdin, tool: string): Promise<string | undefined> {
+  const sessionId = deriveDispatchSessionId(hookData, tool);
+  const events = (await readEvents()).filter(event => event.sessionId === sessionId).toReversed();
+
+  return (events.find(event => event.cwd && !fs.existsSync(event.cwd)) ?? events.find(event => event.cwd))?.cwd;
+}
+
+const recordedWorkspaces = new Map<string, Promise<string | undefined>>();
+
+/**
+ * The workspace the session recorded, when one is still there: the answer for a
+ * host that sends a directory that holds no teamai scope (#1516). Read once per
+ * process, as the scope above is: events.jsonl grows with the session. The home
+ * is part of the key, as the events it reads live there.
+ */
+function recordedWorkspace(hookData: HookStdin, tool: string): Promise<string | undefined> {
+  const sessionId = deriveDispatchSessionId(hookData, tool);
+  const key = `${sessionId}\0${getUserHome()}`;
+  let known = recordedWorkspaces.get(key);
+
+  if (!known) {
+    known = readEvents().then((events) => events
+      .filter(event => event.sessionId === sessionId)
+      .toReversed()
+      .find(event => event.cwd && fs.existsSync(event.cwd))?.cwd);
+    recordedWorkspaces.set(key, known);
+  }
+
+  return known;
+}
+
+/**
+ * The directory a hook's scope is resolved from (#810): its cwd. A cwd that no
+ * longer exists (a removed worktree) would resolve to the user scope, so it is
+ * instead the checkout of the repo this session last recorded (at that cwd
+ * first, else anywhere: see recordedScope), when the config
+ * there is still the scope that event's data home key names, or cannot be read (so
+ * the hook gets no scope, never the user scope, #748). With nothing recorded to
+ * match, it is the cwd, today's answer. A cwd that exists costs nothing more.
+ */
+export async function hookScopeDir(hookData: HookStdin, tool: string): Promise<string | undefined> {
+  const cwd = resolveHookCwd(hookData);
+
+  if (!cwd || fs.existsSync(cwd)) return cwd;
+  const { scope } = await recordedScope(deriveDispatchSessionId(hookData, tool), cwd);
+  const checkout = scope?.anchor ? await checkoutOf(scope.anchor) : undefined;
+
+  if (scope && checkout) {
+    const { resolveConfigForDir } = await import('./config.js');
+    const config = await resolveConfigForDir(checkout);
+
+    if (!config || await dataHomeKey(getDataHome(config)) === scope.key) return checkout;
+  }
+
+  return cwd;
+}
+
+/**
+ * The hosts whose hook payload names the extension host's own directory instead
+ * of the workspace the session works in: the CodeBuddy plugin sends the
+ * extension host's (#1516). Their scope comes from the workspace the session
+ * recorded. Every other host's payload names the workspace itself, so its scope
+ * stays what that directory holds — a directory without teamai runs no team
+ * handlers (#748), and another repository's work is never reported to the team
+ * the session started in.
+ */
+const HOSTS_SENDING_OWN_CWD = new Set(['codebuddy']);
+
+/**
+ * The scope a hook reports to, and the directory it works in: the payload's
+ * own, or — for a host that sends the extension host's directory — the
+ * workspace the session recorded (#1516). Such a host names a place that holds
+ * no teamai scope, so every handler that needs one was dropped and the
+ * session's tool use was never recorded.
+ */
+export async function resolveHookScopeFor(hookData: HookStdin, tool: string): Promise<{ config: LocalConfig | null; dir: string | undefined }> {
+  const { resolveConfigForDir } = await import('./config.js');
+  const scope = await hookScopeDir(hookData, tool);
+  const config = await resolveConfigForDir(scope);
+  // The directory the hook works in: the payload's own, as every host but the
+  // ones below sends the workspace.
+  const dir = resolveHookCwd(hookData);
+
+  if (!HOSTS_SENDING_OWN_CWD.has(tool)) return { config, dir };
+
+  // A scope the payload's own directory holds is the one the session works in.
+  if (config && config.scope === 'project') return { config, dir };
+  const workspace = await recordedWorkspace(hookData, tool);
+
+  if (!workspace || workspace === dir) return { config, dir };
+  const recorded = await resolveConfigForDir(workspace);
+
+  // The workspace's scope: the project the session started in, or the user
+  // scope, which the extension host's directory resolves to as well when the
+  // member installed there (#1516).
+  return recorded ? { config: recorded, dir: workspace } : { config, dir };
+}
+
+/**
+ * The scope a hook reports to: resolveConfigForDir at {@link hookScopeDir}, or at
+ * the workspace the session recorded when the payload's own directory holds none
+ * ({@link resolveHookScopeFor}). The dispatcher and the legacy `dashboard-report`,
+ * `track` and `track-slash` entry points all resolve through here.
+ */
+export async function resolveHookConfig(hookData: HookStdin, tool: string): Promise<LocalConfig | null> {
+  return (await resolveHookScopeFor(hookData, tool)).config;
+}
+
+/**
+ * Recover a live checkout for scope detection, including Git-directory identities.
+ */
+async function checkoutOf(anchor: string): Promise<string | undefined> {
+  if (!fs.existsSync(anchor)) return undefined;
+
+  if (fs.existsSync(path.join(anchor, '.git'))) return anchor;
+  const { checkoutForProjectAnchor } = await import('./utils/git.js');
+
+  return await checkoutForProjectAnchor(anchor) ?? undefined;
+}
+
+/**
+ * The `projectAnchor` an event records (#809): the stable identity of the repo
+ * holding the event's `cwd`, the directory the hook resolved its scope for.
+ * Undefined for an event that records no cwd, which keeps it free of paths
+ * (Copilot), and outside git. For a cwd that no longer exists, which git refuses
+ * to open, it is the last anchor the session recorded there, else anywhere
+ * (#810). Both event writers go through here.
+ */
+export async function eventProjectAnchor(cwd: string | undefined, sessionId: string): Promise<string | undefined> {
+  if (!cwd) return undefined;
+
+  if (!fs.existsSync(cwd)) return (await recordedScope(sessionId, cwd)).projectAnchor;
+  const { resolveAnchors } = await import('./utils/git.js');
+
+  return (await resolveAnchors(cwd))?.projectAnchor;
+}
+
+/** How long a session start waits for `git status` before recording no git state. */
+const GIT_STATE_TIMEOUT_MS = 2_000;
+
+/**
+ * The hook payload field in which the session-start dispatcher hands its readers, the session capture and this event,
+ * the one git state it read: a state, or null when it found none.
+ */
+export const GIT_AT_START_PAYLOAD_KEY = 'teamai_git_at_start';
+
+/** The git state the session-start dispatcher hands on under {@link GIT_AT_START_PAYLOAD_KEY}. */
+const GitAtStartPayloadSchema = z.object({ head: z.string(), dirty: z.boolean() });
+
+/** The git state `payload` carries from its session start's one read: a state, null for none, undefined when it carries none. */
+export function gitStateIn(payload: HookStdin): HeadState | null | undefined {
+  if (!(GIT_AT_START_PAYLOAD_KEY in payload)) return undefined;
+  const state = GitAtStartPayloadSchema.safeParse(payload[GIT_AT_START_PAYLOAD_KEY]);
+
+  return state.success ? state.data : null;
+}
+
+/**
+ * The commit `cwd` had checked out at a session start and whether tracked files had changes, or null when it has no
+ * commit, is not in git, or `git status` takes longer than its time cap. A failure is logged at debug level.
+ */
+export async function readGitStateAtStart(cwd: string): Promise<HeadState | null> {
+  try {
+    const { getHeadState } = await import('./utils/git.js');
+    const state = await getHeadState(cwd, AbortSignal.timeout(GIT_STATE_TIMEOUT_MS));
+
+    if (!state) log.debug(`dashboard: ${cwd} has no commit yet, so session_start records no git state`);
+
+    return state;
+  } catch (e) {
+    log.debug(`dashboard: could not read the git state of ${cwd} at session_start: ${e instanceof Error ? e.message : String(e)}`);
+
+    return null;
+  }
+}
+
+/**
+ * Add to a `session_start` event the git state its `cwd` started on, so the session can be replayed on the code it ran
+ * against: `known`, the state the session-start dispatcher read once for the session capture too, else one read here.
+ * Every start records its own (resume and compaction fire SessionStart too). Other events, and events with no cwd
+ * (Copilot), are left as they are. Without a state the event is still written. Both event writers go through here.
+ */
+export async function addGitStateAtStart(event: DashboardEvent, known?: HeadState | null): Promise<void> {
+  if (event.type !== 'session_start' || !event.cwd) return;
+  const state = known === undefined ? await readGitStateAtStart(event.cwd) : known;
+
+  if (state) event.gitAtStart = state;
+}
+
+/**
+ * Add to a `stop` event the commit its `cwd` has checked out, and the branch, so the commits a session made are the
+ * range from its start's `gitAtStart` to its last Stop's `gitHead`, and its pull request that of the last branch a Stop
+ * recorded, known without reading the checkout as it is when the session is folded (#1387). Other events, events with
+ * no cwd, and a cwd with no commit or whose git fails or times out are left as they are; a detached HEAD records no
+ * branch.
+ */
+export async function addGitHeadAtStop(event: DashboardEvent): Promise<void> {
+  if (event.type !== 'stop' || !event.cwd) return;
+  const { getCurrentBranch, getHeadCommit } = await import('./utils/git.js');
+  const abort = AbortSignal.timeout(GIT_STATE_TIMEOUT_MS);
+  // A git killed at the cap is still waited for while a child of it holds the pipe (a wrapper's), so the cap ends the
+  // wait itself: the Stop handler is stopped soon after, and its event would go unwritten.
+  const capped = new Promise<[null, null]>((resolve) => abort.addEventListener('abort', () => resolve([null, null]), { once: true }));
+  const [head, branch] = await Promise.race([Promise.all([getHeadCommit(event.cwd, 'HEAD', abort), getCurrentBranch(event.cwd, abort)]), capped]);
+
+  if (!head) return;
+  event.gitHead = head;
+
+  if (branch) event.gitBranch = branch;
+}
+
+// ─── CLI entry point ────────────────────────────────────
+
+/**
+ * Handle `teamai dashboard-report --stdin --tool <name>`.
+ * Called by dashboard hooks in Claude Code / other AI tools.
+ *
+ * Legacy entry point: a current install only writes `teamai hook-dispatch`,
+ * whose dashboard-report handler is registered with `requiresConfig`. Hooks
+ * left behind by an earlier install still call this command in every
+ * directory, so it applies the same gate itself — a directory with no teamai
+ * config has no team to report its sessions to (#768).
+ */
+export async function dashboardReport(toolArg?: string): Promise<void> {
+  const raw = await readStdin();
+
+  if (!raw.trim()) {
+    log.debug('dashboard-report: no STDIN data');
+
+    return;
+  }
+
+  // Asked about the session's cwd, never the directory this process started in.
+  let hookData: HookStdin = {};
+
+  try {
+    const parsed = HookStdinSchema.safeParse(JSON.parse(raw));
+
+    if (parsed.success) hookData = parsed.data;
+  } catch {
+    // parseHookEvent reports the malformed payload below; nothing to gate on yet.
+  }
+
+  const config = await resolveHookConfig(hookData, toolArg ?? 'claude');
+
+  if (!config) {
+    log.debug('dashboard-report: teamai is not set up here, skipping');
+
+    return;
+  }
+
+  const scopeKey = await dataHomeKey(getDataHome(config));
+  const event = await parseHookEvent(raw, toolArg ?? 'claude', { modelAliases: config.modelAliases, dataHomeKey: scopeKey });
+
+  if (!event) return;
+
+  event.dataHomeKey = scopeKey;
+
+  const [projectAnchor] = await Promise.all([
+    eventProjectAnchor(event.cwd, event.sessionId),
+    addGitStateAtStart(event, gitStateIn(hookData)),
+    addGitHeadAtStop(event),
+  ]);
+
+  event.projectAnchor = projectAnchor;
+  const { sessionRun } = await import('./launch-context.js');
+  Object.assign(event, sessionRun(process.env));
+  await appendEvent(event);
+
+  // Trigger compaction check (non-blocking)
+  compactEvents().catch(() => {});
+}
